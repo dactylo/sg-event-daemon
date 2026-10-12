@@ -1,0 +1,21 @@
+[daemon]
+state_dir = "/tmp/sg-event-daemon-test"
+sg_api_provider = "shotgun-api3"
+probe_bind = "127.0.0.1"
+
+[sites.test]
+server = "https://example.invalid"
+default_source = "admin"
+
+[sites.test.credentials.admin]
+script_name = "test"
+api_key = { env = "SG_EVENT_ADMIN_KEY" }
+
+[sites.test.sources.admin]
+credentials = "admin"
+
+[sites.test.groups.noop]
+
+[[sites.test.groups.noop.plugins]]
+id = "noop"
+path = "noop_plugin.py"

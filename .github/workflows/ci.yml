@@ -1,0 +1,348 @@
+name: CI
+run-name: >-
+  ${{ github.event_name == 'push' && vars.CI_RUN_ON_PUSH == 'false' && 'CI / push skipped' ||
+      (!github.event.repository.private || github.event_name != 'workflow_dispatch' ||
+       inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER)) &&
+      'CI / hosted' || inputs.full_tests && 'CI / local (full)' || 'CI / local' }}
+
+on:
+  pull_request:
+  push:
+    # Publications push a branch and tags together; test the branch once.
+    branches:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      hosted:
+        description: Run the complete publication checks on GitHub-hosted runners
+        type: boolean
+        default: true
+      full_tests:
+        description: Include slow tests on local runners
+        type: boolean
+        default: false
+
+# A newer requested run on a branch supersedes the older one. Each push run
+# has its own group: the release workflow needs the tagged commit's push run.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch'
+        && format('ci-dispatch-{0}', github.ref)
+        || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI_HOSTED: >-
+    ${{ !github.event.repository.private || github.event_name != 'workflow_dispatch' ||
+        inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER) }}
+  CI_IMPORT: sg_event_daemon
+  NODE_VERSION: 24.21.0
+  UV_PYTHON_DOWNLOADS: never
+  UV_SYSTEM_PYTHON: "0"
+  UV_VERSION: 0.12.13
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    if: github.event_name != 'push' || vars.CI_RUN_ON_PUSH != 'false'
+    runs-on: >-
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
+          !inputs.hosted && vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Verify execution environment
+        env:
+          CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CI_RUNNER_OS: ${{ runner.os }}
+          CI_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          printf 'Runner: %s; OS: %s; architecture: %s\n' \
+            "$CI_RUNNER_ENVIRONMENT" "$CI_RUNNER_OS" "$CI_RUNNER_ARCH"
+          if [ "$CI_HOSTED" = true ]; then
+            test "$CI_RUNNER_ENVIRONMENT" = github-hosted
+          fi
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          architecture: >-
+            ${{ runner.environment == 'self-hosted' && runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          python-version: "3.13"
+      - name: Set up Node for Pyright
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Set up locked development environment
+        run: make setup
+      - name: Check Pyright startup
+        run: |
+          node --version
+          .venv/bin/python -m pyright --version
+      - name: Set up Markdown formatters
+        env:
+          SHFMT_VERSION: 3.14.1
+          TAPLO_VERSION: 0.10.0
+        run: |
+          case "$RUNNER_ARCH" in
+            ARM64)
+              architecture=aarch64
+              taplo_checksum=033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3
+              shfmt_architecture=arm64
+              shfmt_checksum=5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489
+              ;;
+            X64)
+              architecture=x86_64
+              taplo_checksum=8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156
+              shfmt_architecture=amd64
+              shfmt_checksum=76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
+              ;;
+            *) echo "Unsupported formatter architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/markdown-formatters"
+          curl --fail --show-error --silent --location --retry 3 \
+            "https://github.com/tamasfe/taplo/releases/download/$TAPLO_VERSION/taplo-linux-$architecture.gz" \
+            --output "$RUNNER_TEMP/taplo.gz"
+          printf '%s  %s\n' "$taplo_checksum" "$RUNNER_TEMP/taplo.gz" | sha256sum --check --status
+          gzip -dc "$RUNNER_TEMP/taplo.gz" > "$RUNNER_TEMP/markdown-formatters/taplo"
+          curl --fail --show-error --silent --location --retry 3 \
+            "https://github.com/mvdan/sh/releases/download/v$SHFMT_VERSION/shfmt_v${SHFMT_VERSION}_linux_$shfmt_architecture" \
+            --output "$RUNNER_TEMP/markdown-formatters/shfmt"
+          printf '%s  %s\n' "$shfmt_checksum" "$RUNNER_TEMP/markdown-formatters/shfmt" | sha256sum --check --status
+          chmod +x "$RUNNER_TEMP/markdown-formatters/taplo" "$RUNNER_TEMP/markdown-formatters/shfmt"
+          "$RUNNER_TEMP/markdown-formatters/taplo" --version
+          "$RUNNER_TEMP/markdown-formatters/shfmt" --version
+          echo "$RUNNER_TEMP/markdown-formatters" >> "$GITHUB_PATH"
+      - name: Check quality
+        run: make quality
+      - name: Check worktree
+        run: git diff --exit-code
+
+  test:
+    needs: quality
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.11"
+          - os: ubuntu-24.04
+            python-version: "3.12"
+          - os: ubuntu-24.04
+            python-version: "3.13"
+          - os: ubuntu-24.04
+            python-version: "3.14"
+          - os: ubuntu-24.04
+            python-version: "3.15"
+          - os: macos-15
+            python-version: "3.13"
+    runs-on: >-
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
+          !inputs.hosted &&
+          (matrix.os == 'ubuntu-24.04' && vars.CI_LINUX_RUNNER ||
+           matrix.os == 'macos-15' && vars.CI_MACOS_RUNNER) || matrix.os }}
+    steps:
+      - name: Verify execution environment
+        env:
+          CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CI_RUNNER_OS: ${{ runner.os }}
+          CI_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          printf 'Runner: %s; OS: %s; architecture: %s\n' \
+            "$CI_RUNNER_ENVIRONMENT" "$CI_RUNNER_OS" "$CI_RUNNER_ARCH"
+          if [ "$CI_HOSTED" = true ]; then
+            test "$CI_RUNNER_ENVIRONMENT" = github-hosted
+          fi
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Create test environment with supported SQLite
+        env:
+          TEST_PYTHON: ${{ matrix.python-version }}
+          UV_PYTHON_DOWNLOADS: manual
+          UV_PYTHON_INSTALL_DIR: ${{ runner.temp }}/test-python
+        run: |
+          # The pinned uv catalog supplies Python builds with SQLite 3.53.1.
+          uv python install --no-bin "$TEST_PYTHON"
+          uv venv --managed-python --python "$TEST_PYTHON" --no-python-downloads .venv
+          .venv/bin/python - <<'PY'
+          import os
+          import sqlite3
+          import sys
+          from pathlib import Path
+
+          print(sys.version)
+          print(sys.executable)
+          print(f'SQLite {sqlite3.sqlite_version}')
+          with Path(os.environ['GITHUB_PATH']).open('a', encoding='utf-8') as output:
+              output.write(f'{Path.cwd() / ".venv" / "bin"}\n')
+          PY
+      - name: Install locked test dependencies
+        run: |
+          python -c 'import sys; assert sys.prefix != sys.base_prefix'
+          uv pip sync --python python --no-python-downloads --require-hashes --build-constraints requirements-ci.txt requirements-test.txt
+          uv pip install --python python --no-python-downloads --no-deps --no-build-isolation -e .
+      - name: Check SQLite runtime
+        run: |
+          python - <<'PY'
+          from sg_event_daemon._sqlite import _validate_sqlite_version
+
+          _validate_sqlite_version()
+          PY
+      - name: Run tests
+        env:
+          CI_QUICK_TESTS: >-
+            ${{ runner.environment == 'self-hosted' && runner.os != 'Linux' &&
+                !inputs.full_tests }}
+        run: |
+          selection=()
+          if [ "$CI_QUICK_TESTS" = true ]; then
+            selection=(-m 'not slow')
+          fi
+          python -m pytest -q -n auto --dist worksteal --durations=15 "${selection[@]}"
+
+  package:
+    needs: [quality, test]
+    runs-on: >-
+      ${{ github.event.repository.private && github.event_name == 'workflow_dispatch' &&
+          !inputs.hosted && vars.CI_LINUX_RUNNER || 'ubuntu-24.04' }}
+    env:
+      UV_SYSTEM_PYTHON: "0"
+    steps:
+      - name: Verify execution environment
+        env:
+          CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CI_RUNNER_OS: ${{ runner.os }}
+          CI_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          printf 'Runner: %s; OS: %s; architecture: %s\n' \
+            "$CI_RUNNER_ENVIRONMENT" "$CI_RUNNER_OS" "$CI_RUNNER_ARCH"
+          if [ "$CI_HOSTED" = true ]; then
+            test "$CI_RUNNER_ENVIRONMENT" = github-hosted
+          fi
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          architecture: >-
+            ${{ runner.environment == 'self-hosted' && runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Build distributions
+        run: uv build --python python --no-python-downloads --build-constraints requirements-ci.txt --require-hashes
+      - name: Audit distributions
+        run: |
+          python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          dist = Path('dist')
+          wheels = list(dist.glob('*.whl'))
+          sdists = list(dist.glob('*.tar.gz'))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+
+          sdist_roots = {
+              '.gitignore',
+              'LICENSE',
+              'PKG-INFO',
+              'README.md',
+              'pyproject.toml',
+              'src',
+              'docs',
+          }
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              archives = [(archive.filename, archive.namelist(), False)]
+          with tarfile.open(sdists[0], 'r:gz') as archive:
+              archives.append((archive.name, archive.getnames(), True))
+
+          for archive_name, names, strip_sdist_root in archives:
+              for raw_name in names:
+                  path = PurePosixPath(raw_name)
+                  assert not path.is_absolute(), (archive_name, raw_name)
+                  assert '..' not in path.parts, (archive_name, raw_name)
+                  parts = path.parts[1:] if strip_sdist_root else path.parts
+                  if not parts:
+                      continue
+                  if strip_sdist_root:
+                      assert parts[0] in sdist_roots, (archive_name, raw_name)
+                      if parts[0] == 'src' and len(parts) > 1:
+                          assert parts[1] == 'sg_event_daemon', (archive_name, raw_name)
+                      if parts[0] == 'docs' and len(parts) > 1:
+                          assert len(parts) == 2, (archive_name, raw_name)
+                          assert parts[1] in {'operations.md', 'porting.md'}, (archive_name, raw_name)
+                  else:
+                      assert (
+                          parts[0] == 'sg_event_daemon'
+                          or (parts[0].startswith('sg_event_daemon-') and parts[0].endswith('.dist-info'))
+                      ), (archive_name, raw_name)
+          PY
+      - name: Create clean installation environment
+        run: uv venv --python python --no-python-downloads "$RUNNER_TEMP/package-smoke"
+      - name: Install wheel and runtime dependencies
+        run: uv pip install --python "$RUNNER_TEMP/package-smoke/bin/python" --no-python-downloads --constraint requirements-ci.txt --build-constraints requirements-ci.txt dist/*.whl
+      - name: Smoke-test import
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/package-smoke/bin/python" -I -c "import importlib, os; importlib.import_module(os.environ['CI_IMPORT'])"
+      - name: Smoke-test CLI
+        working-directory: ${{ runner.temp }}
+        run: '"$RUNNER_TEMP/package-smoke/bin/sg-event-daemon" --help'
+      - name: Check worktree
+        run: git diff --exit-code
+      - name: Save distributions
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.CI_HOSTED == 'true' && 'python-distributions' || 'local-distributions' }}
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+
+  hosted-validation:
+    if: >-
+      ${{ always() &&
+          (github.event_name != 'push' || vars.CI_RUN_ON_PUSH != 'false') &&
+          (!github.event.repository.private || github.event_name != 'workflow_dispatch' ||
+           inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER)) }}
+    needs: [quality, test, package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require complete hosted CI
+        env:
+          CI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          test "$CI_RUNNER_ENVIRONMENT" = github-hosted
+          test "$QUALITY_RESULT" = success
+          test "$TEST_RESULT" = success
+          test "$PACKAGE_RESULT" = success
