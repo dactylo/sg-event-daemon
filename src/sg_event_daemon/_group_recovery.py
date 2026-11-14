@@ -1,7 +1,5 @@
 """Epoch, park, disposition, audit, and live-join transitions."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import time
@@ -20,7 +18,6 @@ from ._group_store import (
 )
 from ._group_types import (
     AuditIdentity,
-    AuditRecord,
     ConditionalParkDirective,
     ConditionalParkOutcome,
     ConditionalParkResult,
@@ -97,7 +94,7 @@ class DispositionCommand:
     Attributes:
         command: Canonical replay or reset operation.
         disposition_id: Nonempty stable retry identity.
-        from_event_id: Nonnegative replay position, or None for reset.
+        from_event_id: Positive event ID for replay, or None for reset.
         acknowledge_truncation: Whether the operator accepts unavailable
             history.
         reason: Nonempty operator explanation.
@@ -240,63 +237,52 @@ class StrictJoinOutcomeRequest:
 class _AuditEntry:
     """Hold one immutable audit-row insertion."""
 
-    _command: str
-    _operator: OperatorRequest
-    _prior_revision: int
-    _event_id: int | None = None
-    _callback_ordinal: int | None = None
-    _disposition_id: str | None = None
-    _command_fingerprint: str | None = None
-    _terminal_result: str | None = None
-    _result_snapshot_json: str | None = None
+    command: str
+    operator: OperatorRequest
+    prior_revision: int
+    event_id: int | None = None
+    callback_ordinal: int | None = None
+    disposition_id: str | None = None
+    command_fingerprint: str | None = None
+    terminal_result: str | None = None
+    result_snapshot_json: str | None = None
 
 
 @dataclass(frozen=True)
 class _DispositionRequest:
     """Hold normalized replay or reset state."""
 
-    _disposition_id: str
-    _command: Literal['replay', 'reset-to-latest']
-    _new_generation: int
-    _cursor: int
-    _delivery_floor: int
-    _source_frontier: int
-    _replay_from: int | None
-    _acknowledge_truncation: bool
-    _operator: OperatorRequest
+    disposition_id: str
+    command: Literal['replay', 'reset-to-latest']
+    new_generation: int
+    cursor: int
+    delivery_floor: int
+    source_frontier: int
+    replay_from: int | None
+    acknowledge_truncation: bool
+    operator: OperatorRequest
 
 
 @dataclass(frozen=True)
 class _FingerprintInput:
     """Hold one exact operator fingerprint input."""
 
-    _command: str
-    _group_generation: int
-    _operator: OperatorRequest
-    _event_id: int | None = None
-    _callback_ordinal: int | None = None
-    _extra: dict[str, object] | None = None
-
-
-@dataclass(frozen=True)
-class _FloorSkipRequest:
-    """Hold one generation-scoped delivery-floor audit."""
-
-    _command: Literal['delivery-floor-skip', 'strict-delivery-floor-skip']
-    _event_id: int
-    _delivery_floor: int
-    _operator: OperatorRequest
-    _expected_revision: int
+    command: str
+    group_generation: int
+    operator: OperatorRequest
+    event_id: int | None = None
+    callback_ordinal: int | None = None
+    extra: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
 class _RecordedCommand:
     """Identify one previously committed operator command result."""
 
-    _command: str
-    _command_fingerprint: str
-    _disposition_id: str | None = None
-    _terminal_result: str | None = None
+    command: str
+    command_fingerprint: str
+    disposition_id: str | None = None
+    terminal_result: str | None = None
 
 
 def _bind_open_ranges(connection: sqlite3.Connection, group_name: str) -> None:
@@ -428,7 +414,7 @@ def _install_disposition(
         WHERE group_name = ?""",
         (
             target.site_server_url,
-            request._new_generation,
+            request.new_generation,
             target.ordering,
             target.verified_incarnation,
             target.holdback_secs,
@@ -441,15 +427,15 @@ def _install_disposition(
         required_event_id = NULL, retry_event_id = NULL, is_operator_replay = ?,
         replay_required_from = NULL, history_truncated_floor = NULL, ordering_anomaly_id = NULL,
         strict_capacity_abort_streak = 0, strict_capacity_attempt_token = NULL,
-        strict_capacity_last_caused = NULL, strict_capacity_exhausted = 0, shape_mismatch = 0,
+        strict_capacity_last_caused = NULL, shape_mismatch = 0,
         orphaned = 0, stream_identity_changed = 0, ordering_changed = 0,
         reader_clock_checkpoint = 0, last_epoch_capture = NULL, latest_join_boundary = NULL,
         last_delivered_id = ?, operational_late_id_count = 0 WHERE group_name = ?""",
         (
-            request._cursor,
-            request._delivery_floor,
-            int(request._command == 'replay'),
-            request._cursor,
+            request.cursor,
+            request.delivery_floor,
+            int(request.command == 'replay'),
+            request.cursor,
             group_name,
         ),
     )
@@ -472,18 +458,7 @@ def _lifecycle_fingerprint(group_name: str, request: LifecycleRequest) -> str:
 
 def _live_join_identity_json(identity: LiveJoinIdentity) -> str:
     """Return canonical storage for one live-join identity."""
-    return canonical_bytes(
-        {
-            'site': identity.site,
-            'source': identity.source,
-            'group': identity.group,
-            'join_kind': identity.join_kind,
-            'source_generation': identity.source_generation,
-            'group_generation': identity.group_generation,
-            'boundary': identity.boundary,
-            'attempt_token': identity.attempt_token,
-        }
-    ).decode()
+    return canonical_bytes(identity.wire_payload()).decode()
 
 
 def _normalize_request(request: DispositionRequest, frontier: int) -> _DispositionRequest:
@@ -511,17 +486,17 @@ def _normalize_request(request: DispositionRequest, frontier: int) -> _Dispositi
 
 def _operator_fingerprint(fingerprint_input: _FingerprintInput) -> str:
     """Return a stable fingerprint for one exact operator request."""
-    operator = fingerprint_input._operator
+    operator = fingerprint_input.operator
     return _command_fingerprint(
-        fingerprint_input._command,
+        fingerprint_input.command,
         {
-            'group_generation': fingerprint_input._group_generation,
+            'group_generation': fingerprint_input.group_generation,
             'reason': operator.reason,
             'wall_clock_time': operator.wall_clock_time,
             'operator_label': operator.operator_label,
-            'event_id': fingerprint_input._event_id,
-            'callback_ordinal': fingerprint_input._callback_ordinal,
-            **({} if fingerprint_input._extra is None else fingerprint_input._extra),
+            'event_id': fingerprint_input.event_id,
+            'callback_ordinal': fingerprint_input.callback_ordinal,
+            **({} if fingerprint_input.extra is None else fingerprint_input.extra),
         },
     )
 
@@ -552,7 +527,7 @@ def _purge_obligation_tables(
 
 def _record_audit(connection: sqlite3.Connection, group_name: str, entry: _AuditEntry) -> int:
     """Append one locally attributed immutable audit record."""
-    operator = entry._operator
+    operator = entry.operator
     if not operator.reason:
         raise InvalidTransitionError('operator transition reason must not be empty')
     if operator.identity != AuditIdentity.current():
@@ -565,14 +540,14 @@ def _record_audit(connection: sqlite3.Connection, group_name: str, entry: _Audit
         raise RuntimeError('group identity metadata is missing')
     plugin_id: str | None = None
     callback_id: str | None = None
-    if entry._event_id is not None and entry._callback_ordinal is not None:
+    if entry.event_id is not None and entry.callback_ordinal is not None:
         mark = connection.execute(
             """
             SELECT plugin_id, callback_id
             FROM callback_marks
             WHERE group_name = ? AND event_id = ? AND ordinal = ?
             """,
-            (group_name, entry._event_id, entry._callback_ordinal),
+            (group_name, entry.event_id, entry.callback_ordinal),
         ).fetchone()
         if mark is not None:
             plugin_id = str(mark[0])
@@ -590,22 +565,22 @@ def _record_audit(connection: sqlite3.Connection, group_name: str, entry: _Audit
         (
             str(meta[0]),
             str(meta[1]),
-            entry._event_id,
+            entry.event_id,
             plugin_id,
             callback_id,
-            entry._command,
+            entry.command,
             operator.wall_clock_time,
-            entry._prior_revision,
-            entry._prior_revision + 1,
+            entry.prior_revision,
+            entry.prior_revision + 1,
             operator.reason,
             operator.operator_label,
             operator.identity.local_uid,
             operator.identity.username,
             operator.identity.pid,
-            entry._disposition_id,
-            entry._command_fingerprint,
-            entry._terminal_result,
-            entry._result_snapshot_json,
+            entry.disposition_id,
+            entry.command_fingerprint,
+            entry.terminal_result,
+            entry.result_snapshot_json,
         ),
     )
     if cursor.lastrowid is None:
@@ -620,7 +595,7 @@ def _audit_and_bump(
 ) -> GroupSnapshot:
     """Append an audit and finish its revision after command-specific updates."""
     audit_id = _record_audit(connection, group_name, entry)
-    return _bump_and_finish_audit(connection, group_name, audit_id, entry._prior_revision)
+    return _bump_and_finish_audit(connection, group_name, audit_id, entry.prior_revision)
 
 
 def _recorded_live_join(
@@ -663,10 +638,10 @@ def _recorded_snapshot(
         """,
         (
             group_name,
-            record._command,
-            record._command_fingerprint,
-            record._disposition_id,
-            record._terminal_result,
+            record.command,
+            record.command_fingerprint,
+            record.disposition_id,
+            record.terminal_result,
         ),
     ).fetchone()
     if row is None:
@@ -684,74 +659,22 @@ def _operator_receipt(
     recorded = _recorded_snapshot(
         connection,
         group_name,
-        _RecordedCommand(_command=command._command, _command_fingerprint=fingerprint),
+        _RecordedCommand(command=command.command, command_fingerprint=fingerprint),
     )
     return fingerprint, recorded
-
-
-def _record_floor_skip(
-    connection: sqlite3.Connection,
-    group_name: str,
-    current: GroupSnapshot,
-    request: _FloorSkipRequest,
-) -> GroupSnapshot:
-    """Persist one generation-scoped idempotent delivery-floor audit."""
-    fingerprint = _command_fingerprint(
-        request._command,
-        {
-            'delivery_floor': request._delivery_floor,
-            'event_id': request._event_id,
-            'group_generation': current.group_generation,
-        },
-    )
-    recorded = _recorded_snapshot(
-        connection,
-        group_name,
-        _RecordedCommand(_command=request._command, _command_fingerprint=fingerprint),
-    )
-    if recorded is not None:
-        return current
-    check_revision(connection, group_name, request._expected_revision)
-    if request._delivery_floor != current.delivery_floor:
-        raise InvalidTransitionError('delivery-floor identity conflicts')
-    if request._event_id > request._delivery_floor:
-        raise InvalidTransitionError('delivery-floor skip event identity conflicts')
-    return _audit_and_bump(
-        connection,
-        group_name,
-        _AuditEntry(
-            _command=request._command,
-            _operator=request._operator,
-            _prior_revision=request._expected_revision,
-            _event_id=request._event_id,
-            _command_fingerprint=fingerprint,
-        ),
-    )
-
-
-def _record_strict_floor_skip(
-    connection: sqlite3.Connection,
-    group_name: str,
-    current: GroupSnapshot,
-    request: _FloorSkipRequest,
-) -> GroupSnapshot:
-    """Validate strict ordering before the common delivery-floor audit."""
-    if current.ordering != 'strict':
-        raise InvalidTransitionError('strict floor skips require strict ordering')
-    return _record_floor_skip(connection, group_name, current, request)
 
 
 def _replay_covers_active_event(current: GroupSnapshot, request: _DispositionRequest) -> bool:
     """Require replay coverage or explicit proof the active event is unavailable."""
     event_id = current.in_flight_event_id
-    replay_from = request._replay_from
+    replay_from = request.replay_from
     if event_id is None or replay_from is None:
         return False
     if replay_from <= event_id:
         return True
     floor = current.history_truncated_floor
     return (
-        request._acknowledge_truncation
+        request.acknowledge_truncation
         and floor is not None
         and floor > event_id
         and replay_from >= floor
@@ -767,7 +690,7 @@ def _collapsed_event_replay_allowed(
 ) -> bool:
     """Fence the audited replay exception to the current active collapsed generation."""
     if (
-        request._command != 'replay'
+        request.command != 'replay'
         or not current.parked
         or 'orphaned' in current.conditions
         or 'stream-identity-changed' in current.conditions
@@ -817,10 +740,10 @@ def _truncated_event_retirement_allowed(
         or target.stream_fingerprint != current.stream_fingerprint
     ):
         return False
-    if request._command == 'replay' and not (
-        request._acknowledge_truncation
-        and request._replay_from is not None
-        and request._replay_from >= floor
+    if request.command == 'replay' and not (
+        request.acknowledge_truncation
+        and request.replay_from is not None
+        and request.replay_from >= floor
     ):
         return False
     return (
@@ -891,26 +814,34 @@ def _validate_replay_position(
     request: _DispositionRequest,
 ) -> None:
     """Validate inclusive replay bounds and retained evidence."""
-    replay_from = request._replay_from
+    replay_from = request.replay_from
     if replay_from is None:
         return
-    if replay_from < 1 or replay_from > request._source_frontier:
-        raise InvalidTransitionError('replay position exceeds the source frontier')
+    if replay_from < 1 or replay_from > request.source_frontier:
+        raise InvalidTransitionError(
+            f'replay position {replay_from} exceeds the source frontier {request.source_frontier}'
+        )
     if (
         current.history_truncated_floor is not None
         and replay_from < current.history_truncated_floor
     ):
-        raise InvalidTransitionError('replay position is below the visible retention floor')
+        raise InvalidTransitionError(
+            f'replay position {replay_from} is below the visible retention floor '
+            f'{current.history_truncated_floor}'
+        )
     if current.replay_required_from is None or replay_from <= current.replay_required_from:
         return
     override_allowed = (
-        request._acknowledge_truncation
+        request.acknowledge_truncation
         and current.history_truncated_floor is not None
         and current.history_truncated_floor > current.replay_required_from
         and replay_from >= current.history_truncated_floor
     )
     if not override_allowed:
-        raise InvalidTransitionError('replay position is later than retained replay evidence')
+        raise InvalidTransitionError(
+            f'replay position {replay_from} is later than retained replay evidence '
+            f'beginning at {current.replay_required_from}'
+        )
 
 
 def _validate_strict_live_control(
@@ -960,7 +891,9 @@ def acknowledge_ordering_anomaly(
             a new audit has an empty operator reason or nonlocal identity.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     current = snapshot(connection, group_name)
     command = 'acknowledge-ordering-anomaly'
@@ -968,10 +901,10 @@ def acknowledge_ordering_anomaly(
         connection,
         group_name,
         _FingerprintInput(
-            _command=command,
-            _group_generation=current.group_generation,
-            _operator=request.operator,
-            _event_id=request.event_id,
+            command=command,
+            group_generation=current.group_generation,
+            operator=request.operator,
+            event_id=request.event_id,
         ),
     )
     if recorded is not None:
@@ -983,62 +916,17 @@ def acknowledge_ordering_anomaly(
         connection,
         group_name,
         _AuditEntry(
-            _command=command,
-            _operator=request.operator,
-            _prior_revision=expected_revision,
-            _event_id=request.event_id,
-            _command_fingerprint=fingerprint,
+            command=command,
+            operator=request.operator,
+            prior_revision=expected_revision,
+            event_id=request.event_id,
+            command_fingerprint=fingerprint,
         ),
     )
     connection.execute(
         'UPDATE group_state SET ordering_anomaly_id = NULL WHERE group_name = ?', (group_name,)
     )
     return _bump_and_finish_audit(connection, group_name, audit_id, expected_revision)
-
-
-def audit_records(connection: sqlite3.Connection, group_name: str) -> tuple[AuditRecord, ...]:
-    """Return cumulative audit history from one open facade connection.
-
-    Args:
-        connection: Live group-state database connection.
-        group_name: Exact group whose durable rows are accessed.
-
-    Returns:
-        Immutable audit records in durable insertion order.
-    """
-    return tuple(
-        AuditRecord(
-            site=str(row[0]),
-            group=str(row[1]),
-            event_id=None if row[2] is None else int(row[2]),
-            plugin_id=None if row[3] is None else str(row[3]),
-            callback_id=None if row[4] is None else str(row[4]),
-            command=str(row[5]),
-            wall_clock_time=float(row[6]),
-            prior_revision=int(row[7]),
-            new_revision=int(row[8]),
-            reason=str(row[9]),
-            operator_label=None if row[10] is None else str(row[10]),
-            local_uid=int(row[11]),
-            username=str(row[12]),
-            pid=int(row[13]),
-            disposition_id=None if row[14] is None else str(row[14]),
-            command_fingerprint=None if row[15] is None else str(row[15]),
-            terminal_result=None if row[16] is None else str(row[16]),
-        )
-        for row in connection.execute(
-            """
-            SELECT site, group_name, event_id, plugin_id, callback_id,
-                   command, wall_clock_time, prior_revision, new_revision,
-                   reason, operator_label, local_uid, username, pid,
-                   disposition_id, command_fingerprint, terminal_result
-            FROM audit
-            WHERE group_name = ?
-            ORDER BY audit_id
-            """,
-            (group_name,),
-        ).fetchall()
-    )
 
 
 def capture_epoch(
@@ -1064,6 +952,8 @@ def capture_epoch(
         InvalidTransitionError: Ordering, generation, bounds, capacity,
             sequence, or timing does not permit the epoch.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -1145,6 +1035,8 @@ def checkpoint_reader_clock(
         InvalidTransitionError: No strict epoch is pending, the source
             generation is stale, or the checkpoint is too early.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -1190,6 +1082,8 @@ def complete_epoch(
         InvalidTransitionError: Recovery evidence or an obligation blocks
             completion, the epoch is not delivering, or the cursor is wrong.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -1248,9 +1142,9 @@ def _validate_disposition(
     target: DispositionTarget,
 ) -> Literal['replay-collapsed-event', 'retire-truncated-event'] | None:
     """Validate one new replay or reset disposition."""
-    if not request._disposition_id:
+    if not request.disposition_id:
         raise InvalidTransitionError('disposition id must not be empty')
-    if request._new_generation <= current.group_generation:
+    if request.new_generation <= current.group_generation:
         raise InvalidTransitionError('new group generation must increase')
     retirement = None
     if current.in_flight_event_id is not None:
@@ -1301,8 +1195,8 @@ def disposition_command(
         raise ValueError('group disposition command is invalid')
     from_event_id = arguments.get('from_event_id')
     if kind == 'replay':
-        if type(from_event_id) is not int or from_event_id < 0:
-            raise ValueError('replay position must be a nonnegative integer')
+        if type(from_event_id) is not int or from_event_id < 1:
+            raise ValueError('replay position must be a positive event ID')
     elif from_event_id is not None:
         raise ValueError('reset-to-latest must not include a replay position')
     acknowledge = arguments.get('acknowledge_truncation', False)
@@ -1326,7 +1220,13 @@ def disposition_command(
 
 
 def group_result_mapping(snapshot: GroupSnapshot) -> Mapping[str, object]:
-    """Project one body-free recovery result for the control plane."""
+    """Project one body-free recovery result for the control plane.
+
+    Returns:
+        A mapping containing `site`, `source`, `group`, `group_generation`,
+        `revision`, `status`, `conditions`, `cursor`, and `parked` from the
+        snapshot.
+    """
     return {
         'site': snapshot.site,
         'source': snapshot.source,
@@ -1363,6 +1263,8 @@ def mark_epoch_eligible(
         InvalidTransitionError: The epoch is absent, not next, not waiting, or
             not yet eligible, or the reader clock moves backward.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     epoch = connection.execute(
@@ -1427,6 +1329,8 @@ def mark_history_truncated(
     Raises:
         InvalidTransitionError: The retention floor is not positive.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -1466,6 +1370,8 @@ def mark_ordering_anomaly(
         InvalidTransitionError: Ordering is not strict, the event does not
             identify a new anomaly, or another anomaly is active.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -1485,65 +1391,6 @@ def mark_ordering_anomaly(
     connection.execute(
         'UPDATE group_state SET ordering_anomaly_id = ? WHERE group_name = ?',
         (event_id, group_name),
-    )
-    bump_revision(connection, group_name, expected_revision)
-    return snapshot(connection, group_name)
-
-
-def mark_strict_capacity_exhausted(
-    connection: sqlite3.Connection,
-    group_name: str,
-    identity: LiveJoinIdentity,
-    *,
-    abort_limit: int,
-    expected_revision: int,
-) -> GroupSnapshot:
-    """Persist one complete-identity live-window capacity halt.
-
-    Args:
-        group_name: Exact group whose durable rows are accessed.
-        connection: Live group-state database connection.
-        identity: Exact committed strict live-join identity.
-        abort_limit: Positive capacity-abort threshold to persist.
-        expected_revision: Required compare-and-swap revision.
-
-    Returns:
-        Current or revision-advanced immutable capacity-halt snapshot.
-
-    Raises:
-        InvalidTransitionError: The live identity is stale or conflicting,
-            ordering is not strict, or the abort limit is invalid.
-        RevisionConflictError: The expected revision differs.
-    """
-    check_revision(connection, group_name, expected_revision)
-    current = snapshot(connection, group_name)
-    _validate_strict_live_control(connection, group_name, current, identity)
-    if type(abort_limit) is not int or abort_limit <= 0:
-        raise InvalidTransitionError('strict capacity abort limit must be positive')
-    row = connection.execute(
-        """
-        SELECT strict_capacity_exhausted, strict_capacity_attempt_token
-        FROM group_state
-        WHERE group_name = ?
-        """,
-        (group_name,),
-    ).fetchone()
-    if row is None:
-        raise RuntimeError('group state is not initialized')
-    if bool(row[0]):
-        if str(row[1]) != identity.attempt_token:
-            raise InvalidTransitionError('strict capacity halt targets a stale attempt')
-        return current
-    connection.execute(
-        """
-        UPDATE group_state
-        SET strict_capacity_abort_streak = ?,
-            strict_capacity_attempt_token = ?,
-            strict_capacity_last_caused = 1,
-            strict_capacity_exhausted = 1
-        WHERE group_name = ?
-        """,
-        (abort_limit, identity.attempt_token, group_name),
     )
     bump_revision(connection, group_name, expected_revision)
     return snapshot(connection, group_name)
@@ -1572,7 +1419,9 @@ def park(
             an empty operator reason or nonlocal identity.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     current = snapshot(connection, group_name)
     command = 'park'
@@ -1580,10 +1429,10 @@ def park(
         connection,
         group_name,
         _FingerprintInput(
-            _command=command,
-            _group_generation=current.group_generation,
-            _operator=operator,
-            _event_id=current.in_flight_event_id,
+            command=command,
+            group_generation=current.group_generation,
+            operator=operator,
+            event_id=current.in_flight_event_id,
         ),
     )
     if recorded is not None:
@@ -1596,97 +1445,11 @@ def park(
         connection,
         group_name,
         _AuditEntry(
-            _command=command,
-            _operator=operator,
-            _prior_revision=expected_revision,
-            _event_id=current.in_flight_event_id,
-            _command_fingerprint=fingerprint,
-        ),
-    )
-
-
-def record_delivery_floor_skip(
-    connection: sqlite3.Connection,
-    group_name: str,
-    event_id: int,
-    operator: OperatorRequest,
-    expected_revision: int,
-) -> GroupSnapshot:
-    """Stage one ordering-neutral delivery-floor audit.
-
-    Args:
-        connection: Live configured-level group-state transaction connection;
-            the caller commits or rolls back.
-        group_name: Exact group whose durable rows are accessed.
-        event_id: Event id skipped at or below the delivery floor.
-        operator: Trusted local operator audit context.
-        expected_revision: Required for a new audit. An exact recorded retry
-            returns the current snapshot before revision comparison.
-
-    Returns:
-        Current or revision-advanced immutable snapshot.
-
-    Raises:
-        InvalidTransitionError: The event is above the durable delivery floor,
-            or a new audit has an empty operator reason or nonlocal identity.
-        RevisionConflictError: The expected revision differs for an unrecorded
-            transition.
-        ValueError: Restored durable snapshot JSON is invalid.
-    """
-    current = snapshot(connection, group_name)
-    return _record_floor_skip(
-        connection,
-        group_name,
-        current,
-        _FloorSkipRequest(
-            _command='delivery-floor-skip',
-            _event_id=event_id,
-            _delivery_floor=current.delivery_floor,
-            _operator=operator,
-            _expected_revision=expected_revision,
-        ),
-    )
-
-
-def record_strict_floor_skip(
-    connection: sqlite3.Connection,
-    group_name: str,
-    event_id: int,
-    operator: OperatorRequest,
-    expected_revision: int,
-) -> GroupSnapshot:
-    """Stage one detached strict delivery-floor audit.
-
-    Args:
-        connection: Live configured-level group-state transaction connection;
-            the caller commits or rolls back.
-        group_name: Exact group whose durable rows are accessed.
-        event_id: Strict event id skipped at or below the delivery floor.
-        operator: Trusted local operator audit context.
-        expected_revision: Required compare-and-swap revision.
-
-    Returns:
-        Current or revision-advanced immutable snapshot.
-
-    Raises:
-        InvalidTransitionError: Ordering is not strict, the event is above the
-            delivery floor, or a new audit has an empty operator reason or
-            nonlocal identity.
-        RevisionConflictError: The expected revision differs.
-        ValueError: Restored durable snapshot JSON is invalid.
-    """
-    check_revision(connection, group_name, expected_revision)
-    current = snapshot(connection, group_name)
-    return _record_strict_floor_skip(
-        connection,
-        group_name,
-        current,
-        _FloorSkipRequest(
-            _command='strict-delivery-floor-skip',
-            _event_id=event_id,
-            _delivery_floor=current.delivery_floor,
-            _operator=operator,
-            _expected_revision=expected_revision,
+            command=command,
+            operator=operator,
+            prior_revision=expected_revision,
+            event_id=current.in_flight_event_id,
+            command_fingerprint=fingerprint,
         ),
     )
 
@@ -1697,13 +1460,13 @@ def record_strict_join_outcome(
     request: StrictJoinOutcomeRequest,
     expected_revision: int,
 ) -> GroupSnapshot:
-    """Persist one bounded token-fenced strict join outcome.
+    """Persist one token-fenced strict join outcome.
 
     Args:
         connection: Live group-state database connection.
         group_name: Exact group whose durable rows are accessed.
-        request: Attempt token, capacity cause, and positive consecutive abort
-            limit.
+        request: Attempt token, capacity cause, and positive plan-level abort
+            limit, which is validated but not enforced here.
         expected_revision: Required for a new outcome. An exact retry of the
             retained token returns the current snapshot before comparison.
 
@@ -1716,6 +1479,8 @@ def record_strict_join_outcome(
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
         RuntimeError: Durable group state is not initialized.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     current = snapshot(connection, group_name)
     if current.ordering != 'strict':
@@ -1730,8 +1495,7 @@ def record_strict_join_outcome(
         """
         SELECT strict_capacity_abort_streak,
                strict_capacity_attempt_token,
-               strict_capacity_last_caused,
-               strict_capacity_exhausted
+               strict_capacity_last_caused
         FROM group_state
         WHERE group_name = ?
         """,
@@ -1742,29 +1506,24 @@ def record_strict_join_outcome(
     streak = int(row[0])
     recorded_token = None if row[1] is None else str(row[1])
     recorded_caused = None if row[2] is None else bool(row[2])
-    exhausted = bool(row[3])
     if recorded_token == request.attempt_token and recorded_caused is not None:
         if recorded_caused != request.capacity_caused:
             raise InvalidTransitionError('strict join outcome conflicts for attempt token')
         return current
     check_revision(connection, group_name, expected_revision)
-    if exhausted:
-        return current
     next_streak = streak + 1 if request.capacity_caused else 0
     connection.execute(
         """
         UPDATE group_state
         SET strict_capacity_abort_streak = ?,
             strict_capacity_attempt_token = ?,
-            strict_capacity_last_caused = ?,
-            strict_capacity_exhausted = ?
+            strict_capacity_last_caused = ?
         WHERE group_name = ?
         """,
         (
             next_streak,
             request.attempt_token,
             int(request.capacity_caused),
-            int(request.capacity_caused and next_streak >= request.abort_limit),
             group_name,
         ),
     )
@@ -1776,17 +1535,15 @@ def record_strict_ordering_decision(
     connection: sqlite3.Connection,
     group_name: str,
     control: StrictOrderingControl,
-    operator: OperatorRequest,
     expected_revision: int,
 ) -> GroupSnapshot:
-    """Stage one complete-identity ordering halt or floor audit.
+    """Stage one complete-identity ordering halt.
 
     Args:
         connection: Live configured-level group-state transaction connection;
             the caller commits or rolls back.
         group_name: Exact group whose durable rows are accessed.
         control: Exact token-fenced strict ordering decision.
-        operator: Trusted local operator audit context.
         expected_revision: Required compare-and-swap revision.
 
     Returns:
@@ -1794,10 +1551,10 @@ def record_strict_ordering_decision(
 
     Raises:
         InvalidTransitionError: The live control identity, ordering state, or
-            event action conflicts with durable state, or a new audit has an
-            empty operator reason or nonlocal identity.
+            event action conflicts with durable state.
         RevisionConflictError: The expected revision differs.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: The stored callback manifest is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -1811,34 +1568,18 @@ def record_strict_ordering_decision(
         raise InvalidTransitionError('strict ordering last-delivered identity conflicts')
     if control.delivery_floor != current.delivery_floor:
         raise InvalidTransitionError('strict ordering delivery-floor identity conflicts')
-    if control.action == 'halt':
-        if (
-            control.event_id <= control.delivery_floor
-            or control.event_id >= control.last_delivered_id
-        ):
-            raise InvalidTransitionError('strict ordering anomaly event identity conflicts')
-        if current.ordering_anomaly_id == control.event_id:
-            return current
-        if current.ordering_anomaly_id is not None:
-            raise InvalidTransitionError('another ordering anomaly remains active')
-        connection.execute(
-            'UPDATE group_state SET ordering_anomaly_id = ? WHERE group_name = ?',
-            (control.event_id, group_name),
-        )
-        bump_revision(connection, group_name, expected_revision)
-        return snapshot(connection, group_name)
-    return _record_strict_floor_skip(
-        connection,
-        group_name,
-        current,
-        _FloorSkipRequest(
-            _command='strict-delivery-floor-skip',
-            _event_id=control.event_id,
-            _delivery_floor=control.delivery_floor,
-            _operator=operator,
-            _expected_revision=expected_revision,
-        ),
+    if control.event_id <= control.delivery_floor or control.event_id >= control.last_delivered_id:
+        raise InvalidTransitionError('strict ordering anomaly event identity conflicts')
+    if current.ordering_anomaly_id == control.event_id:
+        return current
+    if current.ordering_anomaly_id is not None:
+        raise InvalidTransitionError('another ordering anomaly remains active')
+    connection.execute(
+        'UPDATE group_state SET ordering_anomaly_id = ? WHERE group_name = ?',
+        (control.event_id, group_name),
     )
+    bump_revision(connection, group_name, expected_revision)
+    return snapshot(connection, group_name)
 
 
 def recorded_bootstrap(
@@ -1863,6 +1604,7 @@ def recorded_bootstrap(
         InvalidTransitionError: Existing generation, lifecycle, or bootstrap
             identity conflicts with the request.
         ValueError: The recorded snapshot JSON is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     current = connection.execute(
         'SELECT group_generation, active, lifecycle FROM groups WHERE group_name = ?',
@@ -1910,6 +1652,7 @@ def bootstrap(
         InvalidTransitionError: Existing group state conflicts with the
             request, or the verified source incarnation has changed.
         ValueError: A recorded snapshot JSON value is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     recorded = recorded_bootstrap(connection, group_name, request)
     if recorded is not None:
@@ -1942,15 +1685,15 @@ def bootstrap(
         connection,
         group_name,
         _AuditEntry(
-            _command='bootstrap',
-            _operator=OperatorRequest('initialize group', AuditIdentity.current(), time.time()),
-            _prior_revision=-1,
-            _disposition_id=str(request.generation),
-            _command_fingerprint=_command_fingerprint(
+            command='bootstrap',
+            operator=OperatorRequest('initialize group', AuditIdentity.current(), time.time()),
+            prior_revision=-1,
+            disposition_id=str(request.generation),
+            command_fingerprint=_command_fingerprint(
                 'bootstrap', {'group': group_name, **asdict(request)}
             ),
-            _terminal_result='applied',
-            _result_snapshot_json=snapshot_to_json(result),
+            terminal_result='applied',
+            result_snapshot_json=snapshot_to_json(result),
         ),
     )
     return result
@@ -1977,6 +1720,7 @@ def recorded_disposition(
         InvalidTransitionError: The disposition identity has different command
             content or a newer disposition has committed.
         ValueError: The recorded snapshot JSON is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     row = connection.execute(
         """SELECT command_fingerprint, result_snapshot_json, audit_id FROM audit
@@ -2031,7 +1775,9 @@ def dispose(
             parked/orphaned state, or in-flight recovery requirements are
             invalid; or the audit reason or local identity is invalid.
         RevisionConflictError: The expected revision differs for new work.
-        ValueError: A recorded snapshot JSON value is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     if request.group != group_name:
         raise InvalidTransitionError('disposition group identity conflicts')
@@ -2048,25 +1794,25 @@ def dispose(
             connection,
             group_name,
             _AuditEntry(
-                _command=retirement,
-                _operator=normalized._operator,
-                _prior_revision=request.expected_revision,
-                _event_id=current.in_flight_event_id,
-                _disposition_id=request.disposition_id,
-                _command_fingerprint=fingerprint,
-                _result_snapshot_json=snapshot_to_json(current),
+                command=retirement,
+                operator=normalized.operator,
+                prior_revision=request.expected_revision,
+                event_id=current.in_flight_event_id,
+                disposition_id=request.disposition_id,
+                command_fingerprint=fingerprint,
+                result_snapshot_json=snapshot_to_json(current),
             ),
         )
     audit_id = _record_audit(
         connection,
         group_name,
         _AuditEntry(
-            _command=request.command,
-            _operator=normalized._operator,
-            _prior_revision=request.expected_revision,
-            _disposition_id=request.disposition_id,
-            _command_fingerprint=fingerprint,
-            _terminal_result='applied',
+            command=request.command,
+            operator=normalized.operator,
+            prior_revision=request.expected_revision,
+            disposition_id=request.disposition_id,
+            command_fingerprint=fingerprint,
+            terminal_result='applied',
         ),
     )
     _install_disposition(connection, group_name, normalized, target)
@@ -2088,7 +1834,7 @@ def dispose(
             current.group_generation,
             result.group_generation,
             result.cursor,
-            normalized._source_frontier,
+            normalized.source_frontier,
             target.verified_incarnation,
         ),
     )
@@ -2120,6 +1866,7 @@ def recorded_lifecycle(
             invalid, or new work conflicts with the current lifecycle,
             generation, or command preconditions.
         ValueError: The recorded snapshot JSON is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     if request.transition_generation < request.expected_generation or (
         request.command == 'readd' and request.transition_generation == request.expected_generation
@@ -2169,21 +1916,28 @@ def change_lifecycle(
 
     Raises:
         InvalidTransitionError: Transition identity or lifecycle/generation
-            fences conflict, an event is active, or the audit identity is not
-            local.
-        ValueError: A recorded snapshot JSON value is invalid.
+            fences conflict, a re-add has an active event, or the audit
+            identity is not local.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     recorded = recorded_lifecycle(connection, group_name, request)
     if recorded is not None:
         return recorded
     current = snapshot(connection, group_name)
-    if current.in_flight_event_id is not None:
+    if current.in_flight_event_id is not None and request.command != 'orphan':
         raise InvalidTransitionError('group lifecycle change requires no active event')
     if request.command == 'orphan':
         marker = source_obligations.orphan(connection, current)
-        _purge_obligation_tables(connection, group_name, include_marks=False)
+        _purge_obligation_tables(
+            connection, group_name, include_marks=current.in_flight_event_id is not None
+        )
+        clear_failure(connection, group_name)
         connection.execute(
-            'UPDATE group_state SET orphaned = 1, parked = 1, replay_required_from = ? '
+            'UPDATE group_state SET orphaned = 1, parked = 1, replay_required_from = ?, '
+            'in_flight_event_id = NULL, in_flight_obligation_id = NULL, manifest_json = NULL, '
+            'required_event_id = NULL, retry_event_id = NULL '
             'WHERE group_name = ?',
             (marker.from_event_id, group_name),
         )
@@ -2204,15 +1958,15 @@ def change_lifecycle(
         connection,
         group_name,
         _AuditEntry(
-            _command=request.command,
-            _operator=OperatorRequest(
+            command=request.command,
+            operator=OperatorRequest(
                 'configured group ' + request.command, request.identity, request.wall_clock_time
             ),
-            _prior_revision=current.revision,
-            _disposition_id=str(request.transition_generation),
-            _command_fingerprint=_lifecycle_fingerprint(group_name, request),
-            _terminal_result='applied',
-            _result_snapshot_json=snapshot_to_json(result),
+            prior_revision=current.revision,
+            disposition_id=str(request.transition_generation),
+            command_fingerprint=_lifecycle_fingerprint(group_name, request),
+            terminal_result='applied',
+            result_snapshot_json=snapshot_to_json(result),
         ),
     )
     return result
@@ -2239,8 +1993,10 @@ def resolve_conditional_park(
         The new or previously recorded typed result.
 
     Raises:
-        InvalidTransitionError: If evidence conflicts with durable group
-            authority.
+        InvalidTransitionError: Evidence conflicts with durable group
+            authority, or the parked-result audit identity is not local.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     fingerprint = directive.fingerprint()
     row = connection.execute(
@@ -2299,14 +2055,14 @@ def resolve_conditional_park(
         connection,
         group_name,
         _AuditEntry(
-            _command='conditional-park',
-            _operator=OperatorRequest(
+            command='conditional-park',
+            operator=OperatorRequest(
                 reason='supervisor-overdue-lane',
                 identity=identity,
                 wall_clock_time=decided_at_wall_clock,
             ),
-            _prior_revision=current.revision,
-            _event_id=directive.event_id,
+            prior_revision=current.revision,
+            event_id=directive.event_id,
         ),
     )
     bump_revision(connection, group_name, current.revision)
@@ -2347,7 +2103,9 @@ def restart_event(
             empty operator reason or nonlocal identity.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     current = snapshot(connection, group_name)
     if current.in_flight_event_id is None:
@@ -2357,11 +2115,11 @@ def restart_event(
         connection,
         group_name,
         _FingerprintInput(
-            _command=command,
-            _group_generation=current.group_generation,
-            _operator=operator,
-            _event_id=current.in_flight_event_id,
-            _extra={'manifest': request.manifest.to_json()},
+            command=command,
+            group_generation=current.group_generation,
+            operator=operator,
+            event_id=current.in_flight_event_id,
+            extra={'manifest': request.manifest.to_json()},
         ),
     )
     if recorded is not None:
@@ -2370,12 +2128,12 @@ def restart_event(
         connection,
         group_name,
         _AuditEntry(
-            _command=command,
-            _operator=operator,
-            _prior_revision=expected_revision,
-            _event_id=current.in_flight_event_id,
-            _callback_ordinal=current.failure_ordinal,
-            _command_fingerprint=fingerprint,
+            command=command,
+            operator=operator,
+            prior_revision=expected_revision,
+            event_id=current.in_flight_event_id,
+            callback_ordinal=current.failure_ordinal,
+            command_fingerprint=fingerprint,
         ),
     )
     result_snapshot = delivery.restart_event_manifest(
@@ -2413,7 +2171,9 @@ def retry(
             nonlocal identity.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     current = snapshot(connection, group_name)
     command = 'retry'
@@ -2421,11 +2181,11 @@ def retry(
         connection,
         group_name,
         _FingerprintInput(
-            _command=command,
-            _group_generation=current.group_generation,
-            _operator=request.operator,
-            _event_id=request.event_id,
-            _callback_ordinal=request.callback_ordinal,
+            command=command,
+            group_generation=current.group_generation,
+            operator=request.operator,
+            event_id=request.event_id,
+            callback_ordinal=request.callback_ordinal,
         ),
     )
     if recorded is not None:
@@ -2450,12 +2210,12 @@ def retry(
         connection,
         group_name,
         _AuditEntry(
-            _command=command,
-            _operator=request.operator,
-            _prior_revision=expected_revision,
-            _event_id=request.event_id,
-            _callback_ordinal=request.callback_ordinal,
-            _command_fingerprint=fingerprint,
+            command=command,
+            operator=request.operator,
+            prior_revision=expected_revision,
+            event_id=request.event_id,
+            callback_ordinal=request.callback_ordinal,
+            command_fingerprint=fingerprint,
         ),
     )
 
@@ -2483,10 +2243,13 @@ def skip_callback(
     Raises:
         InvalidTransitionError: Recovery evidence blocks the skip or the
             request does not identify an attempted pending callback, or a new
-            audit has an empty operator reason or nonlocal identity.
+            audit has an empty operator reason or nonlocal identity, or the
+            strict obligation fence blocks final event completion.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     if request.callback_ordinal is None:
         raise InvalidTransitionError('callback skip requires an exact callback ordinal')
@@ -2498,11 +2261,11 @@ def skip_callback(
         connection,
         group_name,
         _FingerprintInput(
-            _command=command,
-            _group_generation=current.group_generation,
-            _operator=request.operator,
-            _event_id=request.event_id,
-            _callback_ordinal=request.callback_ordinal,
+            command=command,
+            group_generation=current.group_generation,
+            operator=request.operator,
+            event_id=request.event_id,
+            callback_ordinal=request.callback_ordinal,
         ),
     )
     if recorded is not None:
@@ -2528,12 +2291,12 @@ def skip_callback(
         connection,
         group_name,
         _AuditEntry(
-            _command=command,
-            _operator=request.operator,
-            _prior_revision=expected_revision,
-            _event_id=request.event_id,
-            _callback_ordinal=request.callback_ordinal,
-            _command_fingerprint=fingerprint,
+            command=command,
+            operator=request.operator,
+            prior_revision=expected_revision,
+            event_id=request.event_id,
+            callback_ordinal=request.callback_ordinal,
+            command_fingerprint=fingerprint,
         ),
     )
     connection.execute(
@@ -2580,6 +2343,7 @@ def terminal_disposition_identity(
             generation.
         ValueError: The group generation is not a nonnegative integer or
             restored durable snapshot JSON is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     if type(group_generation) is not int or group_generation < 0:
         raise ValueError('group generation must be a nonnegative integer')
@@ -2630,7 +2394,9 @@ def unpark(
             empty operator reason or nonlocal identity.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     current = snapshot(connection, group_name)
     command = 'unpark'
@@ -2638,10 +2404,10 @@ def unpark(
         connection,
         group_name,
         _FingerprintInput(
-            _command=command,
-            _group_generation=current.group_generation,
-            _operator=operator,
-            _event_id=current.in_flight_event_id,
+            command=command,
+            group_generation=current.group_generation,
+            operator=operator,
+            event_id=current.in_flight_event_id,
         ),
     )
     if recorded is not None:
@@ -2661,11 +2427,11 @@ def unpark(
         connection,
         group_name,
         _AuditEntry(
-            _command=command,
-            _operator=operator,
-            _prior_revision=expected_revision,
-            _event_id=current.in_flight_event_id,
-            _command_fingerprint=fingerprint,
+            command=command,
+            operator=operator,
+            prior_revision=expected_revision,
+            event_id=current.in_flight_event_id,
+            command_fingerprint=fingerprint,
         ),
     )
 
@@ -2685,8 +2451,11 @@ def validate_disposition(
         target: Source identity that the durable transition would install.
 
     Raises:
-        InvalidTransitionError: Group recovery state, generation, pending work,
-            or replay bounds prevent the transition.
+        InvalidTransitionError: Source authority, command identity, group
+            recovery state, generation, pending work, or replay bounds prevent
+            the transition.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     _validate_disposition(
         connection,
@@ -2718,6 +2487,8 @@ def validate_live_join(
         InvalidTransitionError: The identity is stale or conflicting, the
             cursor is behind the boundary, or recovery work blocks the join.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -2753,7 +2524,9 @@ def commit_live_join(
             identity is stale or conflicting, or recovery work blocks the join.
         RevisionConflictError: The expected revision differs for an unrecorded
             transition.
-        ValueError: Restored durable snapshot JSON is invalid.
+        ValueError: A stored callback manifest or recorded snapshot JSON is
+            invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     identity_json = _live_join_identity_json(identity)
     recorded = _recorded_live_join(connection, group_name, identity, identity_json)

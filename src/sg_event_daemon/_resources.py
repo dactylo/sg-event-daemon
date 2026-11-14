@@ -29,8 +29,12 @@ def close_callables(
     Args:
         cleanups: Actions to attempt in ownership order.
         primary_error: Existing failure that takes precedence over cleanup.
-        failure_note_prefix: Label for later failures when preserving an
-            existing error; the default follows `primary_error` semantics.
+        failure_note_prefix: Label for cleanup failures noted after the first;
+            the default follows `primary_error` semantics.
+
+    Raises:
+        BaseException: The first cleanup failure when `primary_error` is
+            `None`.
     """
     first_error = primary_error
     note_prefix = failure_note_prefix or (
@@ -59,6 +63,10 @@ def close_resources(
         resources: Owned resources in cleanup order; missing resources are
             skipped.
         primary_error: Existing failure to preserve and annotate.
+
+    Raises:
+        BaseException: The first cleanup failure when `primary_error` is
+            `None`.
     """
     close_callables(
         (resource.close for resource in resources if resource is not None),

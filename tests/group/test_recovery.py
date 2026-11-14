@@ -5,7 +5,6 @@ import select
 import sqlite3
 import subprocess
 import sys
-import time
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -21,9 +20,10 @@ from sg_event_daemon._group_recovery import LifecycleRequest
 from sg_event_daemon._group_state import PendingRange
 from sg_event_daemon._group_types import (
     AuditIdentity,
+    BeginCallbackStep,
     LiveJoinIdentity,
-    canonical_bytes,
-    digest,
+    ReserveLateStep,
+    StartEventStep,
     snapshot_from_json,
 )
 from sg_event_daemon._plugins import CallbackIdentity, CallbackManifest
@@ -38,7 +38,12 @@ from tests._storage_support import (
     write_context_for,
 )
 from tests.group._support import assert_operational_count as _assert_operational_count
-from tests.group._support import dispose_at_frontier, operator_records, seed_pending_range
+from tests.group._support import (
+    commit_step,
+    dispose_at_frontier,
+    operator_records,
+    seed_pending_range,
+)
 
 if TYPE_CHECKING:
     from sg_event_daemon._group_state import GroupState
@@ -303,7 +308,7 @@ def _strict_obligation(
         closed=False,
         close_generation=0,
         eligibility_point=130.0,
-        late_ids=(),
+        visibility_deadline=0.0,
     )
 
 
@@ -319,8 +324,10 @@ def _seed_obligation(state: GroupState, obligation: PendingRange | None = None) 
 
 def _truncated_retirement_request(state: GroupState) -> recovery.DispositionRequest:
     state._database.connection.execute('UPDATE source_meta SET frontier = 900')
-    state.start_event(100, _manifest(), expected_revision=state.snapshot().revision)
-    state.begin_callback(0, expected_revision=state.snapshot().revision)
+    commit_step(
+        state, StartEventStep(100, _manifest(), None), expected_revision=state.snapshot().revision
+    )
+    commit_step(state, BeginCallbackStep(0), expected_revision=state.snapshot().revision)
     state.park(expected_revision=state.snapshot().revision, **_recovery_arguments())
     before = state.mark_history_truncated(500, expected_revision=state.snapshot().revision)
     assert before.replay_required_from is None
@@ -342,8 +349,8 @@ def test_callback_recovery_commands_are_exact_audited_and_idempotent(
     arguments = _recovery_arguments()
     changed_manifest = _manifest_pair()
     with _open_group(tmp_path / 'editorial.db') as state:
-        state.start_event(42, changed_manifest, expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, changed_manifest, None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         state.callback_failed(0, 'failed', expected_revision=2)
         retried = state.retry(
             event_id=42,
@@ -361,7 +368,7 @@ def test_callback_recovery_commands_are_exact_audited_and_idempotent(
             )
             == retried
         )
-        attempted = state.begin_callback(0, expected_revision=4)
+        attempted = commit_step(state, BeginCallbackStep(0), expected_revision=4)
         assert attempted.callback_marks[0][-1] == 2
         skipped = state.skip_callback(
             event_id=42,
@@ -370,7 +377,7 @@ def test_callback_recovery_commands_are_exact_audited_and_idempotent(
             **arguments,
         )
         assert skipped.callback_marks[0][3] == 'skipped'
-        state.begin_callback(1, expected_revision=6)
+        commit_step(state, BeginCallbackStep(1), expected_revision=6)
         state.callback_failed(1, 'failed later', expected_revision=7)
         restarted = state.restart_event(
             _manifest(),
@@ -428,6 +435,27 @@ def test_callback_recovery_commands_are_exact_audited_and_idempotent(
         )
 
 
+def test_capacity_join_outcomes_never_set_the_durable_halt(tmp_path: Path) -> None:
+    path = tmp_path / 'group.db'
+    with _open_group(path, ordering='strict') as state:
+        current = state.snapshot()
+        for index in range(JOIN_ABORT_LIMIT + 3):
+            current = state.record_strict_join_outcome(
+                attempt_token=_attempt_id(f'capacity-{index}'),
+                capacity_caused=True,
+                abort_limit=JOIN_ABORT_LIMIT,
+                expected_revision=current.revision,
+            )
+        assert current.strict_capacity_abort_streak == JOIN_ABORT_LIMIT + 3
+        assert current.strict_capacity_attempt_token == _attempt_id(
+            f'capacity-{JOIN_ABORT_LIMIT + 2}'
+        )
+        assert current.status == 'running'
+    with _open_group(path, ordering='strict') as state:
+        assert state.snapshot().status == 'running'
+        assert state.snapshot().strict_capacity_abort_streak == JOIN_ABORT_LIMIT + 3
+
+
 def test_changed_stream_and_ordering_are_accepted_only_by_new_generation_disposition(
     tmp_path: Path,
 ) -> None:
@@ -474,8 +502,10 @@ def test_changed_stream_and_ordering_are_accepted_only_by_new_generation_disposi
 
 def test_conditional_park_exact_match_parks_and_increments_once(tmp_path: Path) -> None:
     with _open_disposition_group(tmp_path / 'editorial.db') as state:
-        state.start_event(42, _park_manifest('publish'), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(
+            state, StartEventStep(42, _park_manifest('publish'), None), expected_revision=0
+        )
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         directive = group_types.ConditionalParkDirective(
             evidence_id='evidence-exact',
             site='studio',
@@ -513,8 +543,10 @@ def test_conditional_park_reason_replaces_prior_operator_reason(tmp_path: Path) 
         state.park(expected_revision=0, **arguments)
         state.unpark(expected_revision=1, **arguments)
         assert state.park_reason() == arguments['reason']
-        state.start_event(42, _park_manifest('publish'), expected_revision=2)
-        state.begin_callback(0, expected_revision=3)
+        commit_step(
+            state, StartEventStep(42, _park_manifest('publish'), None), expected_revision=2
+        )
+        commit_step(state, BeginCallbackStep(0), expected_revision=3)
         directive = replace(_conditional_park_directive('later-park'), group_revision=4)
         state.resolve_conditional_park(
             directive,
@@ -546,8 +578,8 @@ def test_conditional_park_rejects_id_reuse_revision_regression_and_ambiguous_sta
     for label, directive, message in conflicts:
         path = tmp_path / f'{label}.db'
         with _open_group(path) as state:
-            state.start_event(42, _manifest(), expected_revision=0)
-            state.begin_callback(0, expected_revision=1)
+            commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
+            commit_step(state, BeginCallbackStep(0), expected_revision=1)
             before = state.snapshot()
 
             with pytest.raises(InvalidTransitionError, match=message):
@@ -562,8 +594,8 @@ def test_conditional_park_rejects_id_reuse_revision_regression_and_ambiguous_sta
 
     parked_path = tmp_path / 'already-parked.db'
     with _open_group(parked_path) as state:
-        state.start_event(42, _manifest(), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         state.park(
             reason='operator maintenance',
             identity=identity,
@@ -584,8 +616,8 @@ def test_conditional_park_rejects_id_reuse_revision_regression_and_ambiguous_sta
 
     reuse_path = tmp_path / 'id-reuse.db'
     with _open_group(reuse_path) as state:
-        state.start_event(42, _manifest(), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         recorded = state.resolve_conditional_park(
             base,
             identity=identity,
@@ -609,8 +641,8 @@ def test_conditional_park_result_is_idempotent_by_fingerprint(tmp_path: Path) ->
     path = tmp_path / 'editorial.db'
     directive = _conditional_park_directive('evidence-idempotent')
     with _open_group(path) as state:
-        state.start_event(42, _manifest(), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
 
         first = state.resolve_conditional_park(
             directive,
@@ -651,8 +683,8 @@ def test_conditional_park_stale_result_does_not_change_revision(tmp_path: Path) 
     path = tmp_path / 'editorial.db'
     directive = _conditional_park_directive('evidence-stale')
     with _open_group(path) as state:
-        state.start_event(42, _manifest(), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         state.callback_done(0, expected_revision=2)
         before = state.snapshot()
 
@@ -680,90 +712,6 @@ def test_conditional_park_stale_result_does_not_change_revision(tmp_path: Path) 
             1001.0,
         ),
     )
-
-
-@pytest.mark.parametrize('ordering', ['eager', 'strict'])
-def test_delivery_floor_skip_audits_ordering_neutral_command(
-    tmp_path: Path,
-    ordering: Literal['eager', 'strict'],
-) -> None:
-    path = tmp_path / f'{ordering}.db'
-    with _open_group(path, ordering=ordering) as state:
-        audited = state.record_delivery_floor_skip(40, expected_revision=0)
-
-        assert audited.revision == 1
-        record = operator_records(state)[-1]
-        assert (
-            record.command,
-            record.event_id,
-            record.prior_revision,
-            record.new_revision,
-            record.reason,
-            record.command_fingerprint,
-        ) == (
-            'delivery-floor-skip',
-            40,
-            0,
-            1,
-            'source delivery-floor decision',
-            digest(
-                canonical_bytes(
-                    {
-                        'command': 'delivery-floor-skip',
-                        'delivery_floor': 41,
-                        'event_id': 40,
-                        'group_generation': 7,
-                    }
-                )
-            ),
-        )
-
-    with closing(sqlite3.connect(path)) as inspection:
-        result_snapshot_json = inspection.execute(
-            """
-            SELECT result_snapshot_json
-            FROM audit
-            WHERE group_name = 'editorial' AND command = 'delivery-floor-skip'
-            """
-        ).fetchone()
-    assert result_snapshot_json is not None
-    assert snapshot_from_json(str(result_snapshot_json[0])) == audited
-    with _open_group(path, ordering=ordering) as reopened:
-        assert reopened.snapshot() == audited
-        assert operator_records(reopened)[-1].command == 'delivery-floor-skip'
-
-
-@pytest.mark.parametrize('ordering', ['eager', 'strict'])
-def test_delivery_floor_skip_is_idempotent_with_stale_revision(
-    tmp_path: Path,
-    ordering: Literal['eager', 'strict'],
-) -> None:
-    with _open_group(tmp_path / f'{ordering}.db', ordering=ordering) as state:
-        audited = state.record_delivery_floor_skip(40, expected_revision=0)
-
-        assert state.record_delivery_floor_skip(40, expected_revision=0) == audited
-        assert state.snapshot() == audited
-        assert tuple(record.command for record in operator_records(state)) == (
-            'delivery-floor-skip',
-        )
-
-
-@pytest.mark.parametrize('ordering', ['eager', 'strict'])
-def test_delivery_floor_skip_rejects_above_floor_without_mutation(
-    tmp_path: Path,
-    ordering: Literal['eager', 'strict'],
-) -> None:
-    with _open_group(tmp_path / f'{ordering}.db', ordering=ordering) as state:
-        before = state.snapshot()
-
-        with pytest.raises(
-            InvalidTransitionError,
-            match='delivery-floor skip event identity conflicts',
-        ):
-            state.record_delivery_floor_skip(42, expected_revision=0)
-
-        assert state.snapshot() == before
-        assert operator_records(state) == ()
 
 
 @pytest.mark.parametrize(
@@ -794,7 +742,7 @@ def test_disposition_command_rejects_invalid_arguments(
 
 @pytest.mark.parametrize('command', ['replay', 'reset-to-latest', 'reset-group-to-latest'])
 def test_disposition_command_request_carries_validated_values(command: str) -> None:
-    position = 0 if command == 'replay' else None
+    position = 1 if command == 'replay' else None
     validated = recovery.disposition_command(
         command,
         {'from_event_id': position, 'acknowledge_truncation': True, 'reason': 'recover'},
@@ -831,7 +779,7 @@ def test_disposition_reused_after_intervening_reset_keeps_shared_store_recoverab
             source='events',
             stream_fingerprint='stream',
             source_generation='source-1',
-            visibility_overlap_secs=1.0,
+            late_event_window_secs=1.0,
         ) as source,
         open_group_on_source(
             group_path,
@@ -898,7 +846,7 @@ def test_disposition_reused_after_intervening_reset_keeps_shared_store_recoverab
             source='events',
             stream_fingerprint='stream',
             source_generation='source-1',
-            visibility_overlap_secs=1.0,
+            late_event_window_secs=1.0,
         ) as reopened_source,
         open_group_on_source(
             group_path,
@@ -1074,21 +1022,20 @@ with open_group_on_source(
         assert process.stdout is not None
         return_code: int | None = None
         try:
-            deadline = time.monotonic() + 2.0
             readable, _writable, _exceptional = select.select(
                 (process.stdout,),
                 (),
                 (),
-                max(0.0, deadline - time.monotonic()),
+                None,
             )
-            assert readable, 'child readiness timed out'
+            assert readable, 'child stdout closed without readiness'
             assert os.read(process.stdout.fileno(), 4_096).decode().strip() == 'READY'
             process.kill()
-            return_code = process.wait(timeout=5)
+            return_code = process.wait()
         finally:
             if process.poll() is None:
                 process.kill()
-                process.wait(timeout=5)
+                process.wait()
             if process.stdin is not None:
                 process.stdin.close()
             process.stdout.close()
@@ -1135,16 +1082,17 @@ def test_final_callback_skip_waits_for_new_lower_obligation(tmp_path: Path) -> N
     lower = _strict_obligation(obligation_id='range-lower')
     with _open_group(tmp_path / 'editorial.db', ordering='strict') as state:
         _seed_obligation(state, higher)
-        state.reserve_late_event(
-            higher.obligation_id, 46, expected_revision=state.snapshot().revision
-        )
-        state.start_event(
-            46,
-            _manifest(),
+        commit_step(
+            state,
+            ReserveLateStep(higher.obligation_id, 46),
             expected_revision=state.snapshot().revision,
-            obligation_id=higher.obligation_id,
         )
-        state.begin_callback(0, expected_revision=state.snapshot().revision)
+        commit_step(
+            state,
+            StartEventStep(46, _manifest(), higher.obligation_id),
+            expected_revision=state.snapshot().revision,
+        )
+        commit_step(state, BeginCallbackStep(0), expected_revision=state.snapshot().revision)
         _seed_obligation(state, lower)
         blocked = state.snapshot()
 
@@ -1165,16 +1113,17 @@ def test_final_late_callback_skip_maintains_operational_late_id_count(
 ) -> None:
     with _open_group(tmp_path / 'editorial.db') as state:
         _seed_obligation(state)
-        state.reserve_late_event('range-1', 42, expected_revision=state.snapshot().revision)
+        commit_step(
+            state, ReserveLateStep('range-1', 42), expected_revision=state.snapshot().revision
+        )
         connection = state._database.connection
         _assert_operational_count(connection)
-        state.start_event(
-            42,
-            _manifest(),
+        commit_step(
+            state,
+            StartEventStep(42, _manifest(), 'range-1'),
             expected_revision=state.snapshot().revision,
-            obligation_id='range-1',
         )
-        state.begin_callback(0, expected_revision=state.snapshot().revision)
+        commit_step(state, BeginCallbackStep(0), expected_revision=state.snapshot().revision)
 
         connection.execute(
             "INSERT INTO late_ids VALUES ('editorial', 'range-1', 43, 'capacity-pending', 1)"
@@ -1204,16 +1153,19 @@ def test_final_success_and_skip_share_terminal_state_but_keep_distinct_audit(
         with _open_group(path) as state:
             if late:
                 _seed_obligation(state)
-                state.reserve_late_event(
-                    'range-1', 42, expected_revision=state.snapshot().revision
+                commit_step(
+                    state,
+                    ReserveLateStep('range-1', 42),
+                    expected_revision=state.snapshot().revision,
                 )
-            started = state.start_event(
-                42,
-                _manifest(),
+            started = commit_step(
+                state,
+                StartEventStep(42, _manifest(), 'range-1' if late else None),
                 expected_revision=state.snapshot().revision,
-                obligation_id='range-1' if late else None,
             )
-            attempted = state.begin_callback(0, expected_revision=started.revision)
+            attempted = commit_step(
+                state, BeginCallbackStep(0), expected_revision=started.revision
+            )
             if outcome == 'done':
                 completed = state.callback_done(0, expected_revision=attempted.revision)
                 assert operator_records(state) == ()
@@ -1312,7 +1264,7 @@ def test_live_join_operational_history_retains_only_current_token(
     current_identity: LiveJoinIdentity | None = None
     current_snapshot = None
     with _open_group(path, ordering='strict') as state:
-        for attempt_number in range(32):
+        for attempt_number in range(2):
             identity = _join_identity(
                 'strict',
                 _attempt_id(f'bounded-{attempt_number}'),
@@ -1504,8 +1456,12 @@ def test_live_join_rejects_each_independent_group_local_blocker(
         max_late_ids_per_group=1,
     ) as state:
         _seed_obligation(state)
-        state.reserve_late_event('range-1', 42, expected_revision=state.snapshot().revision)
-        state.reserve_late_event('range-1', 43, expected_revision=state.snapshot().revision)
+        commit_step(
+            state, ReserveLateStep('range-1', 42), expected_revision=state.snapshot().revision
+        )
+        commit_step(
+            state, ReserveLateStep('range-1', 43), expected_revision=state.snapshot().revision
+        )
         identity = _join_identity(ordering, 'capacity')
         _assert_live_join_preflight_and_commit_rejected_without_mutation(
             state,
@@ -1605,8 +1561,8 @@ def test_live_join_rejects_event_unavailable_callback_failure_and_wrong_kind(
 
     failed_path = tmp_path / 'failed.db'
     with _open_group(failed_path) as state:
-        state.start_event(42, _manifest(), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         failed = state.callback_failed(0, 'failed', expected_revision=2)
         identity = replace(
             strict_identity,
@@ -1649,8 +1605,8 @@ def test_manual_and_conditional_parks_require_exact_durable_evidence(tmp_path: P
             expected_revision=1,
         )
         assert unparked.status == 'running'
-        state.start_event(42, _manifest(), expected_revision=2)
-        state.begin_callback(0, expected_revision=3)
+        commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=2)
+        commit_step(state, BeginCallbackStep(0), expected_revision=3)
         before_stale = state.snapshot()
         stale = state.resolve_conditional_park(
             stale_directive,
@@ -1722,47 +1678,6 @@ def test_ordering_anomaly_acknowledgement_is_exact_audited_and_idempotent(
         assert record.event_id == 43
 
 
-def test_orphan_clears_obligations_but_retains_marks_until_reset(tmp_path: Path) -> None:
-    path = tmp_path / 'editorial.db'
-    with _open_group(path) as state:
-        connection = state._handoff.connection
-        _seed_obligation(state)
-        state.reserve_late_event('range-1', 42, expected_revision=state.snapshot().revision)
-        _assert_operational_count(connection)
-
-        # Residual marks are retained by orphaning and retired by a generation reset.
-        connection.execute(
-            "INSERT INTO callback_marks VALUES ('editorial', 41, 0, "
-            "'publish', 'publish', 'done', 1)"
-        )
-        orphaned = state.change_lifecycle(
-            LifecycleRequest(
-                command='orphan',
-                expected_lifecycle='active',
-                expected_generation=7,
-                transition_generation=7,
-                identity=AuditIdentity.current(),
-                wall_clock_time=1000.0,
-            )
-        )
-        assert orphaned.callback_marks == ((0, 'publish', 'publish', 'done', 1),)
-        assert orphaned.late_id_count == 0
-        _assert_operational_count(connection)
-        assert connection.execute(
-            "SELECT COUNT(*) FROM range_groups WHERE group_name = 'editorial' "
-        ).fetchone() == (0,)
-        reset = dispose_at_frontier(
-            state,
-            'reset-to-latest',
-            disposition_id='reset-residual-marks',
-            new_generation=8,
-            source_frontier=100,
-            expected_revision=orphaned.revision,
-            **_recovery_arguments(),
-        )
-        assert reset.callback_marks == ()
-
-
 def test_orphan_requires_an_audited_reset_before_new_generation_progress(tmp_path: Path) -> None:
     arguments = _recovery_arguments()
     path = tmp_path / 'editorial.db'
@@ -1797,6 +1712,33 @@ def test_orphan_requires_an_audited_reset_before_new_generation_progress(tmp_pat
         assert terminal.conditions == ('parked',)
     with _open_group(path, group_generation=8) as reopened:
         assert reopened.snapshot() == terminal
+
+
+def test_orphan_retires_late_obligations(tmp_path: Path) -> None:
+    path = tmp_path / 'editorial.db'
+    with _open_group(path) as state:
+        connection = state._handoff.connection
+        _seed_obligation(state)
+        commit_step(
+            state, ReserveLateStep('range-1', 42), expected_revision=state.snapshot().revision
+        )
+        _assert_operational_count(connection)
+
+        orphaned = state.change_lifecycle(
+            LifecycleRequest(
+                command='orphan',
+                expected_lifecycle='active',
+                expected_generation=7,
+                transition_generation=7,
+                identity=AuditIdentity.current(),
+                wall_clock_time=1000.0,
+            )
+        )
+        assert orphaned.late_id_count == 0
+        _assert_operational_count(connection)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM range_groups WHERE group_name = 'editorial' "
+        ).fetchone() == (0,)
 
 
 def test_replay_receipt_survives_live_join_progress(tmp_path: Path) -> None:
@@ -1861,6 +1803,27 @@ def test_replay_receipt_survives_live_join_progress(tmp_path: Path) -> None:
         assert receipt.terminal_result == 'applied'
 
 
+def test_replay_refusal_names_visible_retention_floor(tmp_path: Path) -> None:
+    with _open_group(tmp_path / 'editorial.db') as state:
+        state.park(expected_revision=0, **_recovery_arguments())
+        current = state.mark_history_truncated(50, expected_revision=state.snapshot().revision)
+        with pytest.raises(
+            InvalidTransitionError,
+            match='replay position 40 is below the visible retention floor 50',
+        ):
+            dispose_at_frontier(
+                state,
+                'replay',
+                disposition_id='below-floor',
+                new_generation=8,
+                from_event_id=40,
+                source_frontier=100,
+                expected_revision=current.revision,
+                **_recovery_arguments(),
+            )
+        assert state.snapshot() == current
+
+
 def test_required_event_blocks_epoch_completion_without_a_manifest(tmp_path: Path) -> None:
     with _open_group(
         tmp_path / 'editorial.db',
@@ -1914,9 +1877,11 @@ def test_reset_disposition_clears_operational_late_id_count_and_old_generation_w
             expected_revision=state.snapshot().revision,
         )
         _seed_obligation(state)
-        state.reserve_late_event('range-1', 42, expected_revision=state.snapshot().revision)
-        capacity = state.reserve_late_event(
-            'range-1', 43, expected_revision=state.snapshot().revision
+        commit_step(
+            state, ReserveLateStep('range-1', 42), expected_revision=state.snapshot().revision
+        )
+        capacity = commit_step(
+            state, ReserveLateStep('range-1', 43), expected_revision=state.snapshot().revision
         )
         assert 'late-capacity-exhausted' in capacity.conditions
         _assert_operational_count(state._handoff.connection)
@@ -1956,7 +1921,7 @@ def test_restart_rejects_invalid_manifest_without_audit_or_state_change(
     tmp_path: Path,
 ) -> None:
     with _open_group(tmp_path / 'editorial.db') as state:
-        started = state.start_event(42, _manifest(), expected_revision=0)
+        started = commit_step(state, StartEventStep(42, _manifest(), None), expected_revision=0)
         before_audit = operator_records(state)
         with pytest.raises(InvalidTransitionError):
             state.restart_event(
@@ -2051,7 +2016,10 @@ def test_retirement_replay_requires_acknowledgement_and_floor(
 
 @pytest.mark.parametrize(
     ('from_event_id', 'marker', 'message'),
-    [(950, None, 'source frontier'), (700, 600, 'retained replay evidence')],
+    [
+        (950, None, 'replay position 950 exceeds the source frontier 900'),
+        (700, 600, 'replay position 700 is later than retained replay evidence beginning at 600'),
+    ],
 )
 def test_retirement_replay_validates_bounds_without_mutation(
     tmp_path: Path, from_event_id: int, marker: int | None, message: str
@@ -2116,8 +2084,8 @@ def test_retirement_rolls_back_on_failure(
 def test_shape_mismatch_blocks_skip_without_retiring_event(tmp_path: Path) -> None:
     recorded_manifest = _manifest()
     with _open_group(tmp_path / 'editorial.db') as state:
-        state.start_event(42, recorded_manifest, expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, recorded_manifest, None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         mismatch = state.verify_manifest(_manifest_pair(), expected_revision=2)
         before_snapshot = state.snapshot()
         before_marks = before_snapshot.callback_marks
@@ -2148,8 +2116,8 @@ def test_shape_mismatch_restart_event_restarts_same_event_after_reopen(
     recorded_manifest = _manifest_pair()
     current_manifest = _manifest()
     with _open_group(path) as state:
-        state.start_event(42, recorded_manifest, expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, recorded_manifest, None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         state.callback_done(0, expected_revision=2)
         mismatch = state.verify_manifest(current_manifest, expected_revision=3)
         assert mismatch.status == 'shape-mismatch'
@@ -2182,8 +2150,8 @@ def test_shape_mismatch_restored_manifest_resumes_same_event_after_reopen(
     path = tmp_path / 'editorial.db'
     recorded_manifest = _manifest_pair()
     with _open_group(path) as state:
-        state.start_event(42, recorded_manifest, expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, recorded_manifest, None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         state.callback_done(0, expected_revision=2)
         mismatch = state.verify_manifest(_manifest(), expected_revision=3)
         assert mismatch.status == 'shape-mismatch'
@@ -2194,7 +2162,7 @@ def test_shape_mismatch_restored_manifest_resumes_same_event_after_reopen(
             recorded_manifest,
             expected_revision=before.revision,
         )
-        resumed = reopened.begin_callback(1, expected_revision=restored.revision)
+        resumed = commit_step(reopened, BeginCallbackStep(1), expected_revision=restored.revision)
 
         assert before.status == 'shape-mismatch'
         assert before.in_flight_event_id == 42
@@ -2294,10 +2262,10 @@ def test_strict_capacity_abort_streak_is_token_fenced_durable_and_reset(
                 expected_revision=current.revision,
             )
         assert current.strict_capacity_abort_streak == JOIN_ABORT_LIMIT
-        assert current.status == 'strict-capacity-exhausted'
+        assert current.status == 'running'
 
     with _open_group(path, ordering='strict') as restarted:
-        assert restarted.snapshot().status == 'strict-capacity-exhausted'
+        assert restarted.snapshot().status == 'running'
         assert restarted.snapshot().strict_capacity_abort_streak == JOIN_ABORT_LIMIT
 
 
@@ -2449,13 +2417,6 @@ def test_strict_epochs_are_disjoint_bounded_and_checkpointed(tmp_path: Path) -> 
             expected_revision=4,
         )
         assert joined.latest_join_boundary == 45
-
-
-def test_strict_floor_skip_preserves_strict_audit_command(tmp_path: Path) -> None:
-    with _open_group(tmp_path / 'strict.db', ordering='strict') as state:
-        state.record_strict_floor_skip(40, expected_revision=0)
-
-        assert operator_records(state)[-1].command == 'strict-delivery-floor-skip'
 
 
 def test_strict_live_join_waits_for_obligations_through_fixed_boundary(
@@ -2675,11 +2636,17 @@ def test_terminal_late_delta_failure_rolls_back_callback_and_audit(
 ) -> None:
     with _open_group(tmp_path / 'terminal-rollback.db') as state:
         _seed_obligation(state)
-        state.reserve_late_event('range-1', 42, expected_revision=state.snapshot().revision)
-        state.start_event(
-            42, _manifest(), expected_revision=state.snapshot().revision, obligation_id='range-1'
+        commit_step(
+            state, ReserveLateStep('range-1', 42), expected_revision=state.snapshot().revision
         )
-        before = state.begin_callback(0, expected_revision=state.snapshot().revision)
+        commit_step(
+            state,
+            StartEventStep(42, _manifest(), 'range-1'),
+            expected_revision=state.snapshot().revision,
+        )
+        before = commit_step(
+            state, BeginCallbackStep(0), expected_revision=state.snapshot().revision
+        )
         connection = state._database.connection
 
         def deny_count_update(

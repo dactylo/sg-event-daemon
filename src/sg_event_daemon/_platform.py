@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import re
+import resource
 import socket
 import stat
 import struct
@@ -37,6 +38,8 @@ _KIND_PATTERN = re.compile(r'[a-z][a-z0-9-]*\Z')
 _LINUX_SOCKET_PATH_LIMIT = 107
 _LOCAL_PEERPID = 2
 _MACOS_SOCKET_PATH_LIMIT = 103
+_OPEN_FILE_FALLBACK = 10_240
+_OPEN_FILE_TARGET = 65_536
 _SO_LOCAL = 0
 
 
@@ -70,11 +73,21 @@ class FileLock:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Release the lock when leaving a context."""
+        """Release the lock when leaving a context.
+
+        Raises:
+            OSError: Releasing the advisory lock or closing its descriptor
+                fails.
+        """
         self.close()
 
     def close(self) -> None:
-        """Release the advisory lock and close its descriptor."""
+        """Release the advisory lock and close its descriptor.
+
+        Raises:
+            OSError: Releasing the advisory lock or closing its descriptor
+                fails.
+        """
         if self._fd < 0:
             return
         fd = self._fd
@@ -174,11 +187,14 @@ def _socket_digest(state_dir: Path, kind: str, identity: Iterable[str]) -> str:
     return base64.urlsafe_b64encode(digest).decode().rstrip('=')
 
 
-def _socket_is_live(path: Path) -> bool:
+def _socket_is_live(path: Path, *, timeout_secs: float) -> bool:
     """Return whether a Unix socket path accepts a connection."""
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        probe.settimeout(timeout_secs)
         probe.connect(os.fspath(path))
+    except TimeoutError:
+        return True
     except OSError as exc:
         if exc.errno in {errno.ECONNREFUSED, errno.ENOENT, errno.ECONNRESET}:
             return False
@@ -283,6 +299,15 @@ def _verify_regular_file(path: Path, metadata: os.stat_result) -> None:
         raise SecurityError(f'state file must use mode 0600: {path}')
 
 
+def acquire_flock_exclusive(fd: int) -> None:
+    """Wait in the kernel for an exclusive advisory lock on `fd`.
+
+    Raises:
+        OSError: The kernel cannot acquire the advisory lock.
+    """
+    _flock(fd, 'LOCK_EX')
+
+
 @cache
 def boot_identity() -> str:
     """Return one stable identity for the running operating-system boot.
@@ -354,6 +379,7 @@ def ensure_secure_state_dir(path: Path) -> Path:
             nor the daemon user, or is writable by others without the sticky
             bit.
         RuntimeError: If the current platform is unsupported.
+        OSError: Resolving, creating, or inspecting the state directory fails.
     """
     _ensure_supported_platform()
     parent_fd = _open_parent_directory(path)
@@ -407,6 +433,27 @@ def pending_socket_bytes(sock: socket.socket) -> int:
     return count[0]
 
 
+def raise_open_file_limit() -> tuple[int, int]:
+    """Raise the soft descriptor limit without lowering an existing allowance.
+
+    Returns:
+        The resulting soft and hard RLIMIT_NOFILE limits. Kernel refusals
+        preserve the existing limit after a bounded fallback attempt.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = _OPEN_FILE_TARGET if hard == resource.RLIM_INFINITY else min(hard, _OPEN_FILE_TARGET)
+    if soft == resource.RLIM_INFINITY or target <= soft:
+        return soft, hard
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        fallback = min(target, _OPEN_FILE_FALLBACK)
+        if fallback > soft:
+            with suppress(ValueError, OSError):
+                resource.setrlimit(resource.RLIMIT_NOFILE, (fallback, hard))
+    return resource.getrlimit(resource.RLIMIT_NOFILE)
+
+
 def reap_child(
     process: ChildProcess,
     *,
@@ -435,19 +482,25 @@ def reap_child(
 
 
 def release_flock(fd: int) -> None:
-    """Release the advisory `flock` held through `fd`."""
+    """Release the advisory `flock` held through `fd`.
+
+    Raises:
+        OSError: The kernel cannot release the advisory lock.
+    """
     _flock(fd, 'LOCK_UN')
 
 
-def remove_stale_socket(path: Path) -> None:
+def remove_stale_socket(path: Path, *, timeout_secs: float = 1.0) -> None:
     """Remove a stale owner-only socket after checking its parent and identity.
 
     Args:
         path: Socket path to inspect immediately before binding.
+        timeout_secs: Owning shutdown slice bounding the listener probe.
 
     Raises:
         SecurityError: The parent or existing socket is unsafe, live, or
             replaced during inspection.
+        OSError: Resolving, inspecting, or removing the socket path fails.
     """
     parent_fd = _open_parent_directory(path)
     try:
@@ -461,7 +514,7 @@ def remove_stale_socket(path: Path) -> None:
             raise SecurityError(f'existing socket has the wrong owner: {path}')
         if stat.S_IMODE(metadata.st_mode) != FILE_MODE:
             raise SecurityError(f'existing socket must use mode 0600: {path}')
-        if _socket_is_live(path):
+        if _socket_is_live(path, timeout_secs=timeout_secs):
             raise SecurityError(f'existing socket has a live listener: {path}')
         current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
@@ -484,6 +537,7 @@ def secure_open_regular_file(path: Path, *, create: bool = True) -> tuple[int, b
     Raises:
         SecurityError: If the file or its parent directory is unsafe.
         FileNotFoundError: If the file is missing and creation is disabled.
+        OSError: Resolving or inspecting the file or parent directory fails.
     """
     _ensure_supported_platform()
     parent_fd = _open_parent_directory(path)
@@ -530,6 +584,8 @@ def acquire_lock(path: Path) -> FileLock:
     Raises:
         AlreadyLockedError: If another process or descriptor owns the lock.
         SecurityError: If the lock path is not an owner-only regular file.
+        OSError: Inspecting, locking, reading, or recording the lock file
+            fails.
     """
     fd, _ = secure_open_regular_file(path)
     try:
@@ -566,6 +622,8 @@ def spawn_child(
 
     Raises:
         ValueError: If the argument vector or descriptor allowlist is invalid.
+        OSError: The child process cannot be created or its executable cannot
+            be started.
     """
     if not argv or any(not value for value in argv):
         raise ValueError('child argv must contain nonempty strings')
@@ -591,6 +649,9 @@ def terminate_child(
     Args:
         process: Child process created by `spawn_child`.
         force: Kill immediately instead of requesting normal termination.
+
+    Raises:
+        OSError: Signaling the child process fails.
     """
     if process.poll() is not None:
         return
@@ -612,6 +673,10 @@ def try_flock_exclusive(fd: int) -> bool:
     Returns:
         `True` when this call acquired the lock, `False` when another open file
         description holds it.
+
+    Raises:
+        OSError: The kernel rejects the lock operation for a reason other than
+            contention.
     """
     try:
         _flock(fd, 'LOCK_EX', 'LOCK_NB')
@@ -630,6 +695,7 @@ def validate_secure_directory(path: Path) -> None:
         SecurityError: The directory or its parent is unsafe, or cannot be
             securely opened.
         FileNotFoundError: The directory or its parent does not exist.
+        OSError: Resolving or inspecting the directory or its parent fails.
     """
     _ensure_supported_platform()
     parent_fd = _open_parent_directory(path)
@@ -657,6 +723,8 @@ def local_socket_path_candidate(
     Raises:
         SecurityError: If `kind` is invalid or no existing private runtime root
             provides a short enough fallback path.
+        OSError: Resolving the state-directory path for the fallback digest
+            fails.
     """
     if _KIND_PATTERN.fullmatch(kind) is None:
         raise SecurityError(f'invalid socket kind: {kind!r}')
@@ -691,6 +759,8 @@ def local_socket_path(
     state_dir: Path,
     kind: str,
     identity: Iterable[str],
+    *,
+    timeout_secs: float = 1.0,
 ) -> Path:
     """Return a secure ordinary or identity-hashed Unix socket path.
 
@@ -698,6 +768,7 @@ def local_socket_path(
         state_dir: Secure daemon state directory for the owning component.
         kind: Socket kind used in the ordinary and fallback filenames.
         identity: Structured stable identity included in the fallback digest.
+        timeout_secs: Owning shutdown slice bounding the stale-listener probe.
 
     Returns:
         A socket path whose stale same-user predecessor has been removed.
@@ -705,10 +776,12 @@ def local_socket_path(
     Raises:
         SecurityError: If the state, fallback, or existing socket path is
             unsafe.
+        OSError: Resolving or preparing the socket directory or removing a
+            stale socket fails.
     """
     result = local_socket_path_candidate(state_dir, kind, identity)
     ensure_secure_state_dir(state_dir)
     if result.parent != state_dir:
         ensure_secure_state_dir(result.parent)
-    remove_stale_socket(result)
+    remove_stale_socket(result, timeout_secs=timeout_secs)
     return result

@@ -7,28 +7,36 @@ import os
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, Unpack
 
 from sg_event_daemon._platform import (
+    acquire_flock_exclusive,
     release_flock,
     secure_open_regular_file,
     try_flock_exclusive,
 )
-from sg_event_daemon._sqlite import DatabaseError
+from sg_event_daemon._sqlite import WAL_IN_USE_LIMIT_BYTES, DatabaseError, wal_file_bytes
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    import logging
+    from collections.abc import Callable, Generator, Mapping
     from contextlib import AbstractContextManager
     from pathlib import Path
 
-WriteLockLevel: TypeAlias = Literal['process-local', 'file', 'SQLite']
+    from sg_event_daemon._health import ConditionFlags
+
+WriteLockLevel: TypeAlias = Literal['pause', 'process-local', 'file', 'SQLite']
 WritePhase: TypeAlias = Literal['write-lock-wait', 'write-hold']
+_WritePolicy: TypeAlias = Literal['wait', 'one-attempt', 'operator']
 
 OPERATOR_WRITE_BUDGET_SECS = 2.0
 WRITE_HOLD_DEADLINE_SECS = 5.0
-_FILE_LOCK_RETRY_SECS = 0.001
+_FILE_WAITS: dict[str, _FileWait] = {}
+_FILE_WAIT_CHANGED = threading.Condition()
+_PAUSE_RETRY_SECS = 0.05
 _REGISTRY: dict[str, _ProcessEntry] = {}
 _REGISTRY_LOCK = threading.Lock()
 _SQLITE_BUSY = 5
@@ -88,6 +96,38 @@ class WriteTiming:
     finished_at: float = math.nan
 
 
+@dataclass(frozen=True)
+class _FileLease:
+    """Identify the acquired open file description and its release ownership."""
+
+    fd: int
+    close_on_release: bool
+
+
+@dataclass
+class _FileWait:
+    """Keep one outstanding kernel acquisition alive independently of entry references."""
+
+    lease: _FileLease
+    authorized: bool = False
+    acquired: bool = False
+    abandoned: bool = False
+    error: OSError | None = None
+
+    def result(self) -> _FileLease | None:
+        """Return the acquired lease or raise the helper's acquisition failure.
+
+        Returns:
+            The acquired lease, or `None` while acquisition remains pending.
+
+        Raises:
+            OSError: The helper could not acquire the file lock.
+        """
+        if self.error is not None:
+            raise self.error
+        return self.lease if self.acquired else None
+
+
 @dataclass
 class _ProcessEntry:
     """Share one process-local lock and lock-file descriptor for one path."""
@@ -106,22 +146,26 @@ class _Attempt:
     timing: WriteTiming
     deadline_at: float
     stop: threading.Event | None
+    slice_secs: float
 
 
 class _TransactionOptions(TypedDict, total=False):
     """Type optional per-transaction budget, stop, timing, and watch arguments."""
 
     budget_secs: float
+    slice_secs: float
     stop: threading.Event
     timing: WriteTiming
     watch: _PhaseWatcher
 
 
 class _WriteLockSeams(TypedDict, total=False):
-    """Type optional monotonic clock and sleep replacements for tests."""
+    """Type optional timing and WAL sampling replacements for tests."""
 
     clock: Callable[[], float]
     sleep: Callable[[float], None]
+    wal_bytes: Callable[[], int]
+    wal_limit_bytes: int
 
 
 class SourceWriteLock:
@@ -129,12 +173,14 @@ class SourceWriteLock:
 
     Every instance for the same lock-file path in one process shares one
     process-local `threading.Lock` and one open lock-file descriptor, so
-    threads queue in-process before one of them polls the cross-process
-    `flock`. A transaction passes through two disjoint phases: acquisition,
-    bounded by one budget across the process-local lock, the file lock, and
-    SQLite's `BEGIN IMMEDIATE` wait; then the protected write, from `BEGIN
-    IMMEDIATE` to `COMMIT` or rollback. A thread holds at most one transaction
-    per lock path.
+    threads queue in-process before one of them waits for the cross-process
+    `flock` on a helper with an independently opened descriptor. A transaction
+    passes through two disjoint phases: acquisition, bounded by one budget
+    across the process-local lock, the file lock, and SQLite's `BEGIN
+    IMMEDIATE` wait; then the protected write, from `BEGIN IMMEDIATE` to
+    `COMMIT` or rollback. A thread holds at most one transaction per lock path.
+    A WAL past the growth bound expires acquisition before either lock is
+    taken.
     Call `close()` when the owner stops; the shared descriptor closes with the
     last instance for its path.
     """
@@ -143,6 +189,7 @@ class SourceWriteLock:
         self,
         lock_path: Path,
         *,
+        database_path: Path,
         timeout_secs: float,
         wait_phase_grace_secs: float,
         **seams: Unpack[_WriteLockSeams],
@@ -152,56 +199,107 @@ class SourceWriteLock:
         Args:
             lock_path: The source database's `.db.write-lock` file beneath a
                 secure state directory; created owner-only when absent.
+            database_path: Source database whose WAL size gates each attempt.
             timeout_secs: Default acquisition budget, normally
                 `write_lock_timeout_secs()`.
             wait_phase_grace_secs: Allowance added to the budget for the
-                `write-lock-wait` phase deadline, normally one health interval.
-            **seams: Optional monotonic clock and sleep replacements.
+                `write-lock-wait` phase deadline, normally the shared watchdog
+                grace.
+            **seams: Optional clock, sleep, WAL-size reader, and byte bound.
 
         Raises:
             ValueError: A duration is not finite and positive.
             SecurityError: The lock file or its parent directory is unsafe.
+            OSError: Resolving or opening the lock-file path fails.
         """
         _validate_positive(timeout_secs, 'write lock timeout')
         _validate_positive(wait_phase_grace_secs, 'write lock wait grace')
-        self._path = lock_path
+        self.path = lock_path
+        self.database_path = database_path
         self._key = str(lock_path.absolute())
         self._timeout_secs = timeout_secs
-        self._wait_phase_grace_secs = wait_phase_grace_secs
-        self._clock = seams.get('clock', time.monotonic)
-        self._sleep = seams.get('sleep', time.sleep)
+        self.wait_phase_grace_secs = wait_phase_grace_secs
+        self.clock = seams.get('clock', time.monotonic)
+        self.sleep = seams.get('sleep', time.sleep)
+        self._wal_bytes = seams.get('wal_bytes', lambda: wal_file_bytes(database_path))
+        self.wal_limit_bytes = seams.get('wal_limit_bytes', WAL_IN_USE_LIMIT_BYTES)
         self._entry: _ProcessEntry | None = _share_entry(self._key, lock_path)
 
     def _remaining(self, level: WriteLockLevel, attempt: _Attempt) -> float:
         """Return the budget left, refusing a stop request or a spent budget."""
-        now = self._clock()
+        now = self.clock()
         waited = now - attempt.timing.started_at
         if attempt.stop is not None and attempt.stop.is_set():
             raise WriteLockStoppedError(
-                f'write lock wait for {self._path} stopped after {waited:.3f}s'
+                f'write lock wait for {self.path} stopped after {waited:.3f}s'
             )
         remaining = attempt.deadline_at - now
         if remaining <= 0:
             raise WriteLockTimeoutError(
-                f'write lock wait expired at the {level} level for {self._path} '
+                f'write lock wait expired at the {level} level for {self.path} '
                 f'after {waited:.3f}s',
                 level,
             )
         return remaining
 
-    def _acquire_file(self, attempt: _Attempt) -> None:
-        """Poll the cross-process lock while the budget lasts and no stop is requested."""
-        while True:
-            remaining = self._remaining('file', attempt)
-            if try_flock_exclusive(attempt.entry.fd):
-                return
-            self._sleep(min(_FILE_LOCK_RETRY_SECS, remaining))
+    def _acquire_file(self, attempt: _Attempt) -> _FileLease:
+        """Try once, then claim a kernel helper's lease within the remaining budget."""
+        self._remaining('file', attempt)
+        if try_flock_exclusive(attempt.entry.fd):
+            return _FileLease(attempt.entry.fd, close_on_release=False)
+        slice_secs = (
+            min(attempt.slice_secs, _STOP_POLL_SECS)
+            if attempt.stop is not None
+            else attempt.slice_secs
+        )
+        with _FILE_WAIT_CHANGED:
+            # An abandoned job still owns its descriptor and registry slot until
+            # the kernel returns. Retries wait here instead of queuing more jobs.
+            while self._key in _FILE_WAITS:
+                remaining = self._remaining('file', attempt)
+                _FILE_WAIT_CHANGED.wait(min(remaining, slice_secs))
+            self._remaining('file', attempt)
+            fd, _created = secure_open_regular_file(self.path)
+            job = _FileWait(_FileLease(fd, close_on_release=True))
+            _FILE_WAITS[self._key] = job
+            try:
+                threading.Thread(
+                    target=_wait_for_file,
+                    args=(self._key, job),
+                    name='source-write-lock',
+                    daemon=True,
+                ).start()
+                job.authorized = True
+                while True:
+                    remaining = self._remaining('file', attempt)
+                    lease = job.result()
+                    if lease is not None:
+                        del _FILE_WAITS[self._key]
+                        _FILE_WAIT_CHANGED.notify_all()
+                        return lease
+                    _FILE_WAIT_CHANGED.wait(min(remaining, slice_secs))
+            except BaseException:
+                job.abandoned = True
+                if not job.authorized or job.acquired or job.error is not None:
+                    try:
+                        if job.acquired:
+                            _release_file(job.lease)
+                        elif not job.authorized:
+                            os.close(fd)
+                    finally:
+                        del _FILE_WAITS[self._key]
+                        _FILE_WAIT_CHANGED.notify_all()
+                raise
 
     def _acquire_local(self, attempt: _Attempt) -> None:
         """Wait for the process-local lock while the budget lasts and no stop is requested."""
         while True:
             remaining = self._remaining('process-local', attempt)
-            wait_secs = remaining if attempt.stop is None else min(remaining, _STOP_POLL_SECS)
+            wait_secs = (
+                remaining
+                if attempt.stop is None
+                else min(remaining, _STOP_POLL_SECS, attempt.slice_secs)
+            )
             if attempt.entry.lock.acquire(timeout=wait_secs):
                 break
         attempt.entry.holder = threading.get_ident()
@@ -218,32 +316,29 @@ class SourceWriteLock:
             (configured,) = connection.execute('PRAGMA busy_timeout').fetchone()
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
-        failure: BaseException | None = None
-        try:
+        while True:
             remaining = self._remaining('SQLite', attempt)
-            remaining_ms = max(1, math.floor(remaining * 1000))
+            failure: BaseException | None = None
             try:
-                connection.execute(f'PRAGMA busy_timeout={remaining_ms}')
-            except sqlite3.Error as exc:
-                raise DatabaseError(str(exc)) from exc
-            self._remaining('SQLite', attempt)
-            try:
-                connection.execute('BEGIN IMMEDIATE')
-                attempt.timing.begun_at = self._clock()
-            except sqlite3.Error as exc:
-                if _is_busy(exc):
-                    waited = self._clock() - attempt.timing.started_at
-                    raise WriteLockTimeoutError(
-                        f'write lock wait expired at the SQLite level for {self._path} '
-                        f'after {waited:.3f}s',
-                        'SQLite',
-                    ) from exc
-                raise DatabaseError(str(exc)) from exc
-        except BaseException as exc:
-            failure = exc
-            raise
-        finally:
-            _restore_busy_timeout(connection, int(configured), failure)
+                remaining_ms = max(1, math.floor(min(attempt.slice_secs, remaining) * 1000))
+                try:
+                    connection.execute(f'PRAGMA busy_timeout={remaining_ms}')
+                except sqlite3.Error as exc:
+                    raise DatabaseError(str(exc)) from exc
+                self._remaining('SQLite', attempt)
+                try:
+                    connection.execute('BEGIN IMMEDIATE')
+                except sqlite3.Error as exc:
+                    if not _is_busy(exc):
+                        raise DatabaseError(str(exc)) from exc
+                else:
+                    attempt.timing.begun_at = self.clock()
+                    return
+            except BaseException as exc:
+                failure = exc
+                raise
+            finally:
+                _restore_busy_timeout(connection, int(configured), failure)
 
     def _rollback(
         self, connection: sqlite3.Connection, primary: BaseException, timing: WriteTiming
@@ -252,29 +347,42 @@ class SourceWriteLock:
         try:
             _rollback(connection, primary)
         finally:
-            timing.finished_at = self._clock()
+            timing.finished_at = self.clock()
 
-    def _acquire(self, attempt: _Attempt, connection: sqlite3.Connection) -> None:
+    def _acquire(self, attempt: _Attempt, connection: sqlite3.Connection) -> _FileLease:
         """Take the process-local lock, the file lock, and then `BEGIN IMMEDIATE`."""
+        self._remaining('process-local', attempt)
+        if self._wal_bytes() > self.wal_limit_bytes:
+            raise WriteLockTimeoutError(
+                f'writes to {self.database_path} paused at the WAL growth bound', 'pause'
+            )
         self._acquire_local(attempt)
         try:
-            attempt.timing.local_acquired_at = self._clock()
-            self._acquire_file(attempt)
+            attempt.timing.local_acquired_at = self.clock()
+            lease = self._acquire_file(attempt)
             try:
-                attempt.timing.file_acquired_at = self._clock()
+                attempt.timing.file_acquired_at = self.clock()
                 self._begin(attempt, connection)
             except BaseException as exc:
-                if connection.in_transaction:
-                    self._rollback(connection, exc, attempt.timing)
-                release_flock(attempt.entry.fd)
+                try:
+                    if connection.in_transaction:
+                        self._rollback(connection, exc, attempt.timing)
+                finally:
+                    _release_file(lease)
                 raise
         except BaseException:
             attempt.entry.holder = None
             attempt.entry.lock.release()
             raise
+        else:
+            return lease
 
     def _settle(
-        self, connection: sqlite3.Connection, attempt: _Attempt, primary: BaseException | None
+        self,
+        connection: sqlite3.Connection,
+        attempt: _Attempt,
+        lease: _FileLease,
+        primary: BaseException | None,
     ) -> None:
         """Roll back an open transaction before releasing both locks."""
         try:
@@ -283,14 +391,18 @@ class SourceWriteLock:
                     try:
                         connection.rollback()
                     finally:
-                        attempt.timing.finished_at = self._clock()
+                        attempt.timing.finished_at = self.clock()
                 else:
                     self._rollback(connection, primary, attempt.timing)
         finally:
-            _release(attempt.entry)
+            _release(attempt.entry, lease)
 
     def close(self) -> None:
-        """Release this instance's share of the process entry; repeated calls are harmless."""
+        """Release this instance's share of the process entry; repeated calls are harmless.
+
+        Raises:
+            OSError: Closing the last shared lock-file descriptor fails.
+        """
         entry = self._entry
         if entry is None:
             return
@@ -311,44 +423,52 @@ class SourceWriteLock:
             **options: `budget_secs` overrides the default acquisition budget;
                 `stop` abandons acquisition once set; `watch` publishes the
                 `write-lock-wait` and `write-hold` phases; `timing` receives
-                the phase boundaries.
+                the phase boundaries; `slice_secs` caps each uninterruptible
+                SQLite wait, in seconds.
 
         Yields:
             The connection while its immediate transaction is active.
 
         Raises:
-            WriteLockTimeoutError: The acquisition budget ran out at a named
-                level.
+            WriteLockTimeoutError: The WAL is over its growth bound, or the
+                acquisition budget ran out at a named level.
             WriteLockStoppedError: `stop` was set during acquisition.
             DatabaseError: The instance is closed, this thread already holds a
                 transaction on this lock path, or SQLite failed.
-            ValueError: `budget_secs` is not finite and positive.
+            ValueError: The acquisition budget or slice is not finite and
+                positive.
+            SecurityError: The lock file or its parent directory is unsafe.
+            OSError: WAL inspection or lock-file acquisition or release fails.
+            RuntimeError: The file-lock acquisition helper thread cannot start.
         """
         entry = self._entry
         if entry is None:
-            raise DatabaseError(f'write lock is closed: {self._path}')
+            raise DatabaseError(f'write lock is closed: {self.path}')
         if entry.holder == threading.get_ident():
-            raise DatabaseError(f'nested write transaction on {self._path}')
+            raise DatabaseError(f'nested write transaction on {self.path}')
         budget_secs = options.get('budget_secs', self._timeout_secs)
         _validate_positive(budget_secs, 'write lock budget')
+        slice_secs = options.get('slice_secs', 1.0)
+        _validate_positive(slice_secs, 'write lock slice')
         watch = options.get('watch', _no_watch)
         timing = options.get('timing')
         if timing is None:
             timing = WriteTiming()
-        timing.started_at = self._clock()
-        attempt = _Attempt(entry, timing, timing.started_at + budget_secs, options.get('stop'))
-        acquired = False
+        timing.started_at = self.clock()
+        attempt = _Attempt(
+            entry, timing, timing.started_at + budget_secs, options.get('stop'), slice_secs
+        )
+        lease: _FileLease | None = None
         try:
             with watch(
                 'write-lock-wait',
-                write_lock_wait_budget_secs(attempt.deadline_at, self._wait_phase_grace_secs),
+                write_lock_wait_budget_secs(attempt.deadline_at, self.wait_phase_grace_secs),
             ):
-                self._acquire(attempt, connection)
-                acquired = True
+                lease = self._acquire(attempt, connection)
         except BaseException as exc:
-            if acquired:
+            if lease is not None:
                 # Acquisition succeeded but leaving the watch phase failed.
-                self._settle(connection, attempt, exc)
+                self._settle(connection, attempt, lease, exc)
             raise
         primary: BaseException | None = None
         try:
@@ -356,7 +476,7 @@ class SourceWriteLock:
                 try:
                     yield connection
                     connection.commit()
-                    timing.finished_at = self._clock()
+                    timing.finished_at = self.clock()
                 except sqlite3.Error as exc:
                     error = DatabaseError(str(exc))
                     self._rollback(connection, error, timing)
@@ -365,11 +485,18 @@ class SourceWriteLock:
                     self._rollback(connection, exc, timing)
                     raise
         except BaseException as exc:
-            # Cleanup below must not replace the error in flight (review P1-S1).
+            # Cleanup below must not replace the error in flight.
             primary = exc
             raise
         finally:
-            self._settle(connection, attempt, primary)
+            self._settle(connection, attempt, lease, primary)
+
+
+@dataclass
+class _WaitState:
+    """Remember a component's first expired attempt until its next committed write."""
+
+    started_at: float | None = None
 
 
 def _is_busy(error: sqlite3.Error) -> bool:
@@ -386,25 +513,85 @@ def _no_watch(_phase: WritePhase, _deadline_at: float, /) -> AbstractContextMana
 class WriteContext:
     """Bind one writer's lock, watchdog, stop event, and acquisition policy.
 
-    The state facade takes ownership of `lock` and closes it with its database
-    handles. Operator copies share that ownership and only override policy.
+    The state facade owns `lock` and closes it with its database handles.
+    Operator copies share those resources but keep independent warning state.
     """
 
     lock: SourceWriteLock
     watch: _PhaseWatcher = _no_watch
     stop: threading.Event | None = None
-    budget_secs: float | None = None
-    busy_is_command_failure: bool = False
+    policy: _WritePolicy = 'wait'
+    conditions: ConditionFlags | None = None
+    logger: logging.Logger | None = None
+    log_extra: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    slice_secs: float = 1.0
+    _wait: _WaitState = field(default_factory=_WaitState, init=False, compare=False)
+
+    def _expired(self, error: WriteLockTimeoutError, timing: WriteTiming) -> None:
+        """Publish one warning and retain its start across source poll retries."""
+        if self._wait.started_at is not None:
+            return
+        self._wait.started_at = timing.started_at
+        if self.conditions is not None:
+            self.conditions.set('write-lock-stalled')
+        if self.logger is not None:
+            if error.level == 'pause':
+                self.logger.warning(
+                    'writes to %s paused: the WAL file is larger than %s bytes; '
+                    'a connection outside the daemon may hold a read open or checkpoint the file',
+                    self.lock.database_path,
+                    self.lock.wal_limit_bytes,
+                    extra=self.log_extra,
+                )
+                return
+            self.logger.warning(
+                'writes to %s waited %.1fs at the %s level: a connection outside the daemon, '
+                'a queue of daemon writers, or writers paused at the WAL growth bound',
+                self.lock.path,
+                self.lock.clock() - timing.started_at,
+                error.level,
+                extra=self.log_extra,
+            )
+
+    def _pause_retry(self) -> None:
+        """Space immediate growth expiries without delaying a stop request."""
+        deadline_at = write_lock_wait_budget_secs(
+            self.lock.clock() + _PAUSE_RETRY_SECS,
+            self.lock.wait_phase_grace_secs,
+        )
+        with self.watch('write-lock-wait', deadline_at):
+            if self.stop is None:
+                self.lock.sleep(_PAUSE_RETRY_SECS)
+            elif self.stop.wait(_PAUSE_RETRY_SECS):
+                raise WriteLockStoppedError('WAL growth pause stopped')
+
+    def _resumed(self) -> None:
+        """Clear a warning only after this context has committed a write."""
+        started_at = self._wait.started_at
+        if started_at is None:
+            return
+        if self.conditions is not None:
+            self.conditions.clear('write-lock-stalled')
+        if self.logger is not None:
+            self.logger.info(
+                'writes to %s resumed after waiting %.1fs',
+                self.lock.path,
+                self.lock.clock() - started_at,
+                extra=self.log_extra,
+            )
+        self._wait.started_at = None
 
     def for_operator(self) -> WriteContext:
-        """Return a bounded retryable operator policy sharing this writer's resources."""
-        return replace(self, budget_secs=OPERATOR_WRITE_BUDGET_SECS, busy_is_command_failure=True)
+        """Return one bounded operator attempt with fresh warning state."""
+        return replace(self, policy='operator')
 
     @contextmanager
     def transaction(self, connection: sqlite3.Connection) -> Generator[sqlite3.Connection]:
-        """Run one protected write, translating operator acquisition timeouts only.
+        """Acquire according to policy, then run exactly one protected write.
 
-        Commit on normal exit and roll back when the body raises.
+        Commit on normal exit and roll back when the body raises. Only
+        acquisition expiry is retried: failures in the body or commit always
+        propagate.
 
         Args:
             connection: An open connection to the database guarded by `lock`,
@@ -414,36 +601,40 @@ class WriteContext:
             The connection while its immediate transaction is active.
 
         Raises:
-            SourceDatabaseBusyError: Acquisition timed out while
-                `busy_is_command_failure` is true.
-            WriteLockTimeoutError: Acquisition timed out while
-                `busy_is_command_failure` is false.
+            SourceDatabaseBusyError: An operator's acquisition attempt expired.
+            WriteLockTimeoutError: A one-attempt acquisition expired.
             WriteLockStoppedError: `stop` was set during acquisition.
             DatabaseError: The lock is closed, this thread already holds a
                 transaction on its path, or SQLite failed.
-            ValueError: The acquisition budget is not finite and positive.
+            ValueError: The acquisition budget or slice is not finite and
+                positive.
+            SecurityError: The lock file or its parent directory is unsafe.
+            OSError: WAL inspection or lock-file acquisition or release fails.
+            RuntimeError: The file-lock acquisition helper thread cannot start.
         """
-        options: _TransactionOptions = {'watch': self.watch}
+        options: _TransactionOptions = {'watch': self.watch, 'slice_secs': self.slice_secs}
         if self.stop is not None:
             options['stop'] = self.stop
-        if self.budget_secs is not None:
-            options['budget_secs'] = self.budget_secs
-        try:
-            with self.lock.transaction(connection, **options) as active:
-                yield active
-        except WriteLockTimeoutError as error:
-            if self.busy_is_command_failure:
-                raise SourceDatabaseBusyError(str(error)) from error
-            raise
-
-
-def _release(entry: _ProcessEntry) -> None:
-    """Release the file lock and then the process-local lock."""
-    try:
-        release_flock(entry.fd)
-    finally:
-        entry.holder = None
-        entry.lock.release()
+        if self.policy == 'operator':
+            options['budget_secs'] = OPERATOR_WRITE_BUDGET_SECS
+        with ExitStack() as stack:
+            while True:
+                timing = WriteTiming()
+                options['timing'] = timing
+                try:
+                    active = stack.enter_context(self.lock.transaction(connection, **options))
+                except WriteLockTimeoutError as error:
+                    if self.policy == 'operator':
+                        raise SourceDatabaseBusyError(str(error)) from error
+                    self._expired(error, timing)
+                    if self.policy == 'one-attempt':
+                        raise
+                    if error.level == 'pause':
+                        self._pause_retry()
+                else:
+                    break
+            yield active
+        self._resumed()
 
 
 def _release_entry(key: str, entry: _ProcessEntry) -> None:
@@ -455,17 +646,38 @@ def _release_entry(key: str, entry: _ProcessEntry) -> None:
             os.close(entry.fd)
 
 
+def _release_file(lease: _FileLease) -> None:
+    """Unlock the acquired description, closing it only when the lease owns it."""
+    try:
+        release_flock(lease.fd)
+    finally:
+        if lease.close_on_release:
+            os.close(lease.fd)
+
+
+def _release(entry: _ProcessEntry, lease: _FileLease) -> None:
+    """Release the file lock and then the process-local lock."""
+    try:
+        _release_file(lease)
+    finally:
+        entry.holder = None
+        entry.lock.release()
+
+
 def _restore_busy_timeout(
     connection: sqlite3.Connection,
     configured: int,
     primary: BaseException | None,
 ) -> None:
-    """Restore `busy_timeout`, noting a failure on the error in flight instead of replacing it."""
+    """Restore `busy_timeout`, promoting a database failure over retryable expiry."""
     try:
         connection.execute(f'PRAGMA busy_timeout={configured}')
     except sqlite3.Error as error:
-        if primary is None:
-            raise DatabaseError(str(error)) from error
+        if primary is None or isinstance(primary, WriteLockTimeoutError):
+            failure = DatabaseError(str(error))
+            if primary is not None:
+                failure.add_note(f'write lock acquisition expiry: {primary!r}')
+            raise failure from error
         primary.add_note(f'busy_timeout restore failure: {error!r}')
 
 
@@ -495,8 +707,38 @@ def _validate_positive(value: float, name: str) -> None:
         raise ValueError(f'{name} must be finite and positive')
 
 
+def _wait_for_file(key: str, job: _FileWait) -> None:
+    """Publish one acquired lease or release it after the caller has abandoned it."""
+    with _FILE_WAIT_CHANGED:
+        # Thread.start can launch the OS thread and then raise. The caller
+        # retains FD ownership until it authorizes this target under the same
+        # condition, so a cancelled startup never touches a closed or reused FD.
+        if not job.authorized:
+            return
+    try:
+        acquire_flock_exclusive(job.lease.fd)
+    except OSError as error:
+        with _FILE_WAIT_CHANGED:
+            os.close(job.lease.fd)
+            job.error = error
+            if job.abandoned:
+                del _FILE_WAITS[key]
+            _FILE_WAIT_CHANGED.notify_all()
+    else:
+        with _FILE_WAIT_CHANGED:
+            if job.abandoned:
+                try:
+                    _release_file(job.lease)
+                finally:
+                    del _FILE_WAITS[key]
+                    _FILE_WAIT_CHANGED.notify_all()
+            else:
+                job.acquired = True
+                _FILE_WAIT_CHANGED.notify_all()
+
+
 def raise_owner_write_failure(error: Exception | None) -> None:
-    """Keep acquisition failures on the component thread that owns the write.
+    """Keep cooperative stops on the component thread that owns the write.
 
     Retryable operator-busy errors remain command replies. The runtime, rather
     than a mailbox or transport, decides whether a stopped wait is cooperative.
@@ -505,10 +747,9 @@ def raise_owner_write_failure(error: Exception | None) -> None:
         error: Captured request failure, if any.
 
     Raises:
-        WriteLockTimeoutError: The owning component exhausted its write budget.
         WriteLockStoppedError: The owning component's wait was interrupted.
     """
-    if isinstance(error, (WriteLockTimeoutError, WriteLockStoppedError)):
+    if isinstance(error, WriteLockStoppedError):
         raise error
 
 

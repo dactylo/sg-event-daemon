@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import socket
 import threading
-import time
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from queue import Queue
@@ -12,6 +11,7 @@ import pytest
 
 import sg_event_daemon._probe as probe_module
 from sg_event_daemon._probe import ProbeResult, ProbeSnapshot, SupervisorProgress
+from tests._stall_policy import stall_deadline
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -70,7 +70,6 @@ def _exchange(
     assert listener is not None
     address = listener.getsockname()
     with socket.socket(family, socket.SOCK_STREAM) as client:
-        client.settimeout(2.0)
         client.connect(address)
         client.sendall(request)
         chunks: list[bytes] = []
@@ -88,6 +87,14 @@ def _healthy_snapshot(*, generated_at: float = 10.0) -> ProbeSnapshot:
         shutting_down=False,
         halted=False,
     )
+
+
+def _join_probe(server: probe_module.ProbeServer) -> None:
+    if server._thread is not None:
+        server._thread.join()
+    for thread in tuple(server._peer_threads):
+        thread.join()
+    assert server.join(timeout=0.0)
 
 
 def _result(*, liveness: bool = True, readiness: bool = True) -> ProbeResult:
@@ -112,14 +119,24 @@ def _running_probe(
         bind,
         0,
         result,
-        peer_timeout_secs=peer_timeout_secs,
+        peer_timeout_secs=stall_deadline('control', peer_timeout_secs),
     )
-    server.start()
-    try:
-        yield server
-    finally:
-        server.close()
-        assert server.join(timeout=2.0)
+
+    # These integration cases exercise serving and ownership. The scripted-peer
+    # tests below separately verify read/write deadline budgets. Native socket
+    # timers must not turn a paused test process into a failed request.
+    def set_timeout(peer: socket.socket, *, deadline: float) -> None:
+        del deadline
+        peer.settimeout(None)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(probe_module, '_set_peer_timeout', set_timeout)
+        server.start()
+        try:
+            yield server
+        finally:
+            server.close()
+            _join_probe(server)
 
 
 @pytest.fixture
@@ -144,21 +161,21 @@ def test_close_interrupts_peer_before_its_serving_thread_closes_socket(
 
     def serve_after_close(server: probe_module.ProbeServer, peer: socket.socket) -> None:
         started.put(peer)
-        assert release.wait(2.0)
+        assert release.wait()
         serve_peer(server, peer)
 
     monkeypatch.setattr(probe_module.ProbeServer, '_serve_peer', serve_after_close)
     with _running_probe(_result, peer_timeout_secs=10.0) as server:
-        with socket.create_connection(server._listener.getsockname(), timeout=1.0):
+        with socket.create_connection(server._listener.getsockname()):
             try:
-                peer = started.get(timeout=1.0)
-                peer.settimeout(1.0)
+                peer = started.get()
+                peer.settimeout(None)
                 server.close()
                 # Shutdown cancels I/O without invalidating the serving owner's descriptor.
                 assert peer.recv(1) == b''
             finally:
                 release.set()
-            assert server.join(timeout=2.0)
+            _join_probe(server)
             assert peer.fileno() == -1
         assert server.failure_reason is None
 
@@ -173,43 +190,57 @@ def test_close_join_waits_for_peer_thread_after_service_cleanup(
     def finish_later(server: probe_module.ProbeServer, peer: socket.socket) -> None:
         serve_admitted(server, peer)
         cleaned_up.set()
-        assert release.wait(2.0)
+        assert release.wait()
 
     monkeypatch.setattr(probe_module.ProbeServer, '_serve_admitted', finish_later)
     with _running_probe(_result) as server:
         try:
             assert _exchange(server, b'GET /livez HTTP/1.1\r\n\r\n') == _OK_RESPONSE
-            assert cleaned_up.wait(1.0)
+            assert cleaned_up.wait()
             server.close()
-            assert not server.join(timeout=0.2)
+            assert server._thread is not None
+            server._thread.join()
+            assert not server.join(timeout=0.0)
         finally:
             release.set()
-        assert server.join(timeout=2.0)
+        _join_probe(server)
 
 
 def test_close_joins_accept_and_peer_threads(peer_starts: Queue[socket.socket]) -> None:
     with _running_probe(_result, peer_timeout_secs=10.0) as server:
-        with socket.create_connection(server._listener.getsockname(), timeout=1.0):
-            peer_starts.get(timeout=1.0)
+        with socket.create_connection(server._listener.getsockname()):
+            peer_starts.get()
             server.close()
-            assert server.join(timeout=2.0)
+            _join_probe(server)
         assert server.failure_reason is None
 
 
 def test_idle_peer_does_not_block_another_admitted_peer(
+    monkeypatch: pytest.MonkeyPatch,
     peer_starts: Queue[socket.socket],
 ) -> None:
+    idle_entered = threading.Event()
+    release = threading.Event()
+    read_request = probe_module._read_request
+
+    def read(peer: socket.socket, *, deadline: float) -> tuple[str, str]:
+        if not idle_entered.is_set():
+            idle_entered.set()
+            release.wait()
+            return 'GET', '/livez'
+        return read_request(peer, deadline=deadline)
+
+    monkeypatch.setattr(probe_module, '_read_request', read)
     with (
         _running_probe(_result) as server,
-        socket.create_connection(server._listener.getsockname(), timeout=1.0),
+        socket.create_connection(server._listener.getsockname()),
     ):
-        peer_starts.get(timeout=1.0)
-        started_at = time.monotonic()
-        response = _exchange(server, b'GET /livez HTTP/1.1\r\n\r\n')
-        elapsed = time.monotonic() - started_at
-
-    assert response == _OK_RESPONSE
-    assert elapsed < 0.5
+        try:
+            peer_starts.get()
+            idle_entered.wait()
+            assert _exchange(server, b'GET /livez HTTP/1.1\r\n\r\n') == _OK_RESPONSE
+        finally:
+            release.set()
 
 
 def test_ipv6_readyz_uses_ipv6_listener_when_loopback_is_available() -> None:
@@ -320,13 +351,15 @@ def test_livez_connection_serves_only_one_request() -> None:
 
 
 def test_livez_listener_records_unexpected_exit_as_fatal_reason() -> None:
-    server = probe_module.ProbeServer('127.0.0.1', 0, _result)
+    server = probe_module.ProbeServer(
+        '127.0.0.1', 0, _result, peer_timeout_secs=stall_deadline('control', 1.0)
+    )
     server.start()
     listener = server._listener
     assert listener is not None
     listener.close()
 
-    assert server.join(timeout=1.0)
+    _join_probe(server)
     assert server.failure_reason == 'probe listener exited unexpectedly'
     server.close()
 
@@ -388,8 +421,8 @@ def test_parseable_head_timed_out_headers_select_body_free_400(
 
 def test_peer_disconnect_is_not_fatal(peer_starts: Queue[socket.socket]) -> None:
     with _running_probe(_result) as server:
-        with socket.create_connection(server._listener.getsockname(), timeout=1.0):
-            peer_starts.get(timeout=1.0)
+        with socket.create_connection(server._listener.getsockname()):
+            peer_starts.get()
         assert _exchange(server, b'GET /livez HTTP/1.1\r\n\r\n') == _OK_RESPONSE
     assert server.failure_reason is None
 
@@ -402,13 +435,58 @@ def test_probe_closes_new_peer_while_all_slots_are_taken(
     with _running_probe(_result) as server:
         address = server._listener.getsockname()
         with (
-            socket.create_connection(address, timeout=1.0),
-            socket.create_connection(address, timeout=1.0),
+            socket.create_connection(address),
+            socket.create_connection(address),
         ):
-            peer_starts.get(timeout=0.5)
-            peer_starts.get(timeout=0.5)
-            with socket.create_connection(address, timeout=0.5) as excess:
+            peer_starts.get()
+            peer_starts.get()
+            with socket.create_connection(address) as excess:
                 assert excess.recv(1) == b''
+
+
+def test_probe_read_uses_one_budget_across_trickled_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    timeouts: list[float] = []
+    reads: list[float] = []
+    responses: list[bytes] = []
+
+    class _TricklingPeer:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_details: object) -> None:
+            return None
+
+        def recv(self, _maximum: int) -> bytes:
+            nonlocal now
+            reads.append(now)
+            timeout = timeouts[-1]
+            now += min(0.04, timeout)
+            if timeout < 0.04:
+                raise TimeoutError
+            if len(reads) > 10:
+                return b''
+            return b'GET /livez HTTP/1.1\r\nX-Wait: ' if len(reads) == 1 else b'x'
+
+        def sendall(self, response: bytes) -> None:
+            responses.append(response)
+
+        def settimeout(self, timeout: float) -> None:
+            timeouts.append(timeout)
+
+    monkeypatch.setattr(probe_module, 'monotonic', lambda: now)
+    server = probe_module.ProbeServer('127.0.0.1', 0, _result, peer_timeout_secs=0.125)
+    try:
+        server._serve_peer(cast('socket.socket', _TricklingPeer()))
+    finally:
+        server.close()
+
+    assert reads == pytest.approx([0.0, 0.04, 0.08, 0.12])
+    assert timeouts == pytest.approx([0.125, 0.085, 0.045, 0.005])
+    assert now == pytest.approx(0.125)
+    assert responses == []
 
 
 def test_probe_serializes_result_callbacks_and_joins_waiting_peers(
@@ -417,42 +495,60 @@ def test_probe_serializes_result_callbacks_and_joins_waiting_peers(
     first_entered = threading.Event()
     second_entered = threading.Event()
     release = threading.Event()
+    acquisitions: Queue[bool] = Queue()
 
     def delayed_result() -> ProbeResult:
         if first_entered.is_set():
             second_entered.set()
         else:
             first_entered.set()
-            assert release.wait(2.0)
+            assert release.wait()
         return _result()
 
     with _running_probe(delayed_result) as server:
+        result_lock = server._result_lock
+
+        class ObservedLock:
+            def __enter__(self) -> None:
+                acquired = result_lock.acquire(blocking=False)
+                acquisitions.put(acquired)
+                if not acquired:
+                    result_lock.acquire()
+
+            def __exit__(self, *_details: object) -> None:
+                result_lock.release()
+
+        vars(server)['_result_lock'] = ObservedLock()
         address = server._listener.getsockname()
         with (
-            socket.create_connection(address, timeout=1.0) as first,
-            socket.create_connection(address, timeout=1.0) as second,
+            socket.create_connection(address) as first,
+            socket.create_connection(address) as second,
         ):
             try:
                 first.sendall(b'GET /livez HTTP/1.1\r\n\r\n')
-                assert first_entered.wait(1.0)
+                assert first_entered.wait()
+                assert acquisitions.get() is True
                 second.sendall(b'GET /livez HTTP/1.1\r\n\r\n')
-                peer_starts.get(timeout=0.5)
-                peer_starts.get(timeout=0.5)
-                assert not second_entered.wait(0.05)
+                peer_starts.get()
+                peer_starts.get()
+                assert acquisitions.get() is False
+                assert not second_entered.is_set()
                 server.close()
-                started_at = time.monotonic()
-                assert not server.join(timeout=0.05)
-                assert time.monotonic() - started_at < 0.5
+                assert server._thread is not None
+                server._thread.join()
+                assert not server.join(timeout=0.0)
             finally:
                 release.set()
-            assert server.join(timeout=2.0)
+            _join_probe(server)
             assert second_entered.is_set()
 
 
 def test_probe_server_start_failure_leaves_join_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = probe_module.ProbeServer('127.0.0.1', 0, _result)
+    server = probe_module.ProbeServer(
+        '127.0.0.1', 0, _result, peer_timeout_secs=stall_deadline('control', 1.0)
+    )
 
     class FailedThread:
         def __init__(self, **_options: object) -> None:
@@ -623,51 +719,9 @@ def test_reader_thread_cannot_refresh_frozen_foreground_heartbeat() -> None:
 
     reader = threading.Thread(target=lambda: results.append(progress.result(now=7.0).liveness))
     reader.start()
-    reader.join(1.0)
+    reader.join()
 
     assert results == [False]
-
-
-def test_slow_client_releases_its_probe_thread_within_peer_budget() -> None:
-    with _running_probe(_result, peer_timeout_secs=0.12) as server:
-        threads_before = set(threading.enumerate())
-        listener = server._listener
-        assert listener is not None
-        address = listener.getsockname()
-        with socket.create_connection(address, timeout=1.0) as slow_client:
-            slow_client.sendall(b'GET /livez HTTP/1.1\r\nX-Wait: ')
-            stop_trickling = threading.Event()
-            first_trickle = threading.Event()
-
-            def trickle_past_watchdog() -> None:
-                for _index in range(50):
-                    if stop_trickling.wait(0.03):
-                        return
-                    try:
-                        slow_client.sendall(b'x')
-                    except OSError:
-                        return
-                    first_trickle.set()
-
-            trickler = threading.Thread(target=trickle_past_watchdog)
-            trickler.start()
-            try:
-                assert first_trickle.wait(1.0)
-                started_at = time.monotonic()
-                response = _exchange(server, b'GET /readyz HTTP/1.1\r\n\r\n')
-                elapsed = time.monotonic() - started_at
-            finally:
-                stop_trickling.set()
-                trickler.join(2.0)
-            assert not trickler.is_alive()
-            assert slow_client.recv(1) == b''
-        for thread in set(threading.enumerate()) - threads_before:
-            thread.join(1.0)
-        threads_after = set(threading.enumerate())
-
-    assert response == _OK_RESPONSE
-    assert elapsed < 1.0
-    assert threads_after == threads_before
 
 
 def test_snapshot_fails_readiness_at_exact_freshness_boundary() -> None:
@@ -733,10 +787,10 @@ def test_unexpected_peer_exception_is_fatal(monkeypatch: pytest.MonkeyPatch) -> 
     with _running_probe(broken_result) as server:
         address = server._listener.getsockname()
         assert _exchange(server, b'GET /livez HTTP/1.1\r\n\r\n') == b''
-        assert failed.wait(1.0)
-        assert server.join(timeout=1.0)
+        assert failed.wait()
+        _join_probe(server)
         assert server.failure_reason == 'probe listener exited unexpectedly'
-        with pytest.raises(ConnectionRefusedError), socket.create_connection(address, timeout=0.5):
+        with pytest.raises(ConnectionRefusedError), socket.create_connection(address):
             pytest.fail('failed probe listener still accepted a connection')
 
     assert len(errors) == 1

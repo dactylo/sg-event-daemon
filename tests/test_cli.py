@@ -19,14 +19,17 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 import sg_event_daemon._cli as cli_module
+import sg_event_daemon._control as control_module
 import sg_event_daemon._downstream as downstream_module
 import sg_event_daemon._logging as logging_module
 import sg_event_daemon._worker as worker_module
 from sg_event_daemon._cli import _build_parser, main
 from sg_event_daemon._config import load_acceptance_evidence, load_config
 from sg_event_daemon._control import (
+    REQUEST_TIMEOUT_SECS,
     ControlClient,
     ControlCommandError,
+    ControlOutcomeUnknownError,
     ControlRequest,
     ControlServer,
     ControlUnavailableError,
@@ -40,6 +43,7 @@ from sg_event_daemon._ipc import (
     EventPeerGrant,
     PendingDispositionSourceGroupAssignment,
     SourceEndpointReady,
+    StopCommand,
     WorkerAssignment,
     WorkerControl,
 )
@@ -54,8 +58,10 @@ from sg_event_daemon._probe import ProbeSnapshot
 from sg_event_daemon._providers import ProviderCapabilities, ProviderError
 from sg_event_daemon._source_state import SourceState
 from sg_event_daemon._supervisor import Supervisor, _SupervisorState
-from sg_event_daemon._worker import WorkerKind, WorkerSpec
+from sg_event_daemon._worker import WorkerSpec, _WorkerKind
 from tests._ipc_support import partial_startup_child_code as _partial_startup_child_code
+from tests._ipc_support import receive_control, send_control
+from tests._stall_policy import StallDetectors, stall_deadline
 from tests._storage_support import open_group_on_source, write_context_for
 from tests.cli_helpers import invoke_cli, process_transcript, run_cli, run_with_closed_output
 
@@ -68,7 +74,7 @@ if TYPE_CHECKING:
     from sg_event_daemon._ipc import SourceGroupAssignment
     from sg_event_daemon._probe import ProbeResult
     from sg_event_daemon._providers import Provider
-    from sg_event_daemon._worker import WorkerRuntime
+    from sg_event_daemon._worker import _WorkerRuntime
 
 _FIXTURES = Path(__file__).parent / 'fixtures'
 
@@ -259,13 +265,13 @@ class _LiveHandle:
         *,
         error: Exception | None = None,
     ) -> None:
-        self._calls: list[tuple[str, object, list[str] | None, dict[str, object]]] = []
-        self._closed = False
+        self.calls: list[tuple[str, object, list[str] | None, dict[str, object]]] = []
+        self.closed = False
         self._error = error
         self._records = [_live_event(123)] if records is None else records
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def find(
         self,
@@ -274,7 +280,7 @@ class _LiveHandle:
         fields: list[str] | None = None,
         **options: object,
     ) -> list[dict[str, object]]:
-        self._calls.append((entity_type, filters, fields, options))
+        self.calls.append((entity_type, filters, fields, options))
         if self._error is not None:
             raise self._error
         return list(self._records)
@@ -295,8 +301,10 @@ class _LiveProvider:
 
 
 class _OfflineControlServer:
-    def __init__(self, _state_dir: Path, _handler: object) -> None:
-        return None
+    def __init__(
+        self, _state_dir: Path, _handler: object, *, socket_probe_timeout_secs: float
+    ) -> None:
+        assert socket_probe_timeout_secs > 0
 
     def __enter__(self) -> Self:
         return self
@@ -419,6 +427,13 @@ def _control_config(tmp_path: Path) -> Path:
     return path
 
 
+def _credential_value_absent_from(path: Path) -> str:
+    value = 'test-key'
+    while value in os.fspath(path):
+        value += '-key'
+    return value
+
+
 def _fail_runtime(
     _request: ControlRequest,
     _identity: PeerIdentity,
@@ -504,8 +519,8 @@ def _offline_worker(monkeypatch: pytest.MonkeyPatch, runtime: object) -> None:
             assert timeout == 0.75
             return assignment
 
-        def send(self, _message: object) -> None:
-            return None
+        def send(self, _message: object, *, deadline_secs: float) -> None:
+            assert deadline_secs == 0.5
 
     def load_offline_config(_path: Path) -> object:
         return config
@@ -514,7 +529,7 @@ def _offline_worker(monkeypatch: pytest.MonkeyPatch, runtime: object) -> None:
         return WorkerSpec(
             worker_id=worker,
             site='test',
-            kind=WorkerKind._SITE,
+            kind=_WorkerKind.SITE,
             name='test',
             sources=(),
             groups=(),
@@ -546,8 +561,8 @@ def _run_assigned_worker(
     assignment: WorkerAssignment,
 ) -> tuple[tuple[int, str, str], list[WorkerSpec]]:
     parent_socket, child_socket = socket.socketpair()
-    parent = WorkerControl(parent_socket, max_frame_bytes=8_388_608, send_deadline_secs=1.0)
-    child = WorkerControl(child_socket, max_frame_bytes=8_388_608, send_deadline_secs=1.0)
+    parent = WorkerControl(parent_socket, max_frame_bytes=8_388_608)
+    child = WorkerControl(child_socket, max_frame_bytes=8_388_608)
     recorded: list[WorkerSpec] = []
 
     def control_from_fd(_descriptor: int, **_options: object) -> WorkerControl:
@@ -558,15 +573,15 @@ def _run_assigned_worker(
         spec: WorkerSpec,
         received: WorkerAssignment,
         control: WorkerControl,
-    ) -> WorkerRuntime:
+    ) -> _WorkerRuntime:
         worker_module.build_worker_runtime(config, spec, received, control)
         recorded.append(spec)
-        return cast('WorkerRuntime', _CompletedWorkerRuntime())
+        return cast('_WorkerRuntime', _CompletedWorkerRuntime())
 
     monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
     monkeypatch.setattr(cli_module.WorkerControl, 'from_fd', control_from_fd)
     monkeypatch.setattr(cli_module, 'build_worker_runtime', build_runtime)
-    parent.send(assignment)
+    send_control(parent, assignment)
     try:
         result = invoke_cli(
             [
@@ -599,24 +614,48 @@ def _run_with_control_server(
     argv: list[str],
     handler: _ControlHandler,
 ) -> int:
+    original_for_state_dir = ControlClient.for_state_dir
+
+    def for_state_dir(
+        _cls: type[ControlClient],
+        state_dir: Path,
+        *,
+        timeout: float = REQUEST_TIMEOUT_SECS,
+        response_timeout: float | None = None,
+    ) -> ControlClient:
+        return original_for_state_dir(
+            state_dir,
+            timeout=stall_deadline('control', timeout),
+            response_timeout=(
+                None if response_timeout is None else stall_deadline('control', response_timeout)
+            ),
+        )
+
     config_path = _control_config(tmp_path)
     stop = threading.Event()
-    with ControlServer(config_path.parent / 'state', handler) as server:
-        thread = threading.Thread(target=_run_server, args=(server, stop))
-        try:
-            thread.start()
-            return main(
-                [
-                    *argv,
-                    '--config',
-                    os.fspath(config_path),
-                ]
-            )
-        finally:
-            stop.set()
-            if thread.ident is not None:
-                thread.join(2)
-                assert not thread.is_alive()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            control_module,
+            'REQUEST_TIMEOUT_SECS',
+            stall_deadline('control', REQUEST_TIMEOUT_SECS),
+        )
+        patch.setattr(ControlClient, 'for_state_dir', classmethod(for_state_dir))
+        with ControlServer(config_path.parent / 'state', handler) as server:
+            thread = threading.Thread(target=_run_server, args=(server, stop))
+            try:
+                thread.start()
+                return main(
+                    [
+                        *argv,
+                        '--config',
+                        os.fspath(config_path),
+                    ]
+                )
+            finally:
+                stop.set()
+                if thread.ident is not None:
+                    thread.join()
+                    assert not thread.is_alive()
 
 
 def _set_live_provider(
@@ -641,8 +680,9 @@ def _set_status_client(
         _state_dir: Path,
         *,
         timeout: float = 5.0,
+        response_timeout: float | None = None,
     ) -> object:
-        del timeout
+        del timeout, response_timeout
         return client
 
     monkeypatch.setattr(
@@ -702,8 +742,8 @@ def _offline_supervise_config(
     def skip_provider_validation(_config: Config) -> None:
         return None
 
-    def start_supervisor(_supervisor: Supervisor) -> None:
-        return None
+    def start_supervisor(_supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
 
     monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
     monkeypatch.setattr(cli_module, 'ControlServer', _OfflineControlServer)
@@ -711,6 +751,72 @@ def _offline_supervise_config(
     monkeypatch.setattr(Supervisor, 'start', start_supervisor)
     monkeypatch.setattr(Supervisor, 'run', run)
     return _supervise_config(tmp_path)
+
+
+@pytest.mark.parametrize(('command', 'expected'), [('park', 0), ('status', 3)])
+def test_cli_recovery_commands_select_response_budget(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    expected: int,
+) -> None:
+    StallDetectors(monkeypatch).enable('control')
+    timeouts: list[float | None] = []
+    config_path = _control_config(tmp_path)
+
+    class _Client:
+        def request(self, requested: str, _arguments: Mapping[str, object]) -> dict[str, object]:
+            assert requested == command
+            if command == 'status':
+                raise ControlOutcomeUnknownError('no answer arrived')
+            return {'finished': True}
+
+    def for_state_dir(
+        _cls: type[ControlClient],
+        state_dir: Path,
+        *,
+        response_timeout: float | None = None,
+    ) -> _Client:
+        assert state_dir == config_path.parent / 'state'
+        timeouts.append(response_timeout)
+        return _Client()
+
+    monkeypatch.setattr(ControlClient, 'for_state_dir', classmethod(for_state_dir))
+    arguments = (
+        ['--site', 'test', '--group', 'editorial', '--reason', 'maintenance']
+        if command == 'park'
+        else []
+    )
+    result = main([command, *arguments, '--config', os.fspath(config_path)])
+    captured = capsys.readouterr()
+    assert timeouts == [600.0 if command == 'park' else None]
+    assert result == expected
+    if expected == 0:
+        assert json.loads(captured.out) == {'finished': True}
+        assert captured.err == ''
+    else:
+        assert captured.out == ''
+        assert 'supervisor did not answer within 5 seconds' in captured.err
+        assert 'recovery command may be running' in captured.err
+
+
+def test_cli_unknown_park_exits_three(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    message = (
+        'park did not finish: worker stopped. '
+        'It may still complete; run status to see the current state.'
+    )
+
+    def handler(_request: ControlRequest, _peer: PeerIdentity) -> Mapping[str, object]:
+        return {'outcome': 'unknown', 'message': message}
+
+    result = _run_with_control_server(
+        tmp_path,
+        ['park', '--site', 'test', '--group', 'editorial', '--reason', 'maintenance'],
+        handler,
+    )
+    captured = capsys.readouterr()
+    assert (result, captured.out, captured.err) == (3, '', f'error: {message}\n')
 
 
 def test_closed_stdout_before_help_is_quiet() -> None:
@@ -752,6 +858,20 @@ def test_command_help_names_option_values() -> None:
     assert ' '.join(stdout.split('\n\n', 1)[0].split()) == (
         'usage: sg-event-daemon park [-h] --config FILE --site SITE --group GROUP --reason REASON'
     )
+
+
+def test_config_warning_uses_cli_format(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    def warn(_path: Path) -> object:
+        cli_module.warnings.warn('callback deadline is short', UserWarning, stacklevel=2)
+        return object()
+
+    monkeypatch.setattr(cli_module, 'load_config', warn)
+
+    cli_module._load_config_with_warnings(tmp_path / 'config.toml')
+
+    assert capsys.readouterr().err == 'warning: callback deadline is short\n'
 
 
 def test_configuration_that_is_not_utf8_is_invalid_toml(tmp_path: Path) -> None:
@@ -804,35 +924,6 @@ def test_control_commands_never_load_or_resolve_full_configuration(
     assert result == 0
 
 
-@pytest.mark.parametrize(
-    ('command', 'arguments', 'expected_arguments'),
-    [
-        *_RECOVERY_CASES,
-        (
-            'status',
-            ['--site', 'test', '--group', 'editorial'],
-            {'site': 'test', 'group': 'editorial'},
-        ),
-    ],
-)
-def test_control_commands_send_only_their_own_arguments(
-    arguments: list[str],
-    command: str,
-    expected_arguments: Mapping[str, object],
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    client = _RecordingClient({'accepted': True})
-    _set_status_client(monkeypatch, client)
-
-    status, stdout, stderr = invoke_cli(
-        [command, *arguments, '--config', os.fspath(_control_config(tmp_path))]
-    )
-
-    assert (status, stdout, stderr) == (0, '{"accepted":true}\n', '')
-    assert client.requests == [(command, expected_arguments)]
-
-
 def test_error_lines_escape_control_characters(tmp_path: Path) -> None:
     path = tmp_path / 'daemon\x1b[31m.toml'
     status, stdout, stderr = invoke_cli(['status', '--config', os.fspath(path)])
@@ -840,34 +931,6 @@ def test_error_lines_escape_control_characters(tmp_path: Path) -> None:
     assert stderr == (
         f'error: cannot read configuration file {tmp_path}/daemon\\x1b[31m.toml: '
         'No such file or directory\n'
-    )
-
-
-@pytest.mark.parametrize(
-    ('result', 'expected'),
-    [
-        (
-            {'liveness': False, 'readiness': False},
-            (1, '{"liveness":false,"readiness":false}\n', ''),
-        ),
-        (
-            {'readiness': True},
-            (1, '{"readiness":true}\n', "error: status result has no boolean 'liveness' field\n"),
-        ),
-    ],
-)
-def test_failed_status_check_prints_its_result_and_exits_1(
-    expected: tuple[int, str, str],
-    monkeypatch: pytest.MonkeyPatch,
-    result: Mapping[str, object],
-    tmp_path: Path,
-) -> None:
-    _set_status_client(monkeypatch, _StaticStatusClient(result))
-    assert (
-        invoke_cli(
-            ['status', '--config', os.fspath(_control_config(tmp_path)), '--check', 'liveness']
-        )
-        == expected
     )
 
 
@@ -903,24 +966,6 @@ def test_help_lists_commands_in_titled_groups(monkeypatch: pytest.MonkeyPatch) -
         end = lines.index(headings[index + 1]) if index + 1 < len(headings) else len(lines)
         first_words = {line.split()[0] for line in lines[start:end] if line.split()}
         assert commands <= first_words
-
-
-@pytest.mark.parametrize(
-    ('argv', 'loader'),
-    [
-        (_VALID_COMMAND_ARGUMENTS, 'load_control_config'),
-        (['validate-config', '--config', 'daemon.toml'], 'load_config'),
-        (['supervise', '--config', 'daemon.toml'], 'load_config'),
-        (_WORKER_ARGUMENTS, 'load_config'),
-    ],
-)
-def test_interrupt_outside_a_running_service_exits_130_quietly(
-    argv: list[str],
-    loader: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(cli_module, loader, _interrupt)
-    assert invoke_cli(argv) == (130, '', '')
 
 
 def test_interrupt_while_running_a_worker_stops_cleanly(
@@ -967,68 +1012,6 @@ def test_invalid_configuration_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ('error', 'detail'),
-    [
-        pytest.param(
-            _named_error(
-                'AuthenticationFault', _named_error('Fault', _named_error('ShotgunError'))
-            )("Can't authenticate script 'test'"),
-            "Can't authenticate script 'test'",
-            id='authentication',
-        ),
-        pytest.param(
-            _named_error('ProtocolError')(
-                '<ProtocolError for example.invalid/api3/json: 503 Service Unavailable>'
-            ),
-            '<ProtocolError for example.invalid/api3/json: 503 Service Unavailable>',
-            id='http-status',
-        ),
-        pytest.param(
-            _named_error('ServerNotFoundError', _named_error('HttpLib2Error'))(
-                'Unable to find the server at example.invalid'
-            ),
-            'Unable to find the server at example.invalid',
-            id='unknown-host',
-        ),
-        pytest.param(
-            ConnectionRefusedError(61, 'Connection refused'),
-            '[Errno 61] Connection refused',
-            id='connection-refused',
-        ),
-        pytest.param(
-            ssl.SSLCertVerificationError(1, 'certificate verify failed'),
-            'certificate verify failed',
-            id='tls',
-        ),
-        pytest.param(TimeoutError(), 'TimeoutError', id='timeout-without-message'),
-        pytest.param(
-            _named_error('TransportError', _named_error('ShotgunError'))('first\nsecond'),
-            'first\\x0asecond',
-            id='multi-line-message',
-        ),
-    ],
-)
-def test_live_provider_failure_is_a_runtime_error(
-    detail: str,
-    error: Exception,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
-    handle = _LiveHandle(error=error)
-    _set_live_provider(monkeypatch, handle)
-    monkeypatch.setattr(cli_module, 'load_plugins', _load_no_plugins)
-    _set_status_client(monkeypatch, _UnavailableStatusClient())
-
-    status, stdout, stderr = invoke_cli(
-        ['validate-config', '--config', os.fspath(_FIXTURES / 'valid.toml'), '--live']
-    )
-
-    assert (status, stdout) == (1, '')
-    assert stderr.endswith(f'error: live source test/<redacted> request failed: {detail}\n')
-    assert handle._closed
-
-
 def test_livez_probe_listener_exit_is_fatal_to_supervise(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1069,8 +1052,8 @@ def test_livez_probe_listener_exit_is_fatal_to_supervise(
     def skip_provider_validation(_config: Config) -> None:
         return None
 
-    def start_supervisor(_supervisor: Supervisor) -> None:
-        return None
+    def start_supervisor(_supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
 
     monkeypatch.setattr(cli_module, 'ProbeServer', FailedProbeServer, raising=False)
     monkeypatch.setattr(cli_module, '_validated_provider', skip_provider_validation)
@@ -1178,63 +1161,24 @@ def test_normal_runs_do_not_read_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert invoke_cli(['--help'])[0] == 0
 
 
-@pytest.mark.parametrize(
-    ('argv', 'command'),
-    [
-        (['supervise', '--config', 'config.toml'], 'supervise'),
-        (
-            [
-                'run-worker',
-                '--config',
-                'config.toml',
-                '--site',
-                'test',
-                '--worker',
-                '["site","test"]',
-                '--control-fd',
-                '7',
-                '--spawn-instance',
-                'spawn-1',
-            ],
-            'run-worker',
-        ),
-        (['status', '--config', 'config.toml'], 'status'),
-        (
-            [
-                'status',
-                '--config',
-                'config.toml',
-                '--site',
-                'test',
-                '--group',
-                'editorial',
-                '--check',
-                'readiness',
-            ],
-            'status',
-        ),
-        (['validate-config', '--config', 'config.toml'], 'validate-config'),
-        (
-            [
-                'validate-config',
-                '--config',
-                'config.toml',
-                '--live',
-                '--evidence',
-                'evidence.toml',
-            ],
-            'validate-config',
-        ),
-    ],
-)
-def test_parser_accepts_documented_command_forms(
-    argv: list[str],
-    command: str,
-) -> None:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+def test_operator_reason_with_secret_marker_has_specific_error(tmp_path: Path) -> None:
+    status, stdout, stderr = invoke_cli(
+        [
+            'park',
+            '--config',
+            os.fspath(_control_config(tmp_path)),
+            '--site',
+            'test',
+            '--group',
+            'editorial',
+            '--reason',
+            'token=keep-private',
+        ]
+    )
 
-    assert args.command == command
+    assert (status, stdout) == (1, '')
+    assert '--reason must not contain secret-looking text' in stderr
+    assert 'keep-private' not in stderr
 
 
 def test_plugin_import_failure_is_a_configuration_error(
@@ -1254,7 +1198,8 @@ def test_plugin_import_failure_is_a_configuration_error(
         '',
         (
             f"{_VALIDATION_WARNING}error: import-failed for site 'test', group 'noop', "
-            "plugin 'noop': plugin import failed: boom; importing trusted plugin code "
+            "plugin 'noop': plugin import failed: RuntimeError: boom; "
+            'importing trusted plugin code '
             'executes top-level Python; it is not sandboxed or guaranteed side-effect-free\n'
         ),
     )
@@ -1272,7 +1217,8 @@ def test_probe_bind_failure_prevents_supervisor_start(
     def fail_probe_bind(*_args: object, **_options: object) -> NoReturn:
         raise OSError('probe bind failed')
 
-    def record_start(_supervisor: Supervisor) -> None:
+    def record_start(_supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
         starts.append('started')
 
     def skip_provider_validation(_config: Config) -> None:
@@ -1286,7 +1232,9 @@ def test_probe_bind_failure_prevents_supervisor_start(
 
     assert result == 1
     assert starts == []
-    assert 'probe bind failed' in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert 'probe bind failed' in error
+    assert 'daemon.probe_bind/probe_port (127.0.0.1:8080)' in error
 
 
 def test_probe_handler_skips_audit_and_full_status_boundaries(
@@ -1326,7 +1274,7 @@ def test_probe_handler_skips_audit_and_full_status_boundaries(
     result = handle_request(
         supervisor,
         ControlRequest(
-            _version=1,
+            version=1,
             request_id='probe-1',
             command='probe',
             arguments={},
@@ -1373,8 +1321,8 @@ def test_probe_join_failure_does_not_replace_supervisor_close_failure(
     def skip_provider_validation(_config: Config) -> None:
         return None
 
-    def start_supervisor(_supervisor: Supervisor) -> None:
-        return None
+    def start_supervisor(_supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
 
     def stop_without_run(_supervisor: Supervisor, **_options: object) -> None:
         return None
@@ -1427,8 +1375,8 @@ def test_probe_join_failure_does_not_replace_supervisor_run_failure(
     def skip_provider_validation(_config: Config) -> None:
         return None
 
-    def start_supervisor(_supervisor: Supervisor) -> None:
-        return None
+    def start_supervisor(_supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
 
     monkeypatch.setattr(cli_module, 'ProbeServer', FailedCleanupProbeServer)
     monkeypatch.setattr(cli_module, '_validated_provider', skip_provider_validation)
@@ -1457,8 +1405,8 @@ def test_probe_port_omission_constructs_no_listener(
     def skip_provider_validation(_config: Config) -> None:
         return None
 
-    def start_supervisor(_supervisor: Supervisor) -> None:
-        return None
+    def start_supervisor(_supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
 
     def stop_without_run(_supervisor: Supervisor, **_options: object) -> None:
         return None
@@ -1510,7 +1458,8 @@ def test_readyz_becomes_unavailable_before_probe_listener_cleanup(
     def skip_provider_validation(_config: Config) -> None:
         return None
 
-    def start_supervisor(supervisor: Supervisor) -> None:
+    def start_supervisor(supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
         progress = supervisor._progress
         now = supervisor._clock()
         progress.advance(now=now)
@@ -1533,6 +1482,7 @@ def test_readyz_becomes_unavailable_before_probe_listener_cleanup(
 
     monkeypatch.setattr(cli_module, 'ProbeServer', RecordingProbeServer, raising=False)
     monkeypatch.setattr(cli_module, '_validated_provider', skip_provider_validation)
+    monkeypatch.setattr(cli_module, 'time', SimpleNamespace(monotonic=lambda: 100.0))
     monkeypatch.setattr(Supervisor, 'start', start_supervisor)
     monkeypatch.setattr(Supervisor, 'run', stop_without_run)
 
@@ -1540,41 +1490,7 @@ def test_readyz_becomes_unavailable_before_probe_listener_cleanup(
 
     assert result == 0
     assert readiness_at_close == [False]
-    assert len(join_timeouts) == 1
-    assert 0.0 <= join_timeouts[0] <= 10.0
-
-
-@pytest.mark.parametrize(('command', 'arguments', 'expected_arguments'), _RECOVERY_CASES)
-def test_recovery_commands_route_body_free_payloads_through_control_supervisor(
-    arguments: list[str],
-    command: str,
-    expected_arguments: Mapping[str, object],
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.delenv('SG_EVENT_ADMIN_KEY', raising=False)
-    observed: list[tuple[ControlRequest, PeerIdentity]] = []
-
-    def handler(
-        request: ControlRequest,
-        identity: PeerIdentity,
-    ) -> Mapping[str, object]:
-        observed.append((request, identity))
-        return {'accepted': True, 'command': request.command}
-
-    result = _run_with_control_server(
-        tmp_path,
-        [command, *arguments],
-        handler,
-    )
-
-    assert result == 0
-    request, identity = observed[0]
-    assert request.command == command
-    assert request.arguments == expected_arguments
-    assert 'event' not in request.arguments
-    assert 'local_uid' not in request.arguments
-    assert identity.uid == os.geteuid()
+    assert join_timeouts == [10.0]
 
 
 def test_refused_control_command_exits_1(
@@ -1698,71 +1614,21 @@ def test_runtime_value_error_exits_1(
     )
 
 
-@pytest.mark.parametrize(
-    ('check', 'snapshot', 'expected'),
-    [
-        ('liveness', {'liveness': True, 'readiness': False}, 0),
-        ('liveness', {'liveness': False, 'readiness': False}, 1),
-        ('readiness', {'liveness': True, 'readiness': True}, 0),
-        ('readiness', {'liveness': True, 'readiness': False}, 1),
-    ],
-)
-def test_status_check_uses_compact_probe_exit_codes(
-    capsys: pytest.CaptureFixture[str],
-    check: str,
-    expected: int,
-    snapshot: Mapping[str, object],
-    tmp_path: Path,
-) -> None:
-    compact = {
-        **snapshot,
-        'complete': True,
-        'conditions': ('healthy',),
-        'generated_at': 10.0,
-        'snapshot_age_seconds': 0.25,
-    }
-    observed: list[ControlRequest] = []
-
-    def probe(request: ControlRequest, _identity: PeerIdentity) -> Mapping[str, object]:
-        observed.append(request)
-        return compact
-
-    result = _run_with_control_server(
-        tmp_path,
-        ['status', '--site', 'test', '--group', 'editorial', '--check', check],
-        probe,
+def test_status_check_rejects_detail_filters(tmp_path: Path) -> None:
+    status, stdout, stderr = invoke_cli(
+        [
+            'status',
+            '--config',
+            os.fspath(_control_config(tmp_path)),
+            '--check',
+            'readiness',
+            '--group',
+            'editorial',
+        ]
     )
 
-    assert result == expected
-    assert observed[0].command == 'probe'
-    assert observed[0].arguments == {}
-    assert json.loads(capsys.readouterr().out) == {
-        **snapshot,
-        'complete': True,
-        'conditions': ['healthy'],
-        'generated_at': 10.0,
-        'snapshot_age_seconds': 0.25,
-    }
-
-
-@pytest.mark.parametrize('missing_entry', [False, True])
-def test_control_audit_identity_uses_authenticated_peer(
-    monkeypatch: pytest.MonkeyPatch, missing_entry: bool
-) -> None:
-    def lookup(uid: int) -> pwd.struct_passwd:
-        assert uid == 12345
-        if missing_entry:
-            raise KeyError(uid)
-        return pwd.struct_passwd(('service', 'x', uid, 100, '', '/', '/bin/false'))
-
-    monkeypatch.setattr(pwd, 'getpwuid', lookup)
-    peer = PeerIdentity(uid=12345, gid=100, pid=678)
-
-    identity = cli_module._audit_identity(peer)
-
-    assert identity.local_uid == peer.uid
-    assert identity.pid == peer.pid
-    assert identity.username == ('12345' if missing_entry else 'service')
+    assert (status, stdout) == (2, '')
+    assert '--check reports global health; omit --site and --group' in stderr
 
 
 def test_status_prints_structured_result(
@@ -1811,104 +1677,30 @@ def test_status_prints_structured_result(
     }
 
 
-@pytest.mark.parametrize('missing_entry', [False, True])
-def test_supervise_recovers_locked_durable_generations_before_start(
-    missing_entry: bool,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+def test_supervise_stale_socket_probe_uses_shutdown_slice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
     config_path = _supervise_config(tmp_path)
-    config = load_config(config_path)
-    state_dir = ensure_secure_state_dir(config.daemon.state_dir)
-    site_dir = ensure_secure_state_dir(ensure_secure_state_dir(state_dir / 'sites') / 'test')
-    source_path = ensure_secure_state_dir(site_dir / 'sources') / 'admin.db'
-    group_path = source_path
-    configured = {('test', 'remote'): 'admin'}
-    with _SupervisorState._open(state_dir) as supervisor_state:
-        assignment = supervisor_state._reconcile_groups(
-            configured=configured,
-            generations={},
-        )[('test', 'remote')]
-    assert isinstance(assignment, ActiveSourceGroupAssignment)
-    generation = assignment.group_generation
-    fingerprint = stream_fingerprint(
-        'https://example.invalid',
-        'admin',
-        'test',
+    config_path.write_text(
+        config_path.read_text().replace('[daemon]', '[daemon]\nshutdown_deadline_secs = 0.25')
     )
-    with SourceState.open(
-        source_path,
-        writes=write_context_for(source_path),
-        create=True,
-        site='test',
-        source='admin',
-        stream_fingerprint=fingerprint,
-        source_generation='source-generation-1',
-    ) as source:
-        source.initialize(100, incarnation='incarnation-1')
-    with open_group_on_source(
-        group_path,
-        writes=write_context_for(group_path),
-        site='test',
-        site_server_url='https://example.invalid',
-        source='admin',
-        group='remote',
-        group_generation=generation,
-        ordering='eager',
-        stream_fingerprint=fingerprint,
-        source_generation='source-generation-1',
-        verified_incarnation='incarnation-1',
-        start_mode='initialize',
-        initial_cursor=100,
-        initial_delivery_floor=100,
-        initial_last_delivered_id=100,
-    ):
-        pass
-    with _SupervisorState._open(state_dir) as supervisor_state:
-        resumed = supervisor_state._reconcile_groups(
-            configured=configured,
-            generations={('test', 'remote'): generation},
-        )
-        resumed_assignment = resumed[('test', 'remote')]
-        assert isinstance(resumed_assignment, ActiveSourceGroupAssignment)
-        assert resumed_assignment.start_mode == 'resume'
+    seen: list[float] = []
+    original = ControlServer._open
 
-    started: list[dict[tuple[str, str], SourceGroupAssignment]] = []
+    def opened(control: ControlServer) -> None:
+        seen.append(control._socket_probe_timeout_secs)
+        original(control)
 
-    def record_start(supervisor: Supervisor) -> None:
-        reconciled = cast(
-            'dict[tuple[str, str], SourceGroupAssignment] | None',
-            vars(supervisor)['_reconciled'],
-        )
-        assert reconciled is not None
-        started.append(reconciled)
+    def skip(*_args: object, **_kwargs: object) -> None:
+        return None
 
-    def skip_provider_validation(_config: Config) -> None:
-        pass
-
-    def stop_without_run(_supervisor: Supervisor, **_options: object) -> None:
-        pass
-
-    monkeypatch.setattr(cli_module, '_validated_provider', skip_provider_validation)
-    monkeypatch.setattr(Supervisor, 'start', record_start)
-    monkeypatch.setattr(Supervisor, 'run', stop_without_run)
-
-    if missing_entry:
-
-        def missing_user(uid: int) -> pwd.struct_passwd:
-            raise KeyError(uid)
-
-        monkeypatch.setattr(pwd, 'getpwuid', missing_user)
-
-    result = main(['supervise', '--config', os.fspath(config_path)])
-
-    assert result == 0
-    recovered = started[0]
-    recovered_assignment = recovered[('test', 'remote')]
-    assert isinstance(recovered_assignment, ActiveSourceGroupAssignment)
-    assert recovered_assignment.group_generation == generation
-    assert recovered_assignment.start_mode == 'resume'
+    monkeypatch.setattr(ControlServer, '_open', opened)
+    monkeypatch.setattr(cli_module, '_validated_provider', skip)
+    monkeypatch.setattr(Supervisor, 'start', skip)
+    monkeypatch.setattr(Supervisor, 'run', skip)
+    assert main(['supervise', '--config', os.fspath(config_path)]) == 0
+    assert seen == [0.0625]
 
 
 def test_unavailable_stdout_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1920,47 +1712,17 @@ def test_unavailable_stdout_is_an_error(capsys: pytest.CaptureFixture[str]) -> N
     assert (status, capsys.readouterr().err) == (2, 'error: standard output is unavailable\n')
 
 
-@pytest.mark.parametrize('check', [[], ['--check', 'liveness']])
-def test_unavailable_supervisor_exits_3(check: list[str], tmp_path: Path) -> None:
-    status, stdout, stderr = invoke_cli(
-        ['status', '--config', os.fspath(_control_config(tmp_path)), *check]
-    )
-    assert (status, stdout) == (3, '')
-    assert stderr.startswith('error: control IPC is unavailable: ')
-    assert stderr.count('\n') == 1
-
-
-@pytest.mark.parametrize('command', ['status', 'validate-config', 'supervise'])
-@pytest.mark.parametrize(
-    ('name', 'reason'),
-    [('missing.toml', 'No such file or directory'), ('.', 'Is a directory')],
-)
-def test_unreadable_configuration_is_a_configuration_error(
-    command: str,
-    name: str,
-    reason: str,
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / name
-    assert invoke_cli([command, '--config', os.fspath(path)]) == (
-        2,
-        '',
-        f'error: cannot read configuration file {path}: {reason}\n',
-    )
-
-
 def test_unreadable_evidence_is_a_configuration_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
+    credential_value = _credential_value_absent_from(tmp_path)
+    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', credential_value)
     monkeypatch.setattr(cli_module, 'load_provider', _load_offline_provider)
     monkeypatch.setattr(cli_module, 'load_plugins', _load_no_plugins)
-    path = tmp_path / 'evidence.toml'
-    # The loaded credential values are redacted even when they occur in a path.
-    expected_path = (
-        os.fspath(path).replace('test-key', '<redacted>').replace('admin', '<redacted>')
-    )
+    path = tmp_path / f'{credential_value}-evidence.toml'
+    # The loaded API key is redacted in the filename, but the parent path is literal.
+    expected_path = tmp_path / '<redacted>-evidence.toml'
 
     assert invoke_cli(
         [
@@ -1991,7 +1753,7 @@ def test_unrecognized_live_failure_keeps_its_traceback(
 
     with pytest.raises(KeyError, match='records'):
         invoke_cli(['validate-config', '--config', os.fspath(_FIXTURES / 'valid.toml'), '--live'])
-    assert handle._closed
+    assert handle.closed
 
 
 def test_unsafe_state_directory_exits_1(
@@ -2002,55 +1764,14 @@ def test_unsafe_state_directory_exits_1(
         raise AssertionError('supervisor ran with an unsafe state directory')
 
     config_path = _offline_supervise_config(monkeypatch, tmp_path, never_run)
+    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', _credential_value_absent_from(tmp_path))
     state_dir = tmp_path / 'state'
     state_dir.mkdir(mode=0o755)
     state_dir.chmod(0o755)
-    expected_path = (
-        os.fspath(state_dir).replace('test-key', '<redacted>').replace('admin', '<redacted>')
-    )
 
     status, _stdout, stderr = invoke_cli(['supervise', '--config', os.fspath(config_path)])
 
-    assert (status, stderr) == (1, f'error: state directory must use mode 0700: {expected_path}\n')
-
-
-@pytest.mark.parametrize('command', ['validate-config', 'supervise'])
-@pytest.mark.parametrize(
-    'message',
-    [
-        'selected provider shotgun-api3 is not installed',
-        'both shotgun-api3 and sg-python-api own the shotgun_api3 namespace',
-        'provider sg-python-api does not export AsyncShotgun',
-    ],
-)
-def test_validate_and_supervise_report_installed_provider_failures(
-    capsys: pytest.CaptureFixture[str],
-    command: str,
-    message: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    protected_value = 'test-key'
-    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', protected_value)
-
-    def fail_provider(
-        _name: str,
-        _required: Collection[str],
-    ) -> NoReturn:
-        raise ProviderError(f'{message}: {protected_value}')
-
-    monkeypatch.setattr(
-        cli_module,
-        'load_provider',
-        fail_provider,
-    )
-
-    result = main([command, '--config', os.fspath(_FIXTURES / 'valid.toml')])
-
-    assert result == 2
-    stderr = capsys.readouterr().err
-    assert protected_value not in stderr
-    assert message in stderr
-    assert stderr.count('<redacted>') == 1
+    assert (status, stderr) == (1, f'error: state directory must use mode 0700: {state_dir}\n')
 
 
 def test_validate_config_is_offline_and_warns_about_trusted_import_side_effects(
@@ -2118,7 +1839,7 @@ def test_validate_config_live_omits_incarnation_when_supervisor_is_unavailable(
     evidence_path.write_text(captured.out, encoding='utf-8')
     assert result == 0
     assert load_acceptance_evidence(evidence_path).sources[0].stream_incarnation is None
-    assert 'supervisor status is unavailable' in captured.err
+    assert 'no running supervisor; live evidence omits stream incarnation' in captured.err
 
 
 def test_validate_config_live_prints_round_trippable_gap_evidence(
@@ -2164,13 +1885,13 @@ def test_validate_config_live_prints_round_trippable_gap_evidence(
     )
 
     assert result == 0
-    assert len(handle._calls) == 1
-    entity_type, filters, fields, options = handle._calls[0]
+    assert len(handle.calls) == 1
+    entity_type, filters, fields, options = handle.calls[0]
     assert entity_type == 'EventLogEntry'
     assert filters == []
     assert fields == list(EVENT_FIELDS)
     assert options['order'] == [{'field_name': 'id', 'direction': 'desc'}]
-    assert handle._closed
+    assert handle.closed
     captured = capsys.readouterr()
     assert captured.out.startswith('[[sources]]\n')
     assert 'does not prove' not in captured.out
@@ -2189,7 +1910,7 @@ def test_validate_config_live_prints_round_trippable_gap_evidence(
     )
     assert record.stream_incarnation == 'incarnation-1'
     assert record.captured_at.utcoffset() is not None
-    assert record.observed_gap_rate == 0.02
+    assert record.observed_gap_rate == 0.004
 
 
 def test_validate_config_live_rejects_malformed_supervisor_incarnation(
@@ -2256,7 +1977,7 @@ def test_validate_config_live_rejects_missing_runtime_event_fields(
     captured = capsys.readouterr()
     assert captured.out == ''
     assert captured.err.endswith(
-        'error: live source test/<redacted> returned invalid EventLogEntry: '
+        'error: live source test/admin returned invalid EventLogEntry: '
         'event has missing required fields: meta\n'
     )
 
@@ -2304,6 +2025,35 @@ def test_version_prints_the_installed_version(monkeypatch: pytest.MonkeyPatch) -
     assert invoke_cli(['--version']) == (0, 'sg-event-daemon 9.8.7\n', '')
 
 
+def test_worker_assignment_wait_outlasts_startup_budget() -> None:
+    class _Control:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def receive(self, *, timeout: float) -> StopCommand:
+            assert timeout == 30.0
+            self.calls += 1
+            if self.calls <= 3:
+                raise TimeoutError('assignment has not arrived')
+            return StopCommand(reason='supervisor-stop')
+
+    control = _Control()
+    spec = WorkerSpec(
+        worker_id='worker',
+        site='test',
+        kind=_WorkerKind.SITE,
+        name='test',
+        sources=(),
+        groups=(),
+    )
+
+    assert (
+        cli_module._receive_assignment(cast('WorkerControl', control), spec, 'spawn', timeout=30.0)
+        is None
+    )
+    assert control.calls == 4
+
+
 def test_worker_cli_closes_control_when_partial_startup_leaves_stuck_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2312,7 +2062,7 @@ def test_worker_cli_closes_control_when_partial_startup_leaves_stuck_source(
     config_path = _supervise_config(tmp_path)
     report_path = tmp_path / 'startup-report.json'
     parent_socket, child_socket = socket.socketpair()
-    control = WorkerControl(parent_socket, max_frame_bytes=8_388_608, send_deadline_secs=1.0)
+    control = WorkerControl(parent_socket, max_frame_bytes=8_388_608)
     environment = dict(os.environ)
     environment['PYTHONPATH'] = os.fspath(Path(__file__).parents[1] / 'src')
     process = spawn_child(
@@ -2329,8 +2079,9 @@ def test_worker_cli_closes_control_when_partial_startup_leaves_stuck_source(
     )
     child_socket.close()
     try:
-        assert isinstance(control.receive(timeout=5.0), ControlHello)
-        control.send(
+        assert isinstance(receive_control(control), ControlHello)
+        send_control(
+            control,
             WorkerAssignment(
                 worker_id='["site","test"]',
                 spawn_instance='partial-cli',
@@ -2339,21 +2090,22 @@ def test_worker_cli_closes_control_when_partial_startup_leaves_stuck_source(
                 source_group_assignments=(),
                 source_endpoints=(),
                 event_grants=(),
-            )
+            ),
         )
         with pytest.raises(EOFError):
-            control.receive(timeout=5.0)
+            receive_control(control)
         assert json.loads(report_path.read_text()) == {
             'stuck': ['source:admin'],
             'resources_open': True,
             'monitor_started': False,
             'forced': [],
+            'closed': [],
         }
         assert reap_child(process) is None
     finally:
         control.close()
         terminate_child(process, force=True)
-        assert reap_child(process, timeout=5.0) is not None
+        assert process.wait() is not None
 
 
 def test_worker_command_is_hidden_but_callable() -> None:
@@ -2366,3 +2118,519 @@ def test_worker_command_is_hidden_but_callable() -> None:
         'usage: sg-event-daemon run-worker [-h] --config FILE --site SITE '
         '--worker WORKER --control-fd FD --spawn-instance ID'
     )
+
+
+@pytest.mark.parametrize('deadline', [False, True])
+def test_worker_fatal_line_carries_a_utc_timestamp(
+    monkeypatch: pytest.MonkeyPatch, deadline: bool
+) -> None:
+    class _FailedRuntime:
+        fatal_reason = 'fatal\nreason\x1b' if not deadline else None
+
+        def request_stop(self, _reason: str) -> None:
+            return None
+
+        def start(self) -> None:
+            return None
+
+        def wait(self) -> tuple[str, ...]:
+            return ('source',) if deadline else ()
+
+    _offline_worker(monkeypatch, _FailedRuntime())
+    status, stdout, stderr = invoke_cli(
+        [
+            'run-worker',
+            '--config',
+            'daemon.toml',
+            '--site',
+            'test',
+            '--worker',
+            '["site","test"]',
+            '--control-fd',
+            '7',
+            '--spawn-instance',
+            'spawn-1',
+        ]
+    )
+    assert (status, stdout) == (1, '')
+    timestamp, separator, message = stderr.rstrip('\n').partition(' error: ')
+    assert separator == ' error: '
+    offset = datetime.fromisoformat(timestamp).utcoffset()
+    assert offset is not None
+    assert offset.total_seconds() == 0
+    assert message == (
+        'worker shutdown deadline exceeded: source' if deadline else 'fatal\\x0areason\\x1b'
+    )
+
+
+@pytest.mark.parametrize(
+    ('command', 'arguments', 'expected_arguments'),
+    [
+        *_RECOVERY_CASES,
+        (
+            'status',
+            ['--site', 'test', '--group', 'editorial'],
+            {'site': 'test', 'group': 'editorial'},
+        ),
+    ],
+)
+def test_control_commands_send_only_their_own_arguments(
+    arguments: list[str],
+    command: str,
+    expected_arguments: Mapping[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _RecordingClient({'accepted': True})
+    _set_status_client(monkeypatch, client)
+
+    status, stdout, stderr = invoke_cli(
+        [command, *arguments, '--config', os.fspath(_control_config(tmp_path))]
+    )
+
+    assert (status, stdout, stderr) == (0, '{"accepted":true}\n', '')
+    assert client.requests == [(command, expected_arguments)]
+
+
+@pytest.mark.parametrize(
+    ('result', 'expected'),
+    [
+        (
+            {'liveness': False, 'readiness': False},
+            (1, '{"liveness":false,"readiness":false}\n', ''),
+        ),
+        (
+            {'readiness': True},
+            (1, '{"readiness":true}\n', "error: status result has no boolean 'liveness' field\n"),
+        ),
+    ],
+)
+def test_failed_status_check_prints_its_result_and_exits_1(
+    expected: tuple[int, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    result: Mapping[str, object],
+    tmp_path: Path,
+) -> None:
+    _set_status_client(monkeypatch, _StaticStatusClient(result))
+    assert (
+        invoke_cli(
+            ['status', '--config', os.fspath(_control_config(tmp_path)), '--check', 'liveness']
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ('argv', 'loader'),
+    [
+        (_VALID_COMMAND_ARGUMENTS, 'load_control_config'),
+        (['validate-config', '--config', 'daemon.toml'], 'load_config'),
+        (['supervise', '--config', 'daemon.toml'], 'load_config'),
+        (_WORKER_ARGUMENTS, 'load_config'),
+    ],
+)
+def test_interrupt_outside_a_running_service_exits_130_quietly(
+    argv: list[str],
+    loader: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, loader, _interrupt)
+    assert invoke_cli(argv) == (130, '', '')
+
+
+@pytest.mark.parametrize(
+    ('error', 'detail'),
+    [
+        pytest.param(
+            _named_error(
+                'AuthenticationFault', _named_error('Fault', _named_error('ShotgunError'))
+            )("Can't authenticate script 'test'"),
+            "Can't authenticate script 'test'",
+            id='authentication',
+        ),
+        pytest.param(
+            _named_error('ProtocolError')(
+                '<ProtocolError for example.invalid/api3/json: 503 Service Unavailable>'
+            ),
+            '<ProtocolError for example.invalid/api3/json: 503 Service Unavailable>',
+            id='http-status',
+        ),
+        pytest.param(
+            _named_error('ServerNotFoundError', _named_error('HttpLib2Error'))(
+                'Unable to find the server at example.invalid'
+            ),
+            'Unable to find the server at example.invalid',
+            id='unknown-host',
+        ),
+        pytest.param(
+            ConnectionRefusedError(61, 'Connection refused'),
+            '[Errno 61] Connection refused',
+            id='connection-refused',
+        ),
+        pytest.param(
+            ssl.SSLCertVerificationError(1, 'certificate verify failed'),
+            'certificate verify failed',
+            id='tls',
+        ),
+        pytest.param(TimeoutError(), 'TimeoutError', id='timeout-without-message'),
+        pytest.param(
+            _named_error('TransportError', _named_error('ShotgunError'))('first\nsecond'),
+            'first\\x0asecond',
+            id='multi-line-message',
+        ),
+    ],
+)
+def test_live_provider_failure_is_a_runtime_error(
+    detail: str,
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
+    handle = _LiveHandle(error=error)
+    _set_live_provider(monkeypatch, handle)
+    monkeypatch.setattr(cli_module, 'load_plugins', _load_no_plugins)
+    _set_status_client(monkeypatch, _UnavailableStatusClient())
+
+    status, stdout, stderr = invoke_cli(
+        ['validate-config', '--config', os.fspath(_FIXTURES / 'valid.toml'), '--live']
+    )
+
+    assert (status, stdout) == (1, '')
+    assert stderr.endswith(f'error: live source test/admin request failed: {detail}\n')
+    assert handle.closed
+
+
+@pytest.mark.parametrize(
+    ('argv', 'command'),
+    [
+        (['supervise', '--config', 'config.toml'], 'supervise'),
+        (
+            [
+                'run-worker',
+                '--config',
+                'config.toml',
+                '--site',
+                'test',
+                '--worker',
+                '["site","test"]',
+                '--control-fd',
+                '7',
+                '--spawn-instance',
+                'spawn-1',
+            ],
+            'run-worker',
+        ),
+        (['status', '--config', 'config.toml'], 'status'),
+        (
+            ['status', '--config', 'config.toml', '--check', 'readiness'],
+            'status',
+        ),
+        (['validate-config', '--config', 'config.toml'], 'validate-config'),
+        (
+            [
+                'validate-config',
+                '--config',
+                'config.toml',
+                '--live',
+                '--evidence',
+                'evidence.toml',
+            ],
+            'validate-config',
+        ),
+    ],
+)
+def test_parser_accepts_documented_command_forms(
+    argv: list[str],
+    command: str,
+) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    assert args.command == command
+
+
+@pytest.mark.parametrize(('command', 'arguments', 'expected_arguments'), _RECOVERY_CASES)
+def test_recovery_commands_route_body_free_payloads_through_control_supervisor(
+    arguments: list[str],
+    command: str,
+    expected_arguments: Mapping[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv('SG_EVENT_ADMIN_KEY', raising=False)
+    observed: list[tuple[ControlRequest, PeerIdentity]] = []
+
+    def handler(
+        request: ControlRequest,
+        identity: PeerIdentity,
+    ) -> Mapping[str, object]:
+        observed.append((request, identity))
+        return {'accepted': True, 'command': request.command}
+
+    result = _run_with_control_server(
+        tmp_path,
+        [command, *arguments],
+        handler,
+    )
+
+    assert result == 0
+    request, identity = observed[0]
+    assert request.command == command
+    assert request.arguments == expected_arguments
+    assert 'event' not in request.arguments
+    assert 'local_uid' not in request.arguments
+    assert identity.uid == os.geteuid()
+
+
+@pytest.mark.parametrize(
+    ('check', 'snapshot', 'expected'),
+    [
+        ('liveness', {'liveness': True, 'readiness': False}, 0),
+        ('liveness', {'liveness': False, 'readiness': False}, 1),
+        ('readiness', {'liveness': True, 'readiness': True}, 0),
+        ('readiness', {'liveness': True, 'readiness': False}, 1),
+    ],
+)
+def test_status_check_uses_compact_probe_exit_codes(
+    capsys: pytest.CaptureFixture[str],
+    check: str,
+    expected: int,
+    snapshot: Mapping[str, object],
+    tmp_path: Path,
+) -> None:
+    compact = {
+        **snapshot,
+        'complete': True,
+        'conditions': ('healthy',),
+        'generated_at': 10.0,
+        'snapshot_age_seconds': 0.25,
+    }
+    observed: list[ControlRequest] = []
+
+    def probe(request: ControlRequest, _identity: PeerIdentity) -> Mapping[str, object]:
+        observed.append(request)
+        return compact
+
+    result = _run_with_control_server(
+        tmp_path,
+        ['status', '--check', check],
+        probe,
+    )
+
+    assert result == expected
+    assert observed[0].command == 'probe'
+    assert observed[0].arguments == {}
+    assert json.loads(capsys.readouterr().out) == {
+        **snapshot,
+        'complete': True,
+        'conditions': ['healthy'],
+        'generated_at': 10.0,
+        'snapshot_age_seconds': 0.25,
+    }
+
+
+@pytest.mark.parametrize('missing_entry', [False, True])
+def test_control_audit_identity_uses_authenticated_peer(
+    monkeypatch: pytest.MonkeyPatch, missing_entry: bool
+) -> None:
+    def lookup(uid: int) -> pwd.struct_passwd:
+        assert uid == 12345
+        if missing_entry:
+            raise KeyError(uid)
+        return pwd.struct_passwd(('service', 'x', uid, 100, '', '/', '/bin/false'))
+
+    monkeypatch.setattr(pwd, 'getpwuid', lookup)
+    peer = PeerIdentity(uid=12345, gid=100, pid=678)
+
+    identity = cli_module._audit_identity(peer)
+
+    assert identity.local_uid == peer.uid
+    assert identity.pid == peer.pid
+    assert identity.username == ('12345' if missing_entry else 'service')
+
+
+@pytest.mark.parametrize('missing_entry', [False, True])
+def test_supervise_recovers_locked_durable_generations_before_start(
+    missing_entry: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'test-key')
+    config_path = _supervise_config(tmp_path)
+    config = load_config(config_path)
+    state_dir = ensure_secure_state_dir(config.daemon.state_dir)
+    site_dir = ensure_secure_state_dir(ensure_secure_state_dir(state_dir / 'sites') / 'test')
+    source_path = ensure_secure_state_dir(site_dir / 'sources') / 'admin.db'
+    group_path = source_path
+    configured = {('test', 'remote'): 'admin'}
+    with _SupervisorState.open(state_dir) as supervisor_state:
+        assignment = supervisor_state.reconcile_groups(
+            configured=configured,
+            generations={},
+        )[('test', 'remote')]
+    assert isinstance(assignment, ActiveSourceGroupAssignment)
+    generation = assignment.group_generation
+    fingerprint = stream_fingerprint(
+        'https://example.invalid',
+        'admin',
+        'test',
+    )
+    with SourceState.open(
+        source_path,
+        writes=write_context_for(source_path),
+        create=True,
+        site='test',
+        source='admin',
+        stream_fingerprint=fingerprint,
+        source_generation='source-generation-1',
+    ) as source:
+        source.initialize(100, incarnation='incarnation-1')
+    with open_group_on_source(
+        group_path,
+        writes=write_context_for(group_path),
+        site='test',
+        site_server_url='https://example.invalid',
+        source='admin',
+        group='remote',
+        group_generation=generation,
+        ordering='eager',
+        stream_fingerprint=fingerprint,
+        source_generation='source-generation-1',
+        verified_incarnation='incarnation-1',
+        start_mode='initialize',
+        initial_cursor=100,
+        initial_delivery_floor=100,
+        initial_last_delivered_id=100,
+    ):
+        pass
+    with _SupervisorState.open(state_dir) as supervisor_state:
+        resumed = supervisor_state.reconcile_groups(
+            configured=configured,
+            generations={('test', 'remote'): generation},
+        )
+        resumed_assignment = resumed[('test', 'remote')]
+        assert isinstance(resumed_assignment, ActiveSourceGroupAssignment)
+        assert resumed_assignment.start_mode == 'resume'
+
+    started: list[dict[tuple[str, str], SourceGroupAssignment]] = []
+
+    def record_start(supervisor: Supervisor, *, should_stop: Callable[[], bool]) -> None:
+        assert not should_stop()
+        reconciled = cast(
+            'dict[tuple[str, str], SourceGroupAssignment] | None',
+            vars(supervisor)['_reconciled'],
+        )
+        assert reconciled is not None
+        started.append(reconciled)
+
+    def skip_provider_validation(_config: Config) -> None:
+        pass
+
+    def stop_without_run(_supervisor: Supervisor, **_options: object) -> None:
+        pass
+
+    monkeypatch.setattr(cli_module, '_validated_provider', skip_provider_validation)
+    monkeypatch.setattr(Supervisor, 'start', record_start)
+    monkeypatch.setattr(Supervisor, 'run', stop_without_run)
+
+    if missing_entry:
+
+        def missing_user(uid: int) -> pwd.struct_passwd:
+            raise KeyError(uid)
+
+        monkeypatch.setattr(pwd, 'getpwuid', missing_user)
+
+    result = main(['supervise', '--config', os.fspath(config_path)])
+
+    assert result == 0
+    recovered = started[0]
+    recovered_assignment = recovered[('test', 'remote')]
+    assert isinstance(recovered_assignment, ActiveSourceGroupAssignment)
+    assert recovered_assignment.group_generation == generation
+    assert recovered_assignment.start_mode == 'resume'
+
+
+@pytest.mark.parametrize('check', [[], ['--check', 'liveness']])
+def test_unavailable_supervisor_exits_3(check: list[str], tmp_path: Path) -> None:
+    status, stdout, stderr = invoke_cli(
+        ['status', '--config', os.fspath(_control_config(tmp_path)), *check]
+    )
+    assert (status, stdout) == (3, '')
+    assert stderr.startswith('error: control IPC is unavailable at ')
+    assert stderr.count('\n') == 1
+
+
+@pytest.mark.parametrize('command', ['status', 'validate-config', 'supervise'])
+@pytest.mark.parametrize(
+    ('name', 'reason'),
+    [('missing.toml', 'No such file or directory'), ('.', 'Is a directory')],
+)
+def test_unreadable_configuration_is_a_configuration_error(
+    command: str,
+    name: str,
+    reason: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / name
+    assert invoke_cli([command, '--config', os.fspath(path)]) == (
+        2,
+        '',
+        f'error: cannot read configuration file {path}: {reason}\n',
+    )
+
+
+@pytest.mark.parametrize('command', ['validate-config', 'supervise'])
+@pytest.mark.parametrize(
+    'message',
+    [
+        'selected provider shotgun-api3 is not installed',
+        'both shotgun-api3 and sg-python-api own the shotgun_api3 namespace',
+        'provider sg-python-api does not export AsyncShotgun',
+    ],
+)
+def test_validate_and_supervise_report_installed_provider_failures(
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected_value = 'test-key'
+    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', protected_value)
+
+    def fail_provider(
+        _name: str,
+        _required: Collection[str],
+    ) -> NoReturn:
+        raise ProviderError(f'{message}: {protected_value}')
+
+    monkeypatch.setattr(
+        cli_module,
+        'load_provider',
+        fail_provider,
+    )
+
+    result = main([command, '--config', os.fspath(_FIXTURES / 'valid.toml')])
+
+    assert result == 2
+    stderr = capsys.readouterr().err
+    assert protected_value not in stderr
+    assert message in stderr
+    assert stderr.count('<redacted>') == 1
+
+
+@pytest.mark.parametrize('message', [None, 12])
+def test_cli_unknown_outcome_requires_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], message: object
+) -> None:
+    def handler(_request: ControlRequest, _peer: PeerIdentity) -> Mapping[str, object]:
+        return {'outcome': 'unknown', 'message': message}
+
+    result = _run_with_control_server(
+        tmp_path,
+        ['park', '--site', 'test', '--group', 'editorial', '--reason', 'maintenance'],
+        handler,
+    )
+    captured = capsys.readouterr()
+    assert result == 3
+    assert captured.out == ''
+    assert 'unknown control outcome has no message' in captured.err

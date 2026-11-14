@@ -48,10 +48,10 @@ class _AsyncCallableCloseHandle:
 
 class _AsyncCloseSyncHandle:
     def __init__(self) -> None:
-        self._closed = False
+        self.closed = False
 
     async def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def set_session_uuid(self, _session_uuid: str | None) -> None:
         pass
@@ -60,12 +60,12 @@ class _AsyncCloseSyncHandle:
 class _AsyncHandle:
     def __init__(self) -> None:
         self.close_error: RuntimeError | None = None
-        self._closed = False
+        self.closed = False
         self.session_uuids: list[str | None] = []
 
     async def close(self) -> None:
         await asyncio.sleep(0)
-        self._closed = True
+        self.closed = True
         if self.close_error is not None:
             raise self.close_error
 
@@ -111,10 +111,10 @@ class _OfflineHandle(Protocol):
 
 class _SyncCloseAsyncHandle:
     def __init__(self) -> None:
-        self._closed = False
+        self.closed = False
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def set_session_uuid(self, _session_uuid: str | None) -> None:
         pass
@@ -123,11 +123,11 @@ class _SyncCloseAsyncHandle:
 class _SyncHandle:
     def __init__(self) -> None:
         self.close_error: RuntimeError | None = None
-        self._closed = False
-        self._session_uuids: list[str | None] = []
+        self.closed = False
+        self.session_uuids: list[str | None] = []
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
         if self.close_error is not None:
             raise self.close_error
 
@@ -141,7 +141,7 @@ class _SyncHandle:
         raise AssertionError('the harness made an unexpected SG request')
 
     def set_session_uuid(self, session_uuid: str | None) -> None:
-        self._session_uuids.append(session_uuid)
+        self.session_uuids.append(session_uuid)
 
 
 def _event(
@@ -241,7 +241,7 @@ def register(registrar):
         asyncio.run(drive_async_plugin(loaded, (), sg=handle))
 
     assert loaded.module.seen == []
-    assert not handle._closed
+    assert not handle.closed
 
 
 def test_async_harness_awaits_setup_and_callback_with_injected_handle(
@@ -304,7 +304,7 @@ def register(registrar):
     assert len(loaded.module.seen_handles) == 1
     assert loaded.module.seen_handles[0] is handle
     assert handle.session_uuids == ['async-session']
-    assert handle._closed
+    assert handle.closed
 
 
 def test_async_harness_default_handle_guides_unsupported_operations(
@@ -391,7 +391,7 @@ def register(registrar):
     assert sensitive_value not in repr(result)
     assert '<redacted>' in failure.detail
     assert loaded.module.seen == [42]
-    assert handle._closed
+    assert handle.closed
 
 
 def test_complete_documented_synthetic_event_delivers() -> None:
@@ -472,7 +472,7 @@ def register(registrar):
     assert result.setup_failure is None
     assert result.callbacks == ()
     assert loaded.module.seen == ['setup']
-    assert handle._closed
+    assert handle.closed
 
 
 def test_harness_exports_its_catchable_error() -> None:
@@ -536,8 +536,8 @@ def register(registrar):
         assert handle.session_uuids == []
     else:
         assert isinstance(handle, _SyncHandle)
-        assert handle._session_uuids == []
-    assert handle._closed
+        assert handle.session_uuids == []
+    assert handle.closed
 
 
 @pytest.mark.parametrize('execution', ['sync', 'async'])
@@ -571,7 +571,7 @@ def register(registrar):
         drive()
 
     assert loaded.module.seen == []
-    assert handle._closed
+    assert handle.closed
 
 
 @pytest.mark.parametrize('execution', ['sync', 'async'])
@@ -617,7 +617,7 @@ def register(registrar):
     with pytest.raises(ValueError, match='event has missing required fields: type') as raised:
         drive()
 
-    assert handle._closed
+    assert handle.closed
     assert any('teardown-failed' in note for note in raised.value.__notes__)
     assert sensitive_value not in repr(raised.value.__notes__)
 
@@ -666,7 +666,7 @@ def register(registrar):
     assert not hasattr(ambient_error, '__notes__')
     assert close_failure.code == 'teardown-failed'
     assert close_failure.__cause__ is handle.close_error
-    assert handle._closed
+    assert handle.closed
 
 
 def test_harness_settings_defaults_are_empty_and_immutable() -> None:
@@ -740,7 +740,7 @@ def register(registrar):
     assert sensitive_value not in str(failure)
     assert '<redacted>' in str(failure)
     assert loaded.module.seen == (['setup', 42] if phase == 'callback' else ['setup'])
-    assert handle._closed
+    assert handle.closed
 
 
 def test_load_plugin_redacts_direct_import_failure_secret(
@@ -868,6 +868,17 @@ def test_offline_handles_preserve_missing_private_attributes(class_name: str) ->
     assert caught.value.obj is handle
 
 
+@pytest.mark.parametrize('class_name', ['_OfflineAsyncHandle', '_OfflineSyncHandle'])
+def test_offline_find_keyword_requests_show_injection_guidance(class_name: str) -> None:
+    handle = _offline_handle(class_name)
+    if class_name == '_OfflineAsyncHandle':
+        with pytest.raises(RuntimeError, match='inject sg='):
+            asyncio.run(cast('Any', handle).find(entity_type='Shot', filters=[], fields=['id']))
+    else:
+        with pytest.raises(RuntimeError, match='inject sg='):
+            cast('Any', handle).find(entity_type='Shot', filters=[], fields=['id'])
+
+
 @pytest.mark.parametrize('round_trip', ['deepcopy', 'pickle'])
 @pytest.mark.parametrize('class_name', ['_OfflineAsyncHandle', '_OfflineSyncHandle'])
 def test_offline_handles_preserve_state_across_protocol_round_trips(
@@ -915,7 +926,7 @@ def register(registrar):
         drive_sync_plugin(loaded, (), sg=handle)
 
     assert loaded.module.seen == []
-    assert not handle._closed
+    assert not handle.closed
 
 
 def test_sync_drive_rejects_async_session_handle(tmp_path: Path) -> None:
@@ -1023,6 +1034,8 @@ def register(registrar):
     loaded = load_plugin(path, plugin_id='sync-coroutine')
     handle = _SyncHandle()
 
+    # Collect earlier tests' garbage before observing this callback's coroutines.
+    gc.collect()
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter('always')
         result = drive_sync_plugin(loaded, (_event(42), _event(43)), sg=handle)
@@ -1044,8 +1057,13 @@ def register(registrar):
     assert "sync callback 'returned-coroutine' returned an awaitable" in callback.failure.detail
     assert loaded.module.seen == [42]
     assert states == [inspect.CORO_CLOSED]
-    assert captured == []
-    assert handle._closed
+    assert not [
+        warning
+        for warning in captured
+        if warning.category is RuntimeWarning
+        and str(warning.message) == "coroutine 'work' was never awaited"
+    ]
+    assert handle.closed
 
 
 def test_sync_harness_returns_redacted_callback_failure_and_stops_group(
@@ -1094,7 +1112,7 @@ def register(registrar):
     assert '<redacted>' in failure.detail
     assert loaded.module.seen == ['fail']
     assert result.callbacks[0].event_id == 42
-    assert handle._closed
+    assert handle.closed
 
 
 def test_sync_harness_uses_setup_config_secrets_filters_context_and_shared_module_state(
@@ -1189,8 +1207,8 @@ def register(registrar):
     ]
     assert len(loaded.module.seen_handles) == 2
     assert loaded.module.seen_handles[0] is handle
-    assert handle._session_uuids == ['browser-session']
-    assert handle._closed
+    assert handle.session_uuids == ['browser-session']
+    assert handle.closed
     assert sensitive_value not in caplog.text
     assert '<redacted>' in caplog.text
     assert {child.name for child in tmp_path.iterdir()} - {'__pycache__'} == {'plugin.py'}

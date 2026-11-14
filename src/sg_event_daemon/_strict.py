@@ -1,11 +1,9 @@
 """Bounded shared strict holdback and release."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Unpack
 
@@ -13,7 +11,6 @@ from ._fanout import (
     EncodedEvent,
     EventDelivery,
     GroupChannelInterface,
-    StrictCapacityControl,
     StrictOrderingControl,
 )
 from ._source import (
@@ -27,7 +24,7 @@ from ._source import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Iterable, Iterator, Mapping
 
     from ._group_types import LiveJoinIdentity
     from ._source_store import DiscoveryRange
@@ -37,50 +34,49 @@ JOIN_ABORT_LIMIT = 8
 
 
 @dataclass(frozen=True)
-class OrderingAnomaly:
-    """Describe one body-free strict-ordering halt or delivery-floor skip."""
+class _OrderingAnomaly:
+    """Describe one body-free strict-ordering halt."""
 
     group: str
     group_generation: int
     event_id: int
     last_delivered_id: int
     delivery_floor: int
-    action: Literal['halt', 'skip']
+    action: Literal['halt']
 
 
 @dataclass(frozen=True)
 class _StrictObservation:
     """Retain one shared encoded payload and its conservative ordering time."""
 
-    _event_id: int
-    _encoded: EncodedEvent
-    _ordering_time: float
-    _range_ids: tuple[str, ...]
+    event_id: int
+    encoded: EncodedEvent
+    ordering_time: float
 
 
 @dataclass(frozen=True)
 class _StrictRelease:
     """Transfer one eligible shared payload to one strict group."""
 
-    _group: str
-    _event_id: int
-    _encoded: EncodedEvent
-    _ordering_time: float
-    _is_operator_replay: bool
+    group: str
+    event_id: int
+    encoded: EncodedEvent
+    ordering_time: float
+    is_operator_replay: bool
 
 
 @dataclass(frozen=True)
 class _StrictReleaseWatermark:
     """Describe one group's strict release and durable comparison progress."""
 
-    _group: str
-    _group_generation: int
-    _holdback_secs: float
-    _delivery_floor: int
-    _released_through: int
-    _last_delivered_id: int
-    _is_operator_replay: bool
-    _provisional: bool
+    group: str
+    group_generation: int
+    holdback_secs: float
+    delivery_floor: int
+    released_through: int
+    last_delivered_id: int
+    is_operator_replay: bool
+    provisional: bool
 
 
 class _AttachGroupOptions(TypedDict):
@@ -97,41 +93,40 @@ class _AttachGroupOptions(TypedDict):
 class _JoinRecord:
     """Retain one token-specific strict join lifecycle."""
 
-    _identity: LiveJoinIdentity
-    _initial: JoinTarget | JoinRetry
-    _phase: Literal['aborted', 'finalized', 'prepared', 'reserved']
-    _sequence: int
-    _channel: GroupChannelInterface | None = None
-    _attached: Attached | None = None
-    _finalized: JoinFinalized | None = None
-    _abort_cause: Literal['capacity', 'non-capacity'] | None = None
+    identity: LiveJoinIdentity
+    initial: JoinTarget | JoinRetry
+    phase: Literal['aborted', 'finalized', 'prepared', 'reserved']
+    sequence: int
+    channel: GroupChannelInterface | None = None
+    attached: Attached | None = None
+    finalized: JoinFinalized | None = None
+    abort_cause: Literal['capacity', 'non-capacity'] | None = None
 
 
 @dataclass
 class _PendingControl:
     """Retain one strict control until an exact configured-level lane commit is acknowledged."""
 
-    _control: StrictCapacityControl | StrictOrderingControl
-    _offered_channel: GroupChannelInterface | None = None
+    control: StrictOrderingControl
+    offered_channel: GroupChannelInterface | None = None
 
 
 @dataclass
 class _GroupReleaseState:
     """Hold one process-local joined or provisional strict release state."""
 
-    _group: str
-    _group_generation: int
-    _holdback_secs: float
-    _delivery_floor: int
-    _released_through: int
-    _last_delivered_id: int
-    _is_operator_replay: bool
-    _provisional: bool
-    _channel: GroupChannelInterface | None
-    _halted: bool
-    _identity: LiveJoinIdentity | None
-    _pending_controls: deque[_PendingControl]
-    _capacity_pending: bool
+    group: str
+    group_generation: int
+    holdback_secs: float
+    delivery_floor: int
+    released_through: int
+    last_delivered_id: int
+    is_operator_replay: bool
+    provisional: bool
+    channel: GroupChannelInterface | None
+    halted: bool
+    identity: LiveJoinIdentity | None
+    pending_controls: deque[_PendingControl]
 
 
 class StrictBuffer:
@@ -177,7 +172,7 @@ class StrictBuffer:
             raise ValueError('strict group delivery floors must be nonnegative integers')
         self._acknowledged_controls: dict[
             str,
-            StrictCapacityControl | StrictOrderingControl,
+            StrictOrderingControl,
         ] = {}
         self._archived_watermarks: dict[str, _StrictReleaseWatermark] = {}
         self._byte_count = 0
@@ -195,12 +190,11 @@ class StrictBuffer:
         self._ordered_observation_ids: tuple[int, ...] | None = None
         self._pending_controls: dict[str, deque[_PendingControl]] = {}
         self._ranges: dict[str, _RangeState] = {}
-        self._relief_action_buffer: deque[str] = deque(maxlen=100)
         self._retry_after_secs = float(retry_after_secs)
 
     def _insert_observation(self, observation: _StrictObservation) -> None:
         """Insert one new observation and invalidate the ordered key view."""
-        self._observation_buffer[observation._event_id] = observation
+        self._observation_buffer[observation.event_id] = observation
         self._ordered_observation_ids = None
 
     def _observation_ids(self) -> tuple[int, ...]:
@@ -219,50 +213,43 @@ class StrictBuffer:
         pending_controls: deque[_PendingControl],
     ) -> _GroupReleaseState:
         """Build one release state from durable policy and pending controls."""
-        capacity_pending = any(
-            isinstance(item._control, StrictCapacityControl) for item in pending_controls
-        )
-        control_halt_pending = capacity_pending or any(
-            isinstance(item._control, StrictOrderingControl) and item._control.action == 'halt'
-            for item in pending_controls
-        )
+        control_halt_pending = bool(pending_controls)
         delivery_floor = self._group_delivery_floors.get(identity.group, identity.boundary)
         restored = self._archived_watermarks.get(identity.group)
-        if restored is not None and restored._group_generation != identity.group_generation:
+        if restored is not None and restored.group_generation != identity.group_generation:
             raise JoinProtocolError('strict restored generation conflicts')
         comparison = max(identity.boundary, delivery_floor)
         replay = False
         restored_halt = False
         if restored is not None:
-            comparison = max(comparison, restored._last_delivered_id)
-            replay = restored._is_operator_replay
+            comparison = max(comparison, restored.last_delivered_id)
+            replay = restored.is_operator_replay
             restored_halt = self._detached_halts.get(identity.group, False)
         return _GroupReleaseState(
-            _group=identity.group,
-            _group_generation=identity.group_generation,
-            _holdback_secs=holdback,
-            _delivery_floor=delivery_floor,
-            _released_through=comparison,
-            _last_delivered_id=comparison,
-            _is_operator_replay=replay,
-            _provisional=True,
-            _channel=channel,
-            _halted=restored_halt or control_halt_pending,
-            _identity=identity,
-            _pending_controls=pending_controls,
-            _capacity_pending=capacity_pending,
+            group=identity.group,
+            group_generation=identity.group_generation,
+            holdback_secs=holdback,
+            delivery_floor=delivery_floor,
+            released_through=comparison,
+            last_delivered_id=comparison,
+            is_operator_replay=replay,
+            provisional=True,
+            channel=channel,
+            halted=restored_halt or control_halt_pending,
+            identity=identity,
+            pending_controls=pending_controls,
         )
 
     def _queue_control(
         self,
         state: _GroupReleaseState,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Retain one new exact control without duplicating acknowledged work."""
-        if self._acknowledged_controls.get(state._group) == control:
+        if self._acknowledged_controls.get(state.group) == control:
             return
-        pending = self._pending_controls.setdefault(state._group, deque())
-        if any(item._control == control for item in pending):
+        pending = self._pending_controls.setdefault(state.group, deque())
+        if any(item.control == control for item in pending):
             return
         pending.append(_PendingControl(control))
 
@@ -270,24 +257,14 @@ class StrictBuffer:
         self,
         state: _GroupReleaseState,
         observation: _StrictObservation,
-        successful_time: float,
     ) -> bool:
-        """Return whether range timing or an unresolved lower range blocks release."""
+        """Return whether an unresolved lower range blocks release."""
         for range_state in self._ranges.values():
             if (
-                not range_state._closed
-                and range_state._high_id > state._released_through
-                and range_state._low_id < observation._event_id
+                not range_state.closed
+                and range_state.high_id > state.released_through
+                and range_state.low_id < observation.event_id
             ):
-                return True
-        for obligation_id in observation._range_ids:
-            range_state = self._ranges.get(obligation_id)
-            if range_state is None:
-                continue
-            if not range_state._closed:
-                return True
-            point = range_state._eligibility_points.get(state._group)
-            if point is not None and successful_time < point:
                 return True
         return False
 
@@ -299,23 +276,23 @@ class StrictBuffer:
         limit: int | None,
     ) -> Iterator[_StrictRelease]:
         """Yield one currently eligible ascending prefix without mutation."""
-        if state._halted:
+        if state.halted:
             return
         release_count = 0
         for event_id in self._observation_ids():
-            if event_id <= state._released_through:
+            if event_id <= state.released_through:
                 continue
             observation = self._observation_buffer[event_id]
-            if successful_time < observation._ordering_time + state._holdback_secs:
+            if successful_time < observation.ordering_time + state.holdback_secs:
                 break
-            if self._range_blocks(state, observation, successful_time):
+            if self._range_blocks(state, observation):
                 break
             yield _StrictRelease(
-                _group=state._group,
-                _event_id=event_id,
-                _encoded=observation._encoded,
-                _ordering_time=observation._ordering_time,
-                _is_operator_replay=state._is_operator_replay,
+                group=state.group,
+                event_id=event_id,
+                encoded=observation.encoded,
+                ordering_time=observation.ordering_time,
+                is_operator_replay=state.is_operator_replay,
             )
             release_count += 1
             if limit is not None and release_count >= limit:
@@ -329,24 +306,19 @@ class StrictBuffer:
         """Fence retained controls to one fresh exact live identity."""
         pending = self._pending_controls.setdefault(group, deque())
         if any(
-            item._control.identity.group_generation > identity.group_generation for item in pending
+            item.control.identity.group_generation > identity.group_generation for item in pending
         ):
             raise JoinProtocolError('strict retained control generation is in the future')
         retained = deque(
             item
             for item in pending
-            if item._control.identity.group_generation == identity.group_generation
+            if item.control.identity.group_generation == identity.group_generation
         )
         for item in retained:
-            item._control = replace(item._control, identity=identity)
-            item._offered_channel = None
+            item.control = replace(item.control, identity=identity)
+            item.offered_channel = None
         self._pending_controls[group] = retained
         return retained
-
-    @property
-    def _relief_actions(self) -> tuple[str, ...]:
-        """Return deterministic capacity-relief actions."""
-        return tuple(self._relief_action_buffer)
 
     def _remove_observation(self, event_id: int) -> _StrictObservation:
         """Remove one observation and invalidate the ordered key view."""
@@ -357,15 +329,15 @@ class StrictBuffer:
     @staticmethod
     def _reset_control_offers(state: _GroupReleaseState) -> None:
         """Make every unacknowledged control eligible for a future channel."""
-        for item in state._pending_controls:
-            item._offered_channel = None
+        for item in state.pending_controls:
+            item.offered_channel = None
 
     def _retire_terminal_history(self, group: str) -> None:
         """Discard the superseded terminal token for one group."""
         for token, previous in tuple(self._join_records.items()):
-            if previous._identity.group != group:
+            if previous.identity.group != group:
                 continue
-            if previous._phase not in {'aborted', 'finalized'}:
+            if previous.phase not in {'aborted', 'finalized'}:
                 raise JoinProtocolError('strict join history is not terminal')
             del self._join_records[token]
 
@@ -379,7 +351,7 @@ class StrictBuffer:
     ) -> None:
         """Keep one group's halt state and process-local reason synchronized."""
         if state is not None:
-            state._halted = halted
+            state.halted = halted
         self._detached_halts[group] = halted
         if not halted:
             self._halt_reasons.pop(group, None)
@@ -405,31 +377,24 @@ class StrictBuffer:
         self,
         state: _GroupReleaseState,
         event_id: int,
-    ) -> OrderingAnomaly | None:
-        """Return a new floor skip or decreasing-order halt."""
-        if event_id <= state._delivery_floor:
-            return OrderingAnomaly(
-                group=state._group,
-                group_generation=state._group_generation,
-                event_id=event_id,
-                last_delivered_id=state._last_delivered_id,
-                delivery_floor=state._delivery_floor,
-                action='skip',
-            )
-        comparison = max(state._last_delivered_id, state._released_through)
+    ) -> _OrderingAnomaly | None:
+        """Return a decreasing-order halt for an event above the floor."""
+        if event_id <= state.delivery_floor:
+            return None
+        comparison = max(state.last_delivered_id, state.released_through)
         if event_id < comparison:
             self._transition_halt(
-                state._group,
+                state.group,
                 halted=True,
                 reason='ordering-anomaly',
                 state=state,
             )
-            return OrderingAnomaly(
-                group=state._group,
-                group_generation=state._group_generation,
+            return _OrderingAnomaly(
+                group=state.group,
+                group_generation=state.group_generation,
                 event_id=event_id,
                 last_delivered_id=comparison,
-                delivery_floor=state._delivery_floor,
+                delivery_floor=state.delivery_floor,
                 action='halt',
             )
         return None
@@ -438,30 +403,30 @@ class StrictBuffer:
     def _project_watermark(state: _GroupReleaseState) -> _StrictReleaseWatermark:
         """Build one immutable group release projection."""
         return _StrictReleaseWatermark(
-            _group=state._group,
-            _group_generation=state._group_generation,
-            _holdback_secs=state._holdback_secs,
-            _delivery_floor=state._delivery_floor,
-            _released_through=state._released_through,
-            _last_delivered_id=state._last_delivered_id,
-            _is_operator_replay=state._is_operator_replay,
-            _provisional=state._provisional,
+            group=state.group,
+            group_generation=state.group_generation,
+            holdback_secs=state.holdback_secs,
+            delivery_floor=state.delivery_floor,
+            released_through=state.released_through,
+            last_delivered_id=state.last_delivered_id,
+            is_operator_replay=state.is_operator_replay,
+            provisional=state.provisional,
         )
 
     def _archive_group(self, state: _GroupReleaseState) -> None:
         """Retain one body-free terminal watermark after detachment."""
-        self._archived_watermarks[state._group] = self._project_watermark(state)
+        self._archived_watermarks[state.group] = self._project_watermark(state)
 
     @property
     def _leases(self) -> tuple[LiveJoinIdentity, ...]:
         """Return active join-retention leases in request order."""
         return tuple(
-            record._identity
+            record.identity
             for record in sorted(
                 self._join_records.values(),
-                key=lambda item: item._sequence,
+                key=lambda item: item.sequence,
             )
-            if record._phase in {'prepared', 'reserved'}
+            if record.phase in {'prepared', 'reserved'}
         )
 
     def _payload_needed(
@@ -470,27 +435,15 @@ class StrictBuffer:
         leases: tuple[LiveJoinIdentity, ...] | None = None,
     ) -> bool:
         """Return whether any joined group or leased boundary retains one id."""
-        if any(
-            not state._capacity_pending and event_id > state._released_through
-            for state in self._groups.values()
-        ):
+        if any(event_id > state.released_through for state in self._groups.values()):
             return True
         if leases is None:
             leases = self._leases
         return any(event_id > identity.boundary for identity in leases)
 
-    @property
-    def _observations(self) -> tuple[_StrictObservation, ...]:
-        """Return retained observations in ascending event-id order."""
-        return tuple(self._observation_buffer[event_id] for event_id in self._observation_ids())
-
     def _retention_floor(self) -> int | None:
         """Return the minimum active group or live lease boundary."""
-        boundaries = [
-            state._released_through
-            for state in self._groups.values()
-            if not state._capacity_pending
-        ]
+        boundaries = [state.released_through for state in self._groups.values()]
         boundaries.extend(identity.boundary for identity in self._leases)
         return min(boundaries, default=None)
 
@@ -504,7 +457,7 @@ class StrictBuffer:
         )
         for event_id in removable:
             observation = self._remove_observation(event_id)
-            self._byte_count -= observation._encoded.byte_count
+            self._byte_count -= observation.encoded.byte_count
 
     def _detach(
         self,
@@ -514,26 +467,23 @@ class StrictBuffer:
     ) -> None:
         """Detach one exact group while retaining only body-free status."""
         self._reset_control_offers(state)
-        self._transition_halt(state._group, halted=state._halted, state=state)
-        self._groups.pop(state._group, None)
+        self._transition_halt(state.group, halted=state.halted, state=state)
+        self._groups.pop(state.group, None)
         self._archive_group(state)
-        if state._channel is not None:
-            state._channel.detach(reason)
+        if state.channel is not None:
+            state.channel.detach(reason)
         self._free_unused()
 
     def _abort_capacity_join(self, record: _JoinRecord) -> None:
         """Abort one newest join for measured capacity relief."""
-        self._relief_action_buffer.append(
-            f'abort-join:{record._identity.group}:{record._identity.attempt_token}'
-        )
-        self._capacity_abort(record._identity.group)
-        state = self._groups.get(record._identity.group)
-        if state is not None and state._identity == record._identity:
+        self._capacity_abort(record.identity.group)
+        state = self._groups.get(record.identity.group)
+        if state is not None and state.identity == record.identity:
             self._detach(state, reason='strict-buffer-capacity')
-        elif record._channel is not None:
-            record._channel.detach('strict-buffer-capacity')
-        record._phase = 'aborted'
-        record._abort_cause = 'capacity'
+        elif record.channel is not None:
+            record.channel.detach('strict-buffer-capacity')
+        record.phase = 'aborted'
+        record.abort_cause = 'capacity'
 
     def _ensure_capacity(self, encoded: EncodedEvent) -> bool:
         """Apply deterministic relief until one new distinct frame fits."""
@@ -544,40 +494,16 @@ class StrictBuffer:
             active_joins = [
                 record
                 for record in self._join_records.values()
-                if record._phase in {'prepared', 'reserved'}
+                if record.phase in {'prepared', 'reserved'}
             ]
             if active_joins:
-                self._abort_capacity_join(max(active_joins, key=lambda item: item._sequence))
+                self._abort_capacity_join(max(active_joins, key=lambda item: item.sequence))
                 self._free_unused()
                 continue
             states = tuple(self._groups.values())
-            if len(states) > 1:
-                state = min(states, key=lambda item: (item._released_through, item._group))
-                self._relief_action_buffer.append(f'detach-group:{state._group}')
+            if states:
+                state = min(states, key=lambda item: (item.released_through, item.group))
                 self._detach(state, reason='strict-buffer-capacity')
-                continue
-            if len(states) == 1:
-                state = states[0]
-                self._transition_halt(
-                    state._group,
-                    halted=True,
-                    reason='strict-capacity-exhausted',
-                    state=state,
-                )
-                self._relief_action_buffer.append(f'halt-group:{state._group}')
-                if state._identity is not None and state._channel is not None:
-                    if not state._capacity_pending:
-                        self._queue_control(
-                            state,
-                            StrictCapacityControl(
-                                identity=state._identity,
-                                abort_limit=JOIN_ABORT_LIMIT,
-                            ),
-                        )
-                    state._capacity_pending = True
-                    self._free_unused()
-                    return False
-                self._detach(state, reason='strict-capacity-exhausted')
                 continue
             return False
         return True
@@ -587,44 +513,30 @@ class StrictBuffer:
         encoded: EncodedEvent,
         *,
         successful_time: float,
-        range_ids: Sequence[str] = (),
-    ) -> tuple[OrderingAnomaly, ...]:
+    ) -> tuple[_OrderingAnomaly, ...]:
         """Retain one payload once and record strict ordering decisions."""
         if not isfinite(successful_time) or successful_time < 0:
             raise ValueError('strict observation time must be finite and nonnegative')
-        normalized_ranges = tuple(sorted(set(range_ids)))
-        unknown = tuple(item for item in normalized_ranges if item not in self._ranges)
-        if unknown:
-            raise ValueError(f'strict observation names unknown ranges: {unknown!r}')
         existing = self._observation_buffer.get(encoded.event_id)
-        range_time = min(
-            (
-                self._ranges[obligation_id]._opened_successful_at
-                for obligation_id in normalized_ranges
-            ),
-            default=successful_time,
-        )
         if existing is not None:
-            if existing._encoded != encoded:
+            if existing.encoded != encoded:
                 raise ValueError('strict duplicate event body conflicts')
-            combined = tuple(sorted(set(existing._range_ids) | set(normalized_ranges)))
             self._observation_buffer[encoded.event_id] = _StrictObservation(
-                _event_id=encoded.event_id,
-                _encoded=encoded,
-                _ordering_time=min(existing._ordering_time, range_time),
-                _range_ids=combined,
+                event_id=encoded.event_id,
+                encoded=encoded,
+                ordering_time=min(existing.ordering_time, successful_time),
             )
             return ()
-        decisions: list[OrderingAnomaly] = []
+        decisions: list[_OrderingAnomaly] = []
         for state in tuple(self._groups.values()):
             decision = self._group_decision(state, encoded.event_id)
             if decision is not None:
                 decisions.append(decision)
-                if state._identity is not None and state._channel is not None:
+                if state.identity is not None and state.channel is not None:
                     self._queue_control(
                         state,
                         StrictOrderingControl(
-                            identity=state._identity,
+                            identity=state.identity,
                             event_id=decision.event_id,
                             last_delivered_id=decision.last_delivered_id,
                             delivery_floor=decision.delivery_floor,
@@ -637,10 +549,9 @@ class StrictBuffer:
             return tuple(decisions)
         self._insert_observation(
             _StrictObservation(
-                _event_id=encoded.event_id,
-                _encoded=encoded,
-                _ordering_time=range_time,
-                _range_ids=normalized_ranges,
+                event_id=encoded.event_id,
+                encoded=encoded,
+                ordering_time=successful_time,
             )
         )
         self._byte_count += encoded.byte_count
@@ -652,21 +563,21 @@ class StrictBuffer:
         channel: GroupChannelInterface,
     ) -> bool:
         """Offer the pending body-free controls before any event frame."""
-        if not state._pending_controls:
+        if not state.pending_controls:
             return True
-        pending = state._pending_controls[0]
-        if pending._offered_channel is channel:
+        pending = state.pending_controls[0]
+        if pending.offered_channel is channel:
             return False
-        if pending._offered_channel is not None:
+        if pending.offered_channel is not None:
             raise JoinProtocolError('strict control offer channel conflicts')
-        if not channel.offer_paced(pending._control):
+        if not channel.offer_paced(pending.control):
             if not channel.status.attached:
                 self._detach(
                     state,
                     reason=channel.status.reason or 'channel-lost',
                 )
             return False
-        pending._offered_channel = channel
+        pending.offered_channel = channel
         return False
 
     def _pump_releases(
@@ -676,18 +587,18 @@ class StrictBuffer:
         successful_time: float,
     ) -> tuple[_StrictRelease, ...]:
         """Fill available channel space with the ready ascending prefix."""
-        if state._halted:
+        if state.halted:
             return ()
         accepted: list[_StrictRelease] = []
         for release in self._ready(state, successful_time, limit=None):
-            if not channel.offer_paced(EventDelivery(release._encoded)):
+            if not channel.offer_paced(EventDelivery(release.encoded)):
                 if not channel.status.attached:
                     self._detach(
                         state,
                         reason=channel.status.reason or 'channel-lost',
                     )
                 break
-            state._released_through = release._event_id
+            state.released_through = release.event_id
             accepted.append(release)
         return tuple(accepted)
 
@@ -698,9 +609,9 @@ class StrictBuffer:
     ) -> tuple[_StrictRelease, ...]:
         """Pump one strict group without the normal reclamation boundary."""
         state = self._groups.get(group)
-        if state is None or state._channel is None:
+        if state is None or state.channel is None:
             return ()
-        channel = state._channel
+        channel = state.channel
         status = channel.status
         if not status.attached:
             self._detach(state, reason=status.reason or 'channel-lost')
@@ -709,16 +620,6 @@ class StrictBuffer:
             return ()
         return self._pump_releases(state, channel, successful_time)
 
-    def _watermark(self, group: str) -> _StrictReleaseWatermark:
-        """Return one group's live or last detached release projection."""
-        state = self._groups.get(group)
-        if state is not None:
-            return self._project_watermark(state)
-        archived = self._archived_watermarks.get(group)
-        if archived is None:
-            raise KeyError(group)
-        return archived
-
     def abort(self, identity: LiveJoinIdentity) -> None:
         """Remove one exact provisional or joined strict attempt.
 
@@ -726,26 +627,25 @@ class StrictBuffer:
             identity: Complete token-specific attempt identity.
         """
         record = self._join_records.get(identity.attempt_token)
-        if record is None or record._identity != identity or record._phase == 'aborted':
+        if record is None or record.identity != identity or record.phase == 'aborted':
             return
         state = self._groups.get(identity.group)
-        if state is not None and state._identity == identity:
+        if state is not None and state.identity == identity:
             self._detach(state, reason='strict-join-aborted')
-        elif record._channel is not None:
-            record._channel.detach('strict-join-aborted')
-        record._phase = 'aborted'
-        record._abort_cause = 'non-capacity'
+        elif record.channel is not None:
+            record.channel.detach('strict-join-aborted')
+        record.phase = 'aborted'
+        record.abort_cause = 'non-capacity'
         self._free_unused()
 
     def acknowledge_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Retire one exact control only after the configured-level lane commit.
 
-        After that commit, acknowledging a capacity or ordering-halt control
-        detaches the group. A floor-skip acknowledgement permits subsequent
-        work without detachment.
+        After that commit, acknowledging the ordering-halt control detaches the
+        group.
 
         Args:
             control: Full current live identity and committed decision.
@@ -755,26 +655,21 @@ class StrictBuffer:
                 identity, or was not offered.
         """
         record = self._join_records.get(control.identity.attempt_token)
-        if record is None or record._identity != control.identity:
+        if record is None or record.identity != control.identity:
             raise JoinProtocolError('strict control acknowledgement is stale')
         if self._acknowledged_controls.get(control.identity.group) == control:
             return
         state = self._groups.get(control.identity.group)
-        if state is None or state._identity != control.identity:
+        if state is None or state.identity != control.identity:
             raise JoinProtocolError('strict control acknowledgement is stale')
         pending = self._pending_controls.get(control.identity.group)
-        if pending is None or not pending or pending[0]._control != control:
+        if pending is None or not pending or pending[0].control != control:
             raise JoinProtocolError('strict control acknowledgement conflicts')
-        if pending[0]._offered_channel is None:
+        if pending[0].offered_channel is None:
             raise JoinProtocolError('strict control was not offered')
         pending.popleft()
         self._acknowledged_controls[control.identity.group] = control
-        capacity_control = isinstance(control, StrictCapacityControl)
-        if capacity_control or control.action == 'halt':
-            self._detach(
-                state,
-                reason=('strict-capacity-exhausted' if capacity_control else 'ordering-anomaly'),
-            )
+        self._detach(state, reason='ordering-anomaly')
 
     @property
     def byte_count(self) -> int:
@@ -825,31 +720,28 @@ class StrictBuffer:
                 provisional release state conflicts.
         """
         record = self._join_records.get(identity.attempt_token)
-        if record is None or record._identity != identity:
+        if record is None or record.identity != identity:
             raise JoinProtocolError('strict join attempt is stale')
-        if record._phase == 'aborted':
-            if record._abort_cause == 'capacity':
+        if record.phase == 'aborted':
+            if record.abort_cause == 'capacity':
                 raise JoinCapacityError('strict join attempt exhausted capacity')
             raise JoinProtocolError('strict join attempt was aborted')
-        if record._phase == 'finalized' and record._finalized is not None:
-            return record._finalized
-        if record._phase != 'prepared':
+        if record.phase == 'finalized' and record.finalized is not None:
+            return record.finalized
+        if record.phase != 'prepared':
             raise JoinProtocolError('strict join attempt is not prepared')
         state = self._groups.get(identity.group)
-        if state is None or state._identity != identity or not state._provisional:
+        if state is None or state.identity != identity or not state.provisional:
             raise JoinProtocolError('strict provisional release state conflicts')
-        state._provisional = False
-        record._phase = 'finalized'
-        record._finalized = JoinFinalized(identity)
+        state.provisional = False
+        record.phase = 'finalized'
+        record.finalized = JoinFinalized(identity)
         self._capacity_aborts[identity.group] = 0
-        if (
-            self._halt_reasons.get(identity.group) == 'strict-capacity-exhausted'
-            and not state._capacity_pending
-        ):
+        if self._halt_reasons.get(identity.group) == 'strict-capacity-exhausted':
             self._transition_halt(identity.group, halted=False, state=state)
         else:
-            self._transition_halt(identity.group, halted=state._halted, state=state)
-        return record._finalized
+            self._transition_halt(identity.group, halted=state.halted, state=state)
+        return record.finalized
 
     def halt_for_replay(self, group: str, generation: int) -> None:
         """Apply a durable replay halt only to the matching release generation.
@@ -861,7 +753,7 @@ class StrictBuffer:
         state = self._groups.get(group)
         watermark = self._archived_watermarks.get(group)
         current = state if state is not None else watermark
-        if current is None or current._group_generation != generation:
+        if current is None or current.group_generation != generation:
             return
         self._transition_halt(group, halted=True, reason='replay-required', state=state)
 
@@ -870,38 +762,33 @@ class StrictBuffer:
         encoded_events: Iterable[EncodedEvent],
         *,
         successful_time: float,
-        range_ids: Mapping[int, Sequence[str]] | None = None,
-    ) -> tuple[OrderingAnomaly, ...]:
+    ) -> tuple[_OrderingAnomaly, ...]:
         """Retain an ascending source chunk without duplicating payloads.
 
-        Deterministic capacity relief may abort the newest active join, detach
-        groups, or halt the remaining group. Relief can discard an incoming
-        payload that still does not fit or is no longer needed. Processing is
-        incremental; a later invalid observation does not roll back earlier
-        work.
+        Deterministic capacity relief may abort the newest active join or
+        detach groups, including the sole remaining group. Relief can discard
+        an incoming payload that still does not fit or is no longer needed.
+        Processing is incremental; a later invalid observation does not roll
+        back earlier work.
 
         Args:
             encoded_events: Complete immutable source chunk.
             successful_time: Finite nonnegative shared successful-query time in
                 seconds.
-            range_ids: Optional per-event identities already synchronized into
-                the buffer.
 
         Returns:
             New body-free ordering decisions across the chunk.
 
         Raises:
-            ValueError: Observation time is invalid, a range is unknown, or a
-                duplicate event id carries a conflicting payload.
+            ValueError: Observation time is invalid or a duplicate event id
+                carries a conflicting payload.
         """
-        relationships: Mapping[int, Sequence[str]] = {} if range_ids is None else range_ids
-        decisions: list[OrderingAnomaly] = []
+        decisions: list[_OrderingAnomaly] = []
         for encoded in encoded_events:
             decisions.extend(
                 self._observe(
                     encoded,
                     successful_time=successful_time,
-                    range_ids=relationships.get(encoded.event_id, ()),
                 )
             )
         return tuple(decisions)
@@ -931,16 +818,16 @@ class StrictBuffer:
                 channel, or restored group policy conflicts.
         """
         record = self._join_records.get(identity.attempt_token)
-        if record is None or record._identity != identity:
+        if record is None or record.identity != identity:
             raise JoinProtocolError('strict join attempt is stale')
-        if record._phase == 'aborted':
-            if record._abort_cause == 'capacity':
+        if record.phase == 'aborted':
+            if record.abort_cause == 'capacity':
                 raise JoinCapacityError('strict join attempt exhausted capacity')
             raise JoinProtocolError('strict join attempt was aborted')
-        if record._phase in {'finalized', 'prepared'}:
-            if record._channel is not channel or record._attached is None:
+        if record.phase in {'finalized', 'prepared'}:
+            if record.channel is not channel or record.attached is None:
                 raise JoinProtocolError('strict join channel conflicts')
-            return record._attached
+            return record.attached
         if channel.group != identity.group or channel.ordering != 'strict':
             raise JoinProtocolError('strict join channel identity conflicts')
         if not channel.status.attached:
@@ -956,11 +843,11 @@ class StrictBuffer:
             pending_controls,
         )
         self._groups[identity.group] = state
-        self._transition_halt(identity.group, halted=state._halted, state=state)
-        record._channel = channel
-        record._attached = Attached(identity)
-        record._phase = 'prepared'
-        return record._attached
+        self._transition_halt(identity.group, halted=state.halted, state=state)
+        record.channel = channel
+        record.attached = Attached(identity)
+        record.phase = 'prepared'
+        return record.attached
 
     def pump_many(
         self,
@@ -981,23 +868,6 @@ class StrictBuffer:
             releases.extend(self._pump_without_reclaim(group, successful_time))
         self._free_unused()
         return tuple(releases)
-
-    def range_ids_for(self, event_id: int) -> tuple[str, ...]:
-        """Return durable ranges that classified one observed late id.
-
-        Args:
-            event_id: Exact EventLogEntry id.
-
-        Returns:
-            Stable range identities in lexical order.
-        """
-        return tuple(
-            sorted(
-                obligation_id
-                for obligation_id, range_state in self._ranges.items()
-                if event_id in range_state._late_ids
-            )
-        )
 
     def reserve(self, identity: LiveJoinIdentity) -> JoinTarget | JoinRetry:
         """Reserve one measured fixed-boundary strict retention lease.
@@ -1023,11 +893,11 @@ class StrictBuffer:
             raise JoinProtocolError('strict join token must not be empty')
         existing = self._join_records.get(identity.attempt_token)
         if existing is not None:
-            if existing._identity != identity:
+            if existing.identity != identity:
                 raise JoinProtocolError('strict join token was reused')
-            return existing._initial
+            return existing.initial
         if identity.group in self._groups or any(
-            record._identity.group == identity.group and record._phase in {'prepared', 'reserved'}
+            record.identity.group == identity.group and record.phase in {'prepared', 'reserved'}
             for record in self._join_records.values()
         ):
             raise JoinProtocolError('strict group already owns live release state')
@@ -1057,11 +927,11 @@ class StrictBuffer:
             phase = 'aborted'
             self._capacity_abort(identity.group)
         self._join_records[identity.attempt_token] = _JoinRecord(
-            _identity=identity,
-            _initial=initial,
-            _phase=phase,
-            _sequence=self._join_sequence,
-            _abort_cause='capacity' if isinstance(initial, JoinRetry) else None,
+            identity=identity,
+            initial=initial,
+            phase=phase,
+            sequence=self._join_sequence,
+            abort_cause='capacity' if isinstance(initial, JoinRetry) else None,
         )
         return initial
 
@@ -1110,14 +980,14 @@ class StrictBuffer:
         if group in self._groups:
             raise ValueError(f'strict group is already attached: {group}')
         watermark = _StrictReleaseWatermark(
-            _group=group,
-            _group_generation=group_generation,
-            _holdback_secs=float(holdback_secs),
-            _delivery_floor=delivery_floor,
-            _released_through=last_delivered_id,
-            _last_delivered_id=last_delivered_id,
-            _is_operator_replay=is_operator_replay,
-            _provisional=False,
+            group=group,
+            group_generation=group_generation,
+            holdback_secs=float(holdback_secs),
+            delivery_floor=delivery_floor,
+            released_through=last_delivered_id,
+            last_delivered_id=last_delivered_id,
+            is_operator_replay=is_operator_replay,
+            provisional=False,
         )
         self._archived_watermarks[group] = watermark
         self._transition_halt(group, halted=halted)
@@ -1137,11 +1007,7 @@ class StrictBuffer:
             Owners with no needed payloads have zero counts. Groups without an
             active retention boundary are omitted.
         """
-        floors = {
-            state._group: state._released_through
-            for state in self._groups.values()
-            if not state._capacity_pending
-        }
+        floors = {state.group: state.released_through for state in self._groups.values()}
         for identity in self._leases:
             floors[identity.group] = min(
                 floors.get(identity.group, identity.boundary),
@@ -1154,14 +1020,14 @@ class StrictBuffer:
         rows: list[tuple[str, int, int, int]] = []
         for group, floor in sorted(floors.items(), key=lambda item: item[1]):
             while index < len(event_ids) and event_ids[index] <= floor:
-                remaining_bytes -= self._observation_buffer[event_ids[index]]._encoded.byte_count
+                remaining_bytes -= self._observation_buffer[event_ids[index]].encoded.byte_count
                 remaining_events -= 1
                 index += 1
             rows.append((group, floor, remaining_events, remaining_bytes))
         return tuple(sorted(rows))
 
     def synchronize_ranges(self, ranges: Iterable[DiscoveryRange]) -> None:
-        """Replace range timing from the sole durable `SourceState` projection.
+        """Replace range bounds and closure from the sole durable `SourceState` projection.
 
         Args:
             ranges: Current body-free durable range snapshots.
@@ -1169,25 +1035,19 @@ class StrictBuffer:
         synchronized: dict[str, _RangeState] = {}
         for item in ranges:
             synchronized[item.obligation_id] = _RangeState(
-                _obligation_id=item.obligation_id,
-                _low_id=item.low_id,
-                _high_id=item.high_id,
-                _opened_successful_at=item.opened_successful_at,
-                _eligibility_points=dict(item.group_eligibility),
-                _closed=item.state == 'closed',
-                _late_ids=set(item.late_ids),
+                obligation_id=item.obligation_id,
+                low_id=item.low_id,
+                high_id=item.high_id,
+                closed=item.state == 'closed',
             )
         self._ranges = synchronized
 
 
 @dataclass
 class _RangeState:
-    """Retain one body-free range's conservative timing and closure state."""
+    """Retain one body-free range's bounds and closure state."""
 
-    _obligation_id: str
-    _low_id: int
-    _high_id: int
-    _opened_successful_at: float
-    _eligibility_points: dict[str, float]
-    _closed: bool
-    _late_ids: set[int] = field(default_factory=set[int])
+    obligation_id: str
+    low_id: int
+    high_id: int
+    closed: bool

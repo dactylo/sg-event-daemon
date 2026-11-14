@@ -23,16 +23,16 @@ _SITE = 'https://example.invalid'
 
 class _AsyncCallableMethod:
     def __init__(self) -> None:
-        self._called = False
+        self.called = False
 
     async def __call__(self, *_args: object, **_kwargs: object) -> object:
-        self._called = True
+        self.called = True
         raise AssertionError('provider method ran during handle validation')
 
 
 class _FakeAsyncShotgun:
-    _calls: ClassVar[list[tuple[str, bool]]] = []
-    _handles: ClassVar[list[_FakeAsyncShotgun]] = []
+    calls: ClassVar[list[tuple[str, bool]]] = []
+    handles: ClassVar[list[_FakeAsyncShotgun]] = []
 
     def __init__(
         self,
@@ -45,11 +45,11 @@ class _FakeAsyncShotgun:
         assert script_name == 'daemon'
         assert api_key == 'secret'
         self.config = _FakeConfig()
-        self._constructed_loop = asyncio.get_running_loop()
+        self.constructed_loop = asyncio.get_running_loop()
         self._closed = False
         self._session_uuid: str | None = None
-        type(self)._calls.append(('AsyncShotgun', connect))
-        type(self)._handles.append(self)
+        type(self).calls.append(('AsyncShotgun', connect))
+        type(self).handles.append(self)
 
     async def close(self) -> None:
         self._closed = True
@@ -80,8 +80,8 @@ class _FakeConfig:
 
 
 class _FakeShotgun:
-    _calls: ClassVar[list[tuple[str, bool]]] = []
-    _handles: ClassVar[list[_FakeShotgun]] = []
+    calls: ClassVar[list[tuple[str, bool]]] = []
+    handles: ClassVar[list[_FakeShotgun]] = []
 
     def __init__(
         self,
@@ -96,8 +96,8 @@ class _FakeShotgun:
         self.config = _FakeConfig()
         self._closed = False
         self._session_uuid: str | None = None
-        type(self)._calls.append(('Shotgun', connect))
-        type(self)._handles.append(self)
+        type(self).calls.append(('Shotgun', connect))
+        type(self).handles.append(self)
 
     def close(self) -> None:
         self._closed = True
@@ -234,8 +234,8 @@ def _load_returning_provider(
 def test_async_factory_constructs_on_running_loop_and_applies_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _FakeAsyncShotgun._calls.clear()
-    _FakeAsyncShotgun._handles.clear()
+    _FakeAsyncShotgun.calls.clear()
+    _FakeAsyncShotgun.handles.clear()
     _install_fake_environment(monkeypatch, owners=['sg-python-api'])
     provider = load_provider('sg-python-api', {'async', 'sync'})
 
@@ -248,14 +248,14 @@ def test_async_factory_constructs_on_running_loop_and_applies_settings(
 
     assert all(isinstance(handle, AsyncSG) for handle in handles)
     assert len({id(handle) for handle in handles}) == 3
-    assert _FakeAsyncShotgun._calls == [
+    assert _FakeAsyncShotgun.calls == [
         ('AsyncShotgun', False),
         ('AsyncShotgun', False),
         ('AsyncShotgun', False),
     ]
     for handle in handles:
         concrete = cast('_FakeAsyncShotgun', handle)
-        assert concrete._constructed_loop is loop
+        assert concrete.constructed_loop is loop
         assert concrete.config.timeout_secs == 17.0
         assert concrete.config.max_rpc_attempts == 4
         assert concrete.config.rpc_attempt_interval == 2_500
@@ -264,7 +264,7 @@ def test_async_factory_constructs_on_running_loop_and_applies_settings(
 def test_async_factory_rejects_sync_methods_before_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _FakeShotgun._handles.clear()
+    _FakeShotgun.handles.clear()
     _install_fake_environment(
         monkeypatch,
         module=SimpleNamespace(Shotgun=_FakeShotgun, AsyncShotgun=_FakeShotgun),
@@ -281,7 +281,7 @@ def test_async_factory_rejects_sync_methods_before_configuration(
 
     asyncio.run(create())
 
-    config = _FakeShotgun._handles[-1].config
+    config = _FakeShotgun.handles[-1].config
     assert config.timeout_secs == 0.0
     assert config.max_rpc_attempts == 0
     assert config.rpc_attempt_interval == 0
@@ -333,10 +333,10 @@ def test_factories_classify_async_callable_object_methods(
             provider.create_sync(_SITE, _credential())
 
         assert sync_handle.config.timeout_secs == 0.0
-        assert sync_method._called is False
+        assert sync_method.called is False
         assert await provider.create_async(_SITE, _credential()) is async_handle
         assert async_handle.config.timeout_secs == 17.0
-        assert async_method._called is False
+        assert async_method.called is False
 
     asyncio.run(validate())
 
@@ -422,7 +422,7 @@ def test_async_handle_mode_rejects_async_session_setter(
             await provider.create_async(_SITE, _credential())
 
         assert async_handle.config.timeout_secs == 0.0
-        assert setter._called is False
+        assert setter.called is False
 
     asyncio.run(validate())
 
@@ -567,11 +567,26 @@ def test_load_provider_uses_one_owner_metadata_snapshot(
     assert calls == 1
 
 
+def test_missing_optional_async_export_names_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    class SyncOnlyModule:
+        Shotgun = _FakeShotgun
+
+        def __getattr__(self, name: str) -> object:
+            if name == 'AsyncShotgun':
+                raise ImportError('httpx2 is not installed')
+            raise AttributeError(name)
+
+    _install_fake_environment(monkeypatch, module=SyncOnlyModule(), owners=['sg-python-api'])
+
+    with pytest.raises(ProviderError, match='sg-python-api-async'):
+        load_provider('sg-python-api', {'sync', 'async'})
+
+
 def test_sync_factory_creates_independent_handles_with_daemon_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _FakeShotgun._calls.clear()
-    _FakeShotgun._handles.clear()
+    _FakeShotgun.calls.clear()
+    _FakeShotgun.handles.clear()
     _install_fake_environment(monkeypatch)
     provider = load_provider('shotgun-api3', {'sync'})
 
@@ -579,12 +594,12 @@ def test_sync_factory_creates_independent_handles_with_daemon_settings(
 
     assert all(isinstance(handle, SyncSG) for handle in handles)
     assert len({id(handle) for handle in handles}) == 3
-    assert _FakeShotgun._calls == [
+    assert _FakeShotgun.calls == [
         ('Shotgun', False),
         ('Shotgun', False),
         ('Shotgun', False),
     ]
-    for handle in _FakeShotgun._handles:
+    for handle in _FakeShotgun.handles:
         assert handle.config.timeout_secs == 17.0
         assert handle.config.max_rpc_attempts == 4
         assert handle.config.rpc_attempt_interval == 2_500
@@ -606,7 +621,7 @@ def test_sync_handle_mode_rejects_async_session_setter(
             provider.create_sync(_SITE, _credential())
 
         assert sync_handle.config.timeout_secs == 0.0
-        assert setter._called is False
+        assert setter.called is False
 
     asyncio.run(validate())
 
@@ -627,7 +642,7 @@ def test_sync_factory_rejects_async_method_before_configuration(
         method_name,
         getattr(_FakeAsyncShotgun, method_name),
     )
-    WrongModeShotgun._handles.clear()
+    WrongModeShotgun.handles.clear()
     _install_fake_environment(
         monkeypatch,
         module=SimpleNamespace(Shotgun=WrongModeShotgun),
@@ -640,7 +655,26 @@ def test_sync_factory_rejects_async_method_before_configuration(
     ):
         provider.create_sync(_SITE, _credential())
 
-    config = WrongModeShotgun._handles[-1].config
+    config = WrongModeShotgun.handles[-1].config
     assert config.timeout_secs == 0.0
     assert config.max_rpc_attempts == 0
     assert config.rpc_attempt_interval == 0
+
+
+def test_sync_provider_does_not_resolve_optional_async_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SyncOnlyModule:
+        Shotgun = _FakeShotgun
+
+        def __getattr__(self, name: str) -> object:
+            if name == 'AsyncShotgun':
+                raise ImportError('install sg-python-api-async')
+            raise AttributeError(name)
+
+    _install_fake_environment(monkeypatch, module=SyncOnlyModule(), owners=['sg-python-api'])
+
+    provider = load_provider('sg-python-api', {'sync'})
+
+    assert provider.capabilities.sync is True
+    assert provider.capabilities.async_ is False

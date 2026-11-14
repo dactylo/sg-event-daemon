@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from itertools import pairwise
 from math import isfinite
+from threading import Lock
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Mapping, Sequence
 
     from ._lane import LaneHealth
+    from ._probe import ProbeResult
     from ._source import SourceHaltStatus, SourceHealth
     from ._watchdog import WatchdogKind, WatchdogPhase
 
@@ -38,6 +40,8 @@ _PrimaryState: TypeAlias = Literal[
     'ordering-anomaly',
     'capacity-exhausted',
     'callback-failed',
+    'write-lock-stalled',
+    'checkpoint-stalled',
     'source-degraded',
     'catching-up',
     'parked',
@@ -47,13 +51,12 @@ _PrimaryState: TypeAlias = Literal[
 HEALTH_LATE_ID_LIMIT = 100
 HEALTH_SECRET_TEXT_TERMS = ('api_key=', 'apikey=', 'password=', 'secret=', 'token=')
 HEALTH_TEXT_MAX_BYTES = 4096
+STALL_CONDITIONS = frozenset({'write-lock-stalled', 'checkpoint-stalled'})
 _HEALTHY_STATES = frozenset({'healthy', 'idle', 'parked'})
 
 _STATUS_PRECEDENCE: tuple[_PrimaryState, ...] = get_args(_PrimaryState)
 _SOURCE_HALT_CONDITIONS: dict[SourceHaltStatus, str] = {
-    'encoder-died': 'event-unavailable',
     'encoder-failed': 'event-unavailable',
-    'encoder-shutdown': 'event-unavailable',
     'event-too-large': 'event-unavailable',
     'frame-too-large': 'event-unavailable',
     'late-capacity-exhausted': 'capacity-exhausted',
@@ -76,6 +79,42 @@ class BreakerTransition:
     def __post_init__(self) -> None:
         """Bound the diagnostic transition reason."""
         object.__setattr__(self, 'reason', bound_health_text(self.reason))
+
+
+class ConditionFlags:
+    """Hold a component's explicit conditions across owner and monitor threads.
+
+    The set is process-local. Each operation is atomic, and `names` returns a
+    snapshot ordered by status precedence, followed by other names in lexical
+    order. Set and clear report whether membership changed.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty condition set with its own lock."""
+        self._lock = Lock()
+        self._names: set[str] = set()
+
+    def clear(self, name: str) -> bool:
+        """Clear `name` and report whether it was present."""
+        with self._lock:
+            present = name in self._names
+            self._names.discard(name)
+            return present
+
+    def names(self) -> tuple[str, ...]:
+        """Return a status-ordered snapshot of current condition names."""
+        with self._lock:
+            names = self._names.copy()
+        return tuple(name for name in _STATUS_PRECEDENCE if name in names) + tuple(
+            sorted(names.difference(_STATUS_PRECEDENCE))
+        )
+
+    def set(self, name: str) -> bool:
+        """Set `name` and report whether it was newly present."""
+        with self._lock:
+            new = name not in self._names
+            self._names.add(name)
+            return new
 
 
 @dataclass(frozen=True)
@@ -206,12 +245,9 @@ class WorkerHealth:
     monitor_alive: bool
     thread_names: tuple[str, ...]
     stuck_threads: tuple[str, ...]
-    breaker_open: bool
-    breaker_reason: str | None
     socket_buffer_requested: int
     socket_send_buffer: int
     socket_receive_buffer: int
-    source_outages: tuple[tuple[str, str], ...] = ()
     heartbeat_age: float = 0.0
     watchdog_failure: str | None = None
 
@@ -224,13 +260,7 @@ class WorkerHealth:
         """
         _validate_health_time(self.heartbeat_at, 'worker heartbeat')
         _validate_health_time(self.heartbeat_age, 'worker heartbeat age')
-        object.__setattr__(self, 'breaker_reason', bound_health_text(self.breaker_reason))
         object.__setattr__(self, 'watchdog_failure', bound_health_text(self.watchdog_failure))
-        object.__setattr__(
-            self,
-            'source_outages',
-            tuple((source, bound_health_text(reason)) for source, reason in self.source_outages),
-        )
 
 
 class _GroupHealthOptions(TypedDict):
@@ -250,9 +280,10 @@ class _GroupHealthOptions(TypedDict):
     park_reason: str | None
     failure_kind: str | None
     failure_text: str | None
-    checkpoint_state: str
     conditions: Iterable[str]
     audit_count: NotRequired[int]
+    replay_required_from: NotRequired[int | None]
+    history_truncated_floor: NotRequired[int | None]
 
 
 @dataclass(frozen=True)
@@ -295,9 +326,10 @@ class GroupHealth:
     park_reason: str | None
     failure_kind: str | None
     failure_text: str | None
-    checkpoint_state: str
     conditions: tuple[str, ...]
     audit_count: int = 0
+    replay_required_from: int | None = None
+    history_truncated_floor: int | None = None
     deadline_at: float | None = None
     overdue_reason: str | None = None
 
@@ -364,9 +396,12 @@ class GroupHealth:
             park_reason: Body-free park detail.
             failure_kind: Setup or callback failure kind.
             failure_text: Bounded failure detail.
-            checkpoint_state: Current database checkpoint condition.
             conditions: Every independently applicable status condition.
             audit_count: Cumulative group-owner audit rows.
+            replay_required_from: Latest safe replay start for retained
+                evidence.
+            history_truncated_floor: Earliest visible event after history
+                truncation.
 
         Returns:
             A complete immutable group projection.
@@ -414,9 +449,10 @@ class GroupHealth:
             park_reason=options['park_reason'],
             failure_kind=options['failure_kind'],
             failure_text=options['failure_text'],
-            checkpoint_state=options['checkpoint_state'],
             conditions=tuple(dict.fromkeys(options['conditions'])),
             audit_count=options.get('audit_count', 0),
+            replay_required_from=options.get('replay_required_from'),
+            history_truncated_floor=options.get('history_truncated_floor'),
             deadline_at=lane.deadline_at,
             overdue_reason=lane.overdue_reason,
         )
@@ -429,32 +465,16 @@ class _AggregateStatusOptions(TypedDict):
     groups: Iterable[GroupHealth]
     workers: Iterable[WorkerHealth]
     now: float
-    stale_after_secs: float
+    probe: ProbeResult
     audit_count: NotRequired[int]
     database_sizes: NotRequired[Iterable[tuple[str, int]]]
     breaker_history: NotRequired[Sequence[BreakerTransition]]
     breaker_transition_count: NotRequired[int]
-    worker_breaker_open: NotRequired[bool]
 
 
 @dataclass(frozen=True)
-class StatusSnapshot:
-    """Contain one complete ephemeral supervisor status snapshot.
-
-    Attributes:
-        generated_at: Time when this projection was generated.
-        primary_state: Highest-priority aggregate state.
-        conditions: Active aggregate condition labels.
-        sources: Source health projections.
-        groups: Group health projections.
-        workers: Worker health projections.
-        liveness: Whether the process is live.
-        readiness: Whether the service is ready.
-        audit_count: Cumulative audit record count.
-        database_sizes: Named database sizes in bytes.
-        breaker_history: Recent worker-breaker transitions.
-        breaker_transition_count: Cumulative breaker transition count.
-    """
+class _StatusSnapshot:
+    """Contain one complete ephemeral supervisor status snapshot."""
 
     generated_at: float
     primary_state: _PrimaryState
@@ -488,6 +508,7 @@ class _ProbeHealthOptions(TypedDict):
     stale_after_secs: float
     worker_breaker_open: NotRequired[bool]
     inventory_complete: NotRequired[bool]
+    supervisor_conditions: NotRequired[Sequence[str]]
 
 
 def _conditions_ready(conditions: Sequence[str]) -> bool:
@@ -519,6 +540,7 @@ def _current_health_inputs(
     )
     extra_conditions = (
         *(('worker-breaker-open',) if options.get('worker_breaker_open', False) else ()),
+        *options.get('supervisor_conditions', ()),
         *(('stale',) if not options.get('inventory_complete', True) else ()),
     )
     return current_sources, current_groups, current_workers, extra_conditions
@@ -529,18 +551,8 @@ def _group_conditions(group: GroupHealth) -> set[str]:
     conditions = set(group.conditions)
     if group.overdue_reason is not None:
         conditions.add('stale')
-    if conditions.intersection(
-        {
-            'late-capacity-exhausted',
-            'strict-capacity-exhausted',
-        }
-    ):
-        conditions.difference_update(
-            {
-                'late-capacity-exhausted',
-                'strict-capacity-exhausted',
-            }
-        )
+    if 'late-capacity-exhausted' in conditions:
+        conditions.remove('late-capacity-exhausted')
         conditions.add('capacity-exhausted')
     if group.parked:
         conditions.add('parked')
@@ -557,9 +569,17 @@ def _group_conditions(group: GroupHealth) -> set[str]:
     return conditions
 
 
+def _primary_state_for_conditions(conditions: Collection[str]) -> _PrimaryState:
+    """Return the highest-precedence state from ordered health conditions."""
+    for state in _STATUS_PRECEDENCE:
+        if state in conditions:
+            return state
+    return 'healthy'
+
+
 def _source_conditions(source: SourceHealth) -> set[str]:
-    """Return every derived source condition."""
-    conditions: set[str] = set()
+    """Return every explicit and derived source condition."""
+    conditions: set[str] = set(source.conditions)
     if source.overdue_reason is not None:
         conditions.add('stale')
     status = source.status
@@ -635,8 +655,6 @@ def _visible_health_conditions(
     for group in groups:
         conditions.update(_group_conditions(group))
     for worker in workers:
-        if worker.breaker_open:
-            conditions.add('worker-breaker-open')
         if not worker.monitor_alive or worker.heartbeat_age > stale_after_secs:
             conditions.add('stale')
         if worker.watchdog_failure is not None:
@@ -666,10 +684,105 @@ def _readiness_health_conditions(
     )
 
 
+@dataclass(frozen=True)
+class _HealthEvaluation:
+    """Contain refreshed component records and their shared health verdict."""
+
+    sources: tuple[SourceHealth, ...]
+    groups: tuple[GroupHealth, ...]
+    workers: tuple[WorkerHealth, ...]
+    conditions: tuple[str, ...]
+    liveness: bool
+    readiness: bool
+
+
 def _worker_liveness(workers: Iterable[WorkerHealth], stale_after_secs: float) -> bool:
     """Return whether all worker monitors have fresh heartbeats."""
     return all(
         worker.monitor_alive and worker.heartbeat_age <= stale_after_secs for worker in workers
+    )
+
+
+def aggregate_status(**options: Unpack[_AggregateStatusOptions]) -> _StatusSnapshot:
+    """Combine component detail with the supervisor's actual published probe verdict.
+
+    Args:
+        **options: Component records, observation time, authoritative probe
+            result, and optional cumulative audit, database, and breaker
+            telemetry.
+
+    Returns:
+        One immutable status snapshot. A missing first probe is reported as
+        stale.
+
+    Raises:
+        ValueError: A cumulative counter is negative.
+    """
+    now = options['now']
+    probe = options['probe']
+    audit_count = options.get('audit_count', 0)
+    breaker_history = options.get('breaker_history', ())
+    breaker_transition_count = options.get('breaker_transition_count', 0)
+    if audit_count < 0 or breaker_transition_count < 0:
+        raise ValueError('cumulative health counters must be nonnegative')
+    conditions = probe.conditions if probe.generated_at is not None else ('stale',)
+    return _StatusSnapshot(
+        generated_at=now,
+        primary_state=_primary_state_for_conditions(conditions),
+        conditions=conditions,
+        sources=tuple(
+            replace(item, heartbeat_age=max(0.0, now - item.heartbeat_at))
+            for item in options['sources']
+        ),
+        groups=tuple(
+            replace(item, heartbeat_age=max(0.0, now - item.heartbeat_at))
+            for item in options['groups']
+        ),
+        workers=tuple(
+            replace(item, heartbeat_age=max(0.0, now - item.heartbeat_at))
+            for item in options['workers']
+        ),
+        liveness=probe.liveness,
+        readiness=probe.readiness,
+        audit_count=audit_count,
+        database_sizes=tuple(options.get('database_sizes', ())),
+        breaker_history=tuple(breaker_history[-100:]),
+        breaker_transition_count=max(breaker_transition_count, len(breaker_history)),
+    )
+
+
+def evaluate_health(**options: Unpack[_ProbeHealthOptions]) -> _HealthEvaluation:
+    """Refresh records once and evaluate visible and non-parked readiness conditions.
+
+    Args:
+        **options: Component records, observation clock, stale threshold,
+            inventory completeness, and supervisor-owned conditions.
+
+    Returns:
+        Refreshed records and both health verdicts; parked groups remain
+        visible but their conditions do not block readiness.
+
+    Raises:
+        ValueError: The stale threshold is not positive.
+    """
+    stale_after_secs = options['stale_after_secs']
+    if stale_after_secs <= 0:
+        raise ValueError('stale threshold must be positive')
+    sources, groups, workers, extra = _current_health_inputs(options)
+    conditions = _visible_health_conditions(
+        sources, groups, workers, stale_after_secs=stale_after_secs, extra_conditions=extra
+    )
+    ready_conditions = _readiness_health_conditions(
+        sources, groups, workers, stale_after_secs=stale_after_secs, extra_conditions=extra
+    )
+    liveness = _worker_liveness(workers, stale_after_secs)
+    return _HealthEvaluation(
+        sources,
+        groups,
+        workers,
+        conditions,
+        liveness,
+        liveness and _conditions_ready(ready_conditions),
     )
 
 
@@ -679,177 +792,20 @@ def looks_secret(value: str) -> bool:
     return any(term in normalized for term in HEALTH_SECRET_TEXT_TERMS)
 
 
-def primary_state_for_conditions(conditions: Collection[str]) -> _PrimaryState:
-    """Return the highest-precedence state from ordered health conditions.
-
-    Args:
-        conditions: Body-free health conditions.
-
-    Returns:
-        The highest-precedence existing primary state, or healthy.
-    """
-    for state in _STATUS_PRECEDENCE:
-        if state in conditions:
-            return state
-    return 'healthy'
-
-
-def probe_health_conditions(**options: Unpack[_ProbeHealthOptions]) -> tuple[str, ...]:
-    """Project ordered probe conditions from in-memory worker health.
-
-    Args:
-        sources: Current source projections.
-        groups: Current group projections.
-        workers: Current worker projections.
-        now: Supervisor monotonic observation time.
-        stale_after_secs: Maximum worker heartbeat age.
-        worker_breaker_open: Whether any supervisor breaker is open.
-        inventory_complete: Whether all expected first-health inventory exists.
-
-    Returns:
-        Ordered body-free visible health conditions.
-    """
-    current_sources, current_groups, current_workers, extra_conditions = _current_health_inputs(
-        options
-    )
-    return _visible_health_conditions(
-        current_sources,
-        current_groups,
-        current_workers,
-        stale_after_secs=options['stale_after_secs'],
-        extra_conditions=extra_conditions,
-    )
-
-
-def probe_health_ready(**options: Unpack[_ProbeHealthOptions]) -> bool:
-    """Return readiness from structured in-memory component ownership.
-
-    Args:
-        sources: Current source projections.
-        groups: Current group projections.
-        workers: Current worker projections.
-        now: Supervisor monotonic observation time.
-        stale_after_secs: Maximum worker heartbeat age.
-        worker_breaker_open: Whether any supervisor breaker is open.
-        inventory_complete: Whether all expected first-health inventory exists.
-
-    Returns:
-        Whether every non-parked component condition is readiness-safe.
-    """
-    current_sources, current_groups, current_workers, extra_conditions = _current_health_inputs(
-        options
-    )
-    conditions = _readiness_health_conditions(
-        current_sources,
-        current_groups,
-        current_workers,
-        stale_after_secs=options['stale_after_secs'],
-        extra_conditions=extra_conditions,
-    )
-    return _worker_liveness(current_workers, options['stale_after_secs']) and _conditions_ready(
-        conditions
-    )
-
-
-def aggregate_status(**options: Unpack[_AggregateStatusOptions]) -> StatusSnapshot:
-    """Aggregate authoritative component records into one status snapshot.
-
-    Args:
-        sources: Current source health records.
-        groups: Current complete group projections.
-        workers: Current process and monitor records.
-        now: Supervisor monotonic observation time.
-        stale_after_secs: Maximum worker heartbeat age before stale status.
-        audit_count: Cumulative durable audit count.
-        database_sizes: Current database byte sizes.
-        breaker_history: Recent worker breaker transitions.
-        breaker_transition_count: Cumulative transition count.
-        worker_breaker_open: Whether a supervisor-level worker breaker is open.
-            Defaults to `False`; when true, adds the worker-breaker-open
-            condition independently of the worker records.
-
-    Returns:
-        One immutable ephemeral status snapshot.
-
-    Raises:
-        ValueError: The stale threshold is not positive or a cumulative counter
-            is negative.
-    """
-    now = options['now']
-    stale_after_secs = options['stale_after_secs']
-    audit_count = options.get('audit_count', 0)
-    breaker_history = options.get('breaker_history', ())
-    breaker_transition_count = options.get('breaker_transition_count', 0)
-    if stale_after_secs <= 0:
-        raise ValueError('stale threshold must be positive')
-    if audit_count < 0 or breaker_transition_count < 0:
-        raise ValueError('cumulative health counters must be nonnegative')
-    current_sources, current_groups, current_workers, extra_conditions = _current_health_inputs(
-        {
-            'sources': options['sources'],
-            'groups': options['groups'],
-            'workers': options['workers'],
-            'now': now,
-            'stale_after_secs': stale_after_secs,
-            'worker_breaker_open': options.get('worker_breaker_open', False),
-        }
-    )
-    visible_conditions = _visible_health_conditions(
-        current_sources,
-        current_groups,
-        current_workers,
-        stale_after_secs=stale_after_secs,
-        extra_conditions=extra_conditions,
-    )
-    primary = primary_state_for_conditions(visible_conditions)
-    liveness = _worker_liveness(current_workers, stale_after_secs)
-    readiness = probe_health_ready(
-        sources=current_sources,
-        groups=current_groups,
-        workers=current_workers,
-        now=now,
-        stale_after_secs=stale_after_secs,
-        worker_breaker_open=options.get('worker_breaker_open', False),
-    )
-    history = tuple(breaker_history[-100:])
-    total_transitions = max(breaker_transition_count, len(breaker_history))
-    return StatusSnapshot(
-        generated_at=now,
-        primary_state=primary,
-        conditions=visible_conditions,
-        sources=current_sources,
-        groups=current_groups,
-        workers=current_workers,
-        liveness=liveness,
-        readiness=readiness,
-        audit_count=audit_count,
-        database_sizes=tuple(options.get('database_sizes', ())),
-        breaker_history=history,
-        breaker_transition_count=total_transitions,
-    )
+@overload
+def _redact_health_text(value: str) -> str: ...
 
 
 @overload
-def redact_health_text(value: str) -> str: ...
+def _redact_health_text(value: None) -> None: ...
 
 
 @overload
-def redact_health_text(value: None) -> None: ...
+def _redact_health_text(value: str | None) -> str | None: ...
 
 
-@overload
-def redact_health_text(value: str | None) -> str | None: ...
-
-
-def redact_health_text(value: str | None) -> str | None:
-    """Apply registry replacement, then the named-secret fallback.
-
-    Args:
-        value: Optional body-free health detail.
-
-    Returns:
-        Registry-redacted safe text, `None`, or the redaction marker.
-    """
+def _redact_health_text(value: str | None) -> str | None:
+    """Apply registry replacement, then the named-secret fallback."""
     if value is None:
         return None
     redacted = logging_support.redact_text(value)
@@ -881,7 +837,7 @@ def bound_health_text(value: str | None) -> str | None:
     """
     if value is not None and type(value) is not str:
         raise TypeError('health text must be text or None')
-    redacted = redact_health_text(value)
+    redacted = _redact_health_text(value)
     if redacted is None:
         return None
     return redacted.encode()[:HEALTH_TEXT_MAX_BYTES].decode(errors='ignore')

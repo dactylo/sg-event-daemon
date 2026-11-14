@@ -1,63 +1,83 @@
 name: Release
 
-# Run manually after reviewing CI for the selected branch or tag.
-# Configure the PyPI Trusted Publisher with release.yml and environment pypi.
+# Publishes sg-event-daemon to PyPI from CI's distributions, then publishes the
+# version's draft release page. release-start.yml runs it on the version tag
+# after CI passes on main; to publish a tagged commit by hand, run it from the
+# Actions tab on its tag. If a run fails, rerun that run instead of starting a
+# new one. If the fault is in this file, every rerun fails the same way, because
+# each run uses the workflow file of the tagged commit. Configure the PyPI
+# Trusted Publisher with release.yml and environment pypi.
+
 on:
   workflow_dispatch:
 
-permissions:
-  actions: read
-  contents: read
+permissions: {}
 
+# Uploads and latest-release choices never overlap. Waiting runs are kept and
+# start in order.
 concurrency:
   group: pypi
   cancel-in-progress: false
+  queue: max
 
 jobs:
   verify:
     name: Verify release
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      run-id: ${{ steps.ci.outputs.run-id }}
+      name: ${{ steps.verify.outputs.name }}
+      run-id: ${{ steps.verify.outputs.run-id }}
+      tag: ${{ steps.verify.outputs.tag }}
     steps:
       - name: Check out release commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - name: Verify version tag and successful CI
-        id: ci
+        id: verify
+        shell: python
         env:
+          CI_WORKFLOW_FILE: ci.yml
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PY'
           import json
           import os
+          import re
           import subprocess
           import tomllib
           from pathlib import Path
 
-          project = tomllib.loads(Path('pyproject.toml').read_text())['project']
-          tag = f"v{project['version']}"
+          project = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']
+          version = project['version']
+          tag = f'v{version}'
           commit = os.environ['GITHUB_SHA']
+          if re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version) is None:
+              raise SystemExit(f'Version {version} in pyproject.toml must have X.Y.Z form to publish.')
           tagged = subprocess.run(
-              ['git', 'rev-parse', '--verify', f'refs/tags/{tag}^{{commit}}'],
-              capture_output=True, text=True,
+              ['git', 'rev-parse', '--verify', '--quiet', f'refs/tags/{tag}^{{commit}}'],
+              capture_output=True,
+              text=True,
+              check=False,
           )
           if tagged.returncode or tagged.stdout.strip() != commit:
               raise SystemExit(f'{tag} must point to the selected commit before publishing.')
 
           repository = os.environ['GITHUB_REPOSITORY']
+          workflow = os.environ['CI_WORKFLOW_FILE']
           response = subprocess.check_output(
               [
                   'gh', 'api', '--method', 'GET',
-                  f'repos/{repository}/actions/workflows/ci.yml/runs',
+                  f'repos/{repository}/actions/workflows/{workflow}/runs',
                   '-f', f'head_sha={commit}',
                   '-f', f"branch={os.environ['DEFAULT_BRANCH']}",
                   '-f', 'event=push', '-f', 'per_page=1',
@@ -70,11 +90,10 @@ jobs:
           run = runs[0]
           if run['status'] != 'completed' or run['conclusion'] != 'success':
               raise SystemExit(f"CI must pass before publishing: {run['html_url']}")
-          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
-              output.write(f"run-id={run['id']}\n")
-          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
+              output.write(f"tag={tag}\nname={project['name']}\nrun-id={run['id']}\n")
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
               summary.write(f"Publishing {tag} from `{commit}`. [CI run]({run['html_url']}).\n")
-          PY
 
   publish:
     name: Publish to PyPI
@@ -96,3 +115,77 @@ jobs:
           github-token: ${{ github.token }}
       - name: Publish distributions
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+  page:
+    name: Publish release page
+    needs: [verify, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Publish the draft release page
+        id: page
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['TAG']
+          strict = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
+
+
+          def version(name):
+              match = strict.fullmatch(name)
+              return tuple(int(part) for part in match.groups()) if match else None
+
+
+          listing = subprocess.check_output(
+              ['gh', 'api', '--paginate', '--slurp', f'repos/{repository}/releases?per_page=100'],
+              text=True,
+          )
+          releases = [release for page in json.loads(listing) for release in page]
+          matching = [release for release in releases if release['tag_name'] == tag]
+          published = next((release for release in matching if not release['draft']), None)
+          draft = next((release for release in matching if release['draft']), None)
+          if published is not None:
+              message = f"The release page for {tag} is already published: {published['html_url']}"
+          elif draft is None:
+              message = (
+                  f'No release page for {tag}. If a draft is created for it later, '
+                  'rerun this workflow to publish it.'
+              )
+          else:
+              wanted = version(tag)
+              higher = wanted is not None and any(
+                  (other := version(release['tag_name'])) is not None and other > wanted
+                  for release in releases
+                  if not release['draft'] and not release['prerelease']
+              )
+              latest = 'false' if draft['prerelease'] or higher else 'true'
+              result = json.loads(
+                  subprocess.check_output(
+                      [
+                          'gh', 'api', '--method', 'PATCH',
+                          f"repos/{repository}/releases/{draft['id']}",
+                          '-F', 'draft=false', '-f', f'make_latest={latest}',
+                      ],
+                      text=True,
+                  )
+              )
+              message = f"Published the release page for {tag}: {result['html_url']}"
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+              summary.write(message + '\n')
+          print(message)

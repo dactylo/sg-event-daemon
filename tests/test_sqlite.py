@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import os
-import select
 import signal
 import sqlite3
 import subprocess
 import sys
-import time
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock
@@ -24,6 +22,7 @@ from sg_event_daemon._sqlite import (
     transaction,
 )
 from tests._subprocess_support import subprocess_env
+from tests.source._support import open_source
 
 _SCHEMA = Schema(
     version=1,
@@ -58,14 +57,6 @@ def _mock_connection_with_journal_mode(
 def _read_child_notice(process: subprocess.Popen[str], expected: str) -> None:
     stdout = process.stdout
     assert stdout is not None
-    deadline = time.monotonic() + 10.0
-    readable, _writable, _exceptional = select.select(
-        (stdout,),
-        (),
-        (),
-        max(0.0, deadline - time.monotonic()),
-    )
-    assert readable, f'child did not announce {expected} before deadline'
     assert os.read(stdout.fileno(), 4_096).decode().strip() == expected
 
 
@@ -76,7 +67,7 @@ def _reap_child(process: subprocess.Popen[str]) -> int:
                 process.kill()
         except ProcessLookupError:
             pass
-        return process.wait(timeout=5.0)
+        return process.wait()
     finally:
         if process.stdin is not None:
             process.stdin.close()
@@ -135,6 +126,24 @@ def _rows(path: Path) -> list[tuple[int, bytes]]:
         handle.close()
 
 
+def test_creation_callback_runs_inside_full_transaction_once(tmp_path: Path) -> None:
+    calls: list[bool] = []
+
+    def initialize(connection: sqlite3.Connection) -> None:
+        assert connection.in_transaction
+        assert connection.execute('PRAGMA synchronous').fetchone() == (2,)
+        connection.execute("INSERT INTO entries VALUES (1, X'01')")
+        calls.append(True)
+
+    path = tmp_path / 'callback.db'
+    for _ in range(2):
+        with open_database(
+            path, 'callback', _SCHEMA, synchronous='FULL', initialize=initialize
+        ) as handle:
+            assert handle.connection.execute('SELECT COUNT(*) FROM entries').fetchone() == (1,)
+    assert calls == [True]
+
+
 def test_database_constants_match_settled_policy() -> None:
     assert BUSY_TIMEOUT_SECS == 5.0
     assert _MIN_SQLITE_VERSION == (3, 51, 3)
@@ -172,7 +181,7 @@ def test_database_rejects_identity_mismatch(tmp_path: Path) -> None:
     path = tmp_path / 'state.db'
     open_database(path, 'first', _SCHEMA, synchronous='NORMAL').close()
 
-    with pytest.raises(DatabaseError, match=r'identity.*first.*second'):
+    with pytest.raises(DatabaseError, match=r'state.db.*identity.*first.*second'):
         open_database(path, 'second', _SCHEMA, synchronous='NORMAL')
 
 
@@ -430,6 +439,64 @@ def test_process_kill_points_preserve_commit_boundary(
     assert _rows(path) == expected_rows
     with closing(sqlite3.connect(path)) as connection, connection:
         assert connection.execute('PRAGMA integrity_check').fetchone() == ('ok',)
+
+
+@pytest.mark.parametrize('point', ['before-commit', 'after-commit'])
+def test_creation_commits_identity_schema_and_metadata_together(
+    tmp_path: Path,
+    point: str,
+) -> None:
+    path = tmp_path / 'creation.db'
+    code = """
+import sys
+from pathlib import Path
+from contextlib import contextmanager
+from sg_event_daemon._write_lock import SourceWriteLock
+from tests.source._support import open_source
+original = SourceWriteLock.transaction
+first = True
+@contextmanager
+def transaction(lock, connection, **options):
+    global first
+    creation = first
+    first = False
+    with original(lock, connection, **options) as active:
+        yield active
+        if creation and sys.argv[2] == 'before-commit':
+            print('READY', flush=True)
+            sys.stdin.read()
+    if creation and sys.argv[2] == 'after-commit':
+        print('READY', flush=True)
+        sys.stdin.read()
+SourceWriteLock.transaction = transaction
+open_source(Path(sys.argv[1]))
+"""
+    process = subprocess.Popen(
+        [sys.executable, '-c', code, str(path), point],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=subprocess_env(),
+    )
+    try:
+        _read_child_notice(process, 'READY')
+        assert path.exists()
+        process.kill()
+    finally:
+        returncode = _reap_child(process)
+    assert returncode == -signal.SIGKILL
+    with closing(sqlite3.connect(path)) as connection:
+        version = connection.execute('PRAGMA user_version').fetchone()[0]
+        if point == 'before-commit':
+            assert version == 0
+            assert connection.execute('SELECT name FROM sqlite_master').fetchall() == []
+        else:
+            assert version == 1
+            assert connection.execute('SELECT COUNT(*) FROM _daemon_metadata').fetchone() == (1,)
+            assert connection.execute('SELECT COUNT(*) FROM source_meta').fetchone() == (1,)
+    with open_source(path) as state:
+        assert not state.snapshot().initialized
+        assert state._handoff.connection.execute('PRAGMA synchronous').fetchone() == (2,)
 
 
 def test_read_transaction_does_not_block_a_writer(tmp_path: Path) -> None:

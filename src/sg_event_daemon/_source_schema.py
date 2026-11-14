@@ -290,8 +290,7 @@ SOURCE_SCHEMA = Schema(
         """,
     ),
 )
-UNRESOLVED_LATE_ID_COUNT_SQL = """SELECT COUNT(*) FROM (
-    SELECT DISTINCT sl.event_id
+_UNRESOLVED_LATE_IDS_SQL = """SELECT DISTINCT sl.event_id
     FROM source_late_ids AS sl
     JOIN discovery_ranges AS dr USING (obligation_id)
     JOIN range_groups AS rg USING (obligation_id)
@@ -304,23 +303,13 @@ UNRESOLVED_LATE_ID_COUNT_SQL = """SELECT COUNT(*) FROM (
                 AND li.obligation_id = rg.obligation_id
                 AND li.event_id = sl.event_id
                 AND li.terminal_state = 'done'
-        )
-)"""
-UNRESOLVED_LATE_ID_PREFIX_SQL = """SELECT DISTINCT sl.event_id
-    FROM source_late_ids AS sl
-    JOIN discovery_ranges AS dr USING (obligation_id)
-    JOIN range_groups AS rg USING (obligation_id)
-    JOIN groups AS gm USING (group_name, group_generation)
-    WHERE rg.group_name = ? AND rg.obligation_state = 'pending'
-        AND dr.range_state = 'closed'
-        AND NOT EXISTS (
-            SELECT 1 FROM late_ids AS li
-            WHERE li.group_name = rg.group_name
-                AND li.obligation_id = rg.obligation_id
-                AND li.event_id = sl.event_id
-                AND li.terminal_state = 'done'
-        )
-    ORDER BY sl.event_id LIMIT ?"""
+        )"""
+UNRESOLVED_LATE_ID_COUNT_SQL = 'SELECT COUNT(*) FROM (BASE_QUERY)'.replace(
+    'BASE_QUERY', _UNRESOLVED_LATE_IDS_SQL
+)
+UNRESOLVED_LATE_ID_PREFIX_SQL = 'BASE_QUERY ORDER BY sl.event_id LIMIT ?'.replace(
+    'BASE_QUERY', _UNRESOLVED_LATE_IDS_SQL
+)
 
 
 def source_identity(site: str, source: str) -> str:

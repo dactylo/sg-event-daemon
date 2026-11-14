@@ -16,7 +16,7 @@ from sg_event_daemon._sqlite import DatabaseError, open_database
 from sg_event_daemon._supervisor import Supervisor
 from sg_event_daemon._worker import _LaneComponent, _LaneConfiguration, build_worker_specs
 from tests._storage_support import write_context_for
-from tests.test_supervisor import _source_only_config
+from tests.test_supervisor import source_only_config
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -63,7 +63,7 @@ def _source(path: Path, *, create: bool = False) -> SourceState:
     return state
 
 
-def test_daemon_creates_exactly_the_part_1_schema(tmp_path: Path) -> None:
+def test_daemon_creates_exactly_the_source_schema(tmp_path: Path) -> None:
     path, _groups = _paths(tmp_path)
     with SourceState.open(
         path,
@@ -142,7 +142,7 @@ def test_only_the_source_component_creates_the_source_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_path, config = _source_only_config(tmp_path, monkeypatch)
+    config_path, config = source_only_config(tmp_path, monkeypatch)
     ensure_secure_state_dir(config.daemon.state_dir)
     path, _groups = _paths(config.daemon.state_dir)
     with pytest.raises(DatabaseError):
@@ -170,12 +170,12 @@ def test_only_the_source_component_creates_the_source_file(
         _write_context=lambda: write_context_for(path),
     )
     context = _LaneConfiguration(
-        _assignment=DeliveryGroupAssignment('admin', 'remote', 1, 'resume'),
-        _credential=site.credentials[source.credentials],
-        _group=group,
-        _holdback_secs=0.0,
-        _site=site,
-        _source_config=source,
+        assignment=DeliveryGroupAssignment('admin', 'remote', 1, 'resume'),
+        credential=site.credentials[source.credentials],
+        group=group,
+        holdback_secs=0.0,
+        site=site,
+        source_config=source,
     )
     observation = GroupBootstrapObservation(
         'admin', 'remote', 1, 'generation', 'incarnation', 0, 0.0

@@ -1,7 +1,5 @@
 """Packed worker specifications and injected foreground runtime."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import json
@@ -12,12 +10,11 @@ import signal
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from functools import partial
-from itertools import chain
 from math import ceil, isfinite, nextafter
 from pathlib import Path
 from typing import (
@@ -36,6 +33,7 @@ from typing import (
 )
 
 from ._checkpoint_host import CheckpointHost, CheckpointHostStoppedError, CheckpointView
+from ._closeout import CloseoutRetries
 from ._config import (
     ConfigError,
     group_state_options,
@@ -43,6 +41,17 @@ from ._config import (
     source_state_options,
     source_stream_fingerprint,
 )
+from ._control import (
+    GROUP_BUSY_CODE,
+    GROUP_DISPOSITION_ARGUMENTS,
+    OPERATOR_COMMANDS,
+    SOURCE_ADOPTION_ARGUMENTS,
+    SOURCE_ADOPTION_EXECUTION_ARGUMENTS,
+    SOURCE_BUSY_CODE,
+    SOURCE_DATABASE_BUSY_CODE,
+    SOURCE_OPERATOR_COMMANDS,
+)
+from ._event_frame import IPC_LENGTH_BYTES
 from ._fanout import (
     EventDelivery,
     EventFanout,
@@ -50,9 +59,9 @@ from ._fanout import (
     GroupChannel,
     GroupChannelInterface,
     RangeChanged,
-    StrictCapacityControl,
     StrictOrderingControl,
 )
+from ._gaps import clip_runs, log_closeout_gave_up, log_closeout_retrying, subtract_ids
 from ._group_recovery import (
     DispositionCommand,
     control_peer_label,
@@ -71,14 +80,17 @@ from ._group_types import (
 from ._health import (
     HEALTH_LATE_ID_LIMIT,
     HEALTH_TEXT_MAX_BYTES,
+    STALL_CONDITIONS,
+    ConditionFlags,
     EventSocketHealth,
     GroupHealth,
     WatchdogHealth,
     WorkerHealth,
     bound_health_text,
-    redact_health_text,
 )
 from ._ipc import (
+    OUTCOME_KEY,
+    OUTCOME_UNKNOWN,
     ActiveSourceGroupAssignment,
     CommandResult,
     DeliveryGroupAssignment,
@@ -98,7 +110,7 @@ from ._ipc import (
     StopCommand,
     WorkerAssignment,
     WorkerControl,
-    WorkerControlSendTimeoutError,
+    WorkerControlOutbox,
     encode_control_message,
 )
 from ._lane import Delivery, GroupLane, LaneHealth
@@ -112,11 +124,13 @@ from ._plugins import load_plugins
 from ._providers import load_provider
 from ._resources import Closeable, close_resources
 from ._source import (
+    HALTS_IN_PLACE,
     SOURCE_RUN_STATUSES,
     Attached,
     CatchupReader,
     HistoryTruncatedError,
     JoinAbort,
+    JoinCapacityError,
     JoinConfirm,
     JoinCoordinator,
     JoinFinalize,
@@ -125,11 +139,15 @@ from ._source import (
     JoinRequest,
     JoinRetry,
     JoinTarget,
+    LiveChannelDetachedError,
     SourceHaltedError,
     SourceHealth,
+    SourceOwnerError,
     SourcePoller,
     StrictDeliveryOutcome,
     history_truncation,
+    jitter_retry_delay,
+    saturating_retry_delay,
 )
 from ._source_schema import SOURCE_SCHEMA, source_identity
 from ._source_state import (
@@ -149,12 +167,15 @@ from ._state_paths import (
 )
 from ._strict import StrictBuffer
 from ._watchdog import (
+    GROUP_PHASES,
+    SOURCE_WATCHDOG_PHASES,
     ComponentWatchdog,
     GroupPhase,
     SourceWatchdogPhase,
     WatchdogKind,
     WatchdogSample,
     internal_stall_deadline_secs,
+    shutdown_slice_secs,
     watchdog_grace_secs,
 )
 from ._write_lock import (
@@ -170,6 +191,7 @@ from ._write_lock import (
 if TYPE_CHECKING:
     from types import TracebackType
 
+    from ._closeout import ObligationKey
     from ._config import (
         Config,
         CredentialConfig,
@@ -178,6 +200,7 @@ if TYPE_CHECKING:
         SourceConfig,
     )
     from ._events import Event
+    from ._gaps import IdRun
     from ._group_state import GroupOpenOptions
     from ._providers import Provider
 
@@ -192,12 +215,14 @@ _MAXIMUM_HEALTH_IDENTITY = 'x' * 64
 _MAXIMUM_HEALTH_INT = 2**63 - 1
 _MAXIMUM_HEALTH_TEXT = '\0' * HEALTH_TEXT_MAX_BYTES
 _MONITOR_THREAD_NAME = 'sg-event-daemon:monitor'
+OPEN_FILE_MARGIN = 32
 _OPERATOR_EXECUTOR_IDENTITY = 'operator-executor'
 
 _ComponentStopPhase: TypeAlias = Literal[
     'eager-catchup',
     'bootstrap',
     'local-call',
+    'reader-slot',
     'resume',
     'strict-catchup',
 ]
@@ -224,25 +249,32 @@ class _CatchupLimiter:
             raise ValueError('catch-up reader limit must be positive')
         self._semaphore = threading.BoundedSemaphore(maximum)
 
-    @contextmanager
-    def _slot(self) -> Generator[None]:
-        """Wait for one reader slot without dropping caller state."""
-        self._semaphore.acquire()
-        try:
-            yield
-        finally:
-            self._semaphore.release()
+    def acquire(self, *, timeout: float) -> bool:
+        """Wait up to the caller's bounded slot interval.
+
+        Args:
+            timeout: Maximum seconds to wait for a reader slot.
+
+        Returns:
+            `True` after acquiring a slot that the caller must release, or
+            `False` when the wait expires without acquiring one.
+        """
+        return self._semaphore.acquire(timeout=timeout)
+
+    def release(self) -> None:
+        """Return one acquired reader slot."""
+        self._semaphore.release()
 
 
 @dataclass(frozen=True)
 class _ComponentHealth:
     """Hold one atomic immutable component-health cache snapshot."""
 
-    _watchdogs: tuple[WatchdogHealth, ...]
-    _sources: tuple[SourceHealth, ...]
-    _groups: tuple[GroupHealth, ...]
-    _event_sockets: tuple[EventSocketHealth, ...]
-    _watchdog_failure: str | None
+    watchdogs: tuple[WatchdogHealth, ...]
+    sources: tuple[SourceHealth, ...]
+    groups: tuple[GroupHealth, ...]
+    event_sockets: tuple[EventSocketHealth, ...]
+    watchdog_failure: str | None
 
 
 class _ComponentWaiter:
@@ -256,14 +288,18 @@ class _ComponentWaiter:
         self._service: Callable[[], None] | None = None
         self._stop = stop
 
-    def _configure_service(self, service: Callable[[], None]) -> None:
+    def configure_service(self, service: Callable[[], None]) -> None:
         """Install the source-thread callback exactly once."""
         if self._service is not None:
             raise RuntimeError('component waiter service is already configured')
         self._service = service
 
-    def _pump(self) -> None:
-        """Run one configured source-thread service pass."""
+    def pump(self) -> None:
+        """Run one configured source-thread service pass.
+
+        Raises:
+            Exception: The configured source-thread service callback fails.
+        """
         service = self._service
         if service is None:
             raise RuntimeError('component waiter service is not configured')
@@ -287,7 +323,7 @@ class _ComponentWaiter:
         """
         deadline = time.monotonic() + seconds
         while not self._stop.is_set():
-            self._pump()
+            self.pump()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -300,7 +336,7 @@ class _CooperativeComponentStopError(RuntimeError):
 
     def __init__(self, phase: _ComponentStopPhase) -> None:
         """Record the exact interruptible operation that observed stop."""
-        self._phase = phase
+        self.phase = phase
         super().__init__(f'component stopped during {phase}')
 
 
@@ -336,17 +372,6 @@ class _DeliveryFloorChannel(GroupChannel):
             isinstance(message, EventDelivery) and message.encoded.event_id <= self._delivery_floor
         )
 
-    def _set_wake(self, wake: threading.Event) -> None:
-        """Connect this channel to its owning lane's wake signal."""
-        self._wake = wake
-
-    def _take_hint(self) -> bool:
-        """Consume the coalesced hint at the lane coordination boundary."""
-        with self._hint_lock:
-            due = self._hint_due
-            self._hint_due = False
-            return due
-
     def activate(self, *, provisional: bool) -> None:
         """Clear a prior attempt's advisory tick on activation."""
         super().activate(provisional=provisional)
@@ -361,6 +386,9 @@ class _DeliveryFloorChannel(GroupChannel):
 
         Returns:
             `True` when queued or safely discarded below the delivery floor.
+            `False` means the channel is detached or was detached because the
+            frame exceeded queue capacity. Below-floor discard succeeds even
+            when detached.
         """
         return True if self._below_floor(message) else super().offer(message)
 
@@ -388,16 +416,34 @@ class _DeliveryFloorChannel(GroupChannel):
 
         Returns:
             `True` when queued or safely discarded below the delivery floor.
+            `False` means the channel is detached or currently lacks capacity;
+            capacity does not detach it. Below-floor discard succeeds even when
+            detached.
+
+        Raises:
+            ValueError: A frame not discarded below the delivery floor is
+                offered to a non-strict channel.
         """
         return True if self._below_floor(message) else super().offer_paced(message)
+
+    def set_wake(self, wake: threading.Event) -> None:
+        """Connect this channel to its owning lane's wake signal."""
+        self._wake = wake
+
+    def take_hint(self) -> bool:
+        """Consume the coalesced hint at the lane coordination boundary."""
+        with self._hint_lock:
+            due = self._hint_due
+            self._hint_due = False
+            return due
 
 
 @dataclass(frozen=True)
 class _DispositionFence:
     """Hold one exact old-to-new group generation reservation."""
 
-    _orphan_generation: int
-    _reserved_generation: int
+    orphan_generation: int
+    reserved_generation: int
 
 
 class _EventWaiter:
@@ -428,7 +474,7 @@ class _ExceptionCapture:
 
     def __init__(self) -> None:
         """Create an empty ordinary-exception capture."""
-        self._error: Exception | None = None
+        self.error: Exception | None = None
 
     def __enter__(self) -> Self:
         """Return this active capture."""
@@ -443,7 +489,7 @@ class _ExceptionCapture:
         """Capture only ordinary exceptions, not process-control exceptions."""
         if not isinstance(exc_value, Exception):
             return False
-        self._error = exc_value
+        self.error = exc_value
         return True
 
 
@@ -455,63 +501,67 @@ class _GroupHaltedCatchupError(RuntimeError):
 class _LaneConfiguration:
     """Hold resolved immutable configuration for one concrete lane."""
 
-    _assignment: DeliveryGroupAssignment
-    _credential: CredentialConfig
-    _group: GroupConfig
-    _holdback_secs: float
-    _site: SiteConfig
-    _source_config: SourceConfig
+    assignment: DeliveryGroupAssignment
+    credential: CredentialConfig
+    group: GroupConfig
+    holdback_secs: float
+    site: SiteConfig
+    source_config: SourceConfig
 
 
 @dataclass
 class _LaneLifecycle:
     """Track mutable process-local state for one persistent lane."""
 
-    _channel: GroupChannelInterface
-    _joined: bool = False
-    _next_coordination_at: float = 0.0
-    _setup_attempted: bool = False
-    _setup_failure: object | None = None
-    _was_running: bool = False
+    channel: GroupChannelInterface
+    joined: bool = False
+    next_coordination_at: float = 0.0
+    setup_attempted: bool = False
+    setup_failure: object | None = None
+    was_running: bool = False
+    halt_logged: str | None = None
+    rejoin_reason: str | None = None
 
 
 class _RemoteBootstrapTransportError(RuntimeError):
     """Signal one retryable remote bootstrap transport failure."""
 
 
+class _InitialGroupQueryError(RuntimeError):
+    """Signal one retryable first query for a newly initialized group."""
+
+
 class _WorkerComponent(Protocol):
     """Define one injected source or lane resource owned by a worker."""
 
-    def _close(self) -> None:
-        """Close provider, database, plugin, and loop resources."""
+    def close(self) -> None:
+        """Retire the component's health registration after its owner thread stops."""
         ...
 
-    def _execute_operator_command(
+    def execute_operator_command(
         self,
         command: OperatorCommand,
+        *,
+        wait_phase: Callable[[], AbstractContextManager[None]] = nullcontext,
     ) -> Mapping[str, object]:
         """Execute one body-free command on the owning component thread."""
         ...
 
-    def _request_stop(self, *, shutdown_deadline_at: float | None = None) -> None:
+    def request_stop(self, *, shutdown_deadline_at: float | None = None) -> None:
         """Interrupt the component's current or future wait."""
         ...
 
-    def _run(self) -> None:
+    def run(self) -> None:
         """Run until a stop request or worker-fatal return."""
         ...
 
 
-class WorkerKind(StrEnum):
-    """Classify source-owning, named packed, and dedicated workers.
+class _WorkerKind(StrEnum):
+    """Classify source-owning, named packed, and dedicated workers."""
 
-    Attributes:
-        value: Stable worker-kind label used by assignment consumers.
-    """
-
-    _SITE = 'site'
-    _NAMED = 'named'
-    _DEDICATED = 'dedicated'
+    SITE = 'site'
+    NAMED = 'named'
+    DEDICATED = 'dedicated'
 
 
 @dataclass(frozen=True)
@@ -533,7 +583,7 @@ class WorkerSpec:
 
     worker_id: str
     site: str
-    kind: WorkerKind
+    kind: _WorkerKind
     name: str
     sources: tuple[str, ...]
     groups: tuple[str, ...]
@@ -543,8 +593,9 @@ class WorkerSpec:
 class _WatchdogRegistration:
     """Hold one current body-free component watchdog supplier."""
 
-    _token: str
-    _supplier: Callable[[], WatchdogSample]
+    token: str
+    supplier: Callable[[], WatchdogSample]
+    conditions: Callable[[], tuple[str, ...]]
 
 
 class _ComponentHealthCache:
@@ -571,32 +622,6 @@ class _ComponentHealthCache:
         self._sources: dict[str, SourceHealth] = {}
         self._watchdogs: dict[_WatchdogKey, _WatchdogRegistration] = {}
 
-    def _deregister_watchdog(
-        self,
-        *,
-        kind: WatchdogKind,
-        identity: str,
-        worker_instance: str,
-        token: str,
-    ) -> None:
-        """Remove exactly the current matching registration."""
-        key = (kind, identity, worker_instance, token)
-        with self._lock:
-            registration = self._watchdogs.get(key)
-            if registration is None:
-                return
-            del self._watchdogs[key]
-            self._operator_targets.pop(key, None)
-            self._samples.pop(key, None)
-            if kind == 'source':
-                self._sources.pop(identity, None)
-                for group, owner in tuple(self._pending_groups.items()):
-                    if owner == (identity, worker_instance):
-                        self._pending_groups.pop(group)
-                        self._groups.pop(group, None)
-            elif kind == 'lane':
-                self._groups.pop(identity, None)
-
     @staticmethod
     def _key(sample: WatchdogSample) -> _WatchdogKey:
         """Return one sample's complete registration key."""
@@ -611,9 +636,18 @@ class _ComponentHealthCache:
         self,
         health: GroupHealth,
         sample: WatchdogSample,
+        conditions: tuple[str, ...],
     ) -> GroupHealth:
         """Merge only current live lane fields over durable group detail."""
         phase = cast('GroupPhase', sample.phase)
+        merged_conditions = tuple(
+            dict.fromkeys(
+                (
+                    *conditions,
+                    *(name for name in health.conditions if name not in STALL_CONDITIONS),
+                )
+            )
+        )
         live_fields = (
             phase,
             sample.event_id,
@@ -622,6 +656,7 @@ class _ComponentHealthCache:
             sample.delivery_attempt,
             sample.heartbeat_at,
             sample.deadline_at,
+            merged_conditions,
         )
         current_fields = (
             health.phase,
@@ -631,6 +666,7 @@ class _ComponentHealthCache:
             health.delivery_attempt,
             health.heartbeat_at,
             health.deadline_at,
+            health.conditions,
         )
         if live_fields == current_fields:
             return health
@@ -643,17 +679,27 @@ class _ComponentHealthCache:
             delivery_attempt=sample.delivery_attempt,
             heartbeat_at=sample.heartbeat_at,
             deadline_at=sample.deadline_at,
+            conditions=merged_conditions,
         )
 
     def _merge_source(
         self,
         health: SourceHealth,
         sample: WatchdogSample,
+        conditions: tuple[str, ...],
     ) -> SourceHealth:
         """Merge only current live source fields over durable source detail."""
         phase = cast('SourceWatchdogPhase', sample.phase)
-        live_fields = (phase, sample.heartbeat_at, sample.deadline_at)
-        current_fields = (health.phase, health.heartbeat_at, health.deadline_at)
+        merged_conditions = tuple(
+            dict.fromkeys(
+                (
+                    *conditions,
+                    *(name for name in health.conditions if name not in STALL_CONDITIONS),
+                )
+            )
+        )
+        live_fields = (phase, sample.heartbeat_at, sample.deadline_at, merged_conditions)
+        current_fields = (health.phase, health.heartbeat_at, health.deadline_at, health.conditions)
         if live_fields == current_fields:
             return health
         return replace(
@@ -661,143 +707,13 @@ class _ComponentHealthCache:
             phase=phase,
             heartbeat_at=sample.heartbeat_at,
             deadline_at=sample.deadline_at,
+            conditions=merged_conditions,
         )
 
     @staticmethod
     def _owner_key(sample: WatchdogSample) -> _WatchdogOwnerKey:
         """Return one sample's token-independent component-owner key."""
         return (sample.kind, sample.identity, sample.worker_instance)
-
-    def _publish_event_socket(self, health: EventSocketHealth) -> None:
-        """Replace one owner-thread event-socket projection."""
-        with self._lock:
-            self._event_sockets[(health.role, health.source, health.group)] = health
-
-    def _publish_group(
-        self,
-        health: GroupHealth,
-        *,
-        sample: WatchdogSample,
-    ) -> None:
-        """Replace one lane-thread group projection."""
-        key = self._key(sample)
-        with self._lock:
-            registration = self._watchdogs.get(key)
-            if (
-                registration is None
-                or registration._token != sample.registration_token
-                or sample.kind != 'lane'
-                or sample.identity != health.group
-                or sample.worker_instance != health.worker_instance
-            ):
-                return
-            self._groups[health.group] = health
-            self._pending_groups.pop(health.group, None)
-            current = self._samples.get(key)
-            if current is None or sample.transition_sequence >= current.transition_sequence:
-                self._samples[key] = sample
-
-    def _publish_pending_group(self, health: GroupHealth, *, sample: WatchdogSample) -> None:
-        """Cache one source-owned parked group without creating a lane watchdog."""
-        with self._lock:
-            registration = self._watchdogs.get(self._key(sample))
-            if (
-                registration is None
-                or sample.kind != 'source'
-                or sample.identity != health.source
-                or sample.worker_instance != health.worker_instance
-            ):
-                return
-            self._groups[health.group] = health
-            self._pending_groups[health.group] = (health.source, health.worker_instance)
-
-    def _publish_source(
-        self,
-        health: SourceHealth,
-        *,
-        sample: WatchdogSample,
-    ) -> None:
-        """Replace one source-thread source projection."""
-        key = self._key(sample)
-        with self._lock:
-            registration = self._watchdogs.get(key)
-            if (
-                registration is None
-                or registration._token != sample.registration_token
-                or sample.kind != 'source'
-                or sample.identity != health.source
-                or sample.worker_instance != health.worker_instance
-            ):
-                return
-            self._sources[health.source] = health
-            current = self._samples.get(key)
-            if current is None or sample.transition_sequence >= current.transition_sequence:
-                self._samples[key] = sample
-
-    def _register_watchdog(
-        self,
-        *,
-        kind: WatchdogKind,
-        identity: str,
-        worker_instance: str,
-        token: str,
-        supplier: Callable[[], WatchdogSample],
-    ) -> None:
-        """Register one current body-free watchdog supplier."""
-        if not identity or not worker_instance or not token:
-            raise ValueError('watchdog registration identity must not be empty')
-        key = (kind, identity, worker_instance, token)
-        owner_key = (kind, identity, worker_instance)
-        with self._lock:
-            predecessors = tuple(
-                registered
-                for registered in self._watchdogs
-                if registered[:3] == owner_key and registered != key
-            )
-            for predecessor in predecessors:
-                del self._watchdogs[predecessor]
-                self._operator_targets.pop(predecessor, None)
-                self._samples.pop(predecessor, None)
-            if predecessors:
-                if kind == 'source':
-                    self._sources.pop(identity, None)
-                elif kind == 'lane':
-                    self._groups.pop(identity, None)
-            self._watchdogs[key] = _WatchdogRegistration(
-                _token=token,
-                _supplier=supplier,
-            )
-
-    def _remove_pending_group(self, group: str, *, sample: WatchdogSample) -> None:
-        """Remove only a parked record still owned by this source watchdog."""
-        with self._lock:
-            registration = self._watchdogs.get(self._key(sample))
-            if (
-                registration is None
-                or registration._token != sample.registration_token
-                or self._pending_groups.get(group) != (sample.identity, sample.worker_instance)
-            ):
-                return
-            self._pending_groups.pop(group)
-            self._groups.pop(group, None)
-
-    def _set_operator_target(
-        self,
-        *,
-        sample: WatchdogSample,
-        source: str | None,
-        group: str | None,
-    ) -> None:
-        """Attach or clear the exact owner routed to one operator cell."""
-        key = self._key(sample)
-        with self._lock:
-            registration = self._watchdogs.get(key)
-            if registration is None or registration._token != sample.registration_token:
-                return
-            if source is None:
-                self._operator_targets.pop(key, None)
-            else:
-                self._operator_targets[key] = (source, group)
 
     def _transport(
         self,
@@ -847,40 +763,221 @@ class _ComponentHealthCache:
             operator_command=sample.operator_command,
         )
 
-    def _snapshot(self) -> _ComponentHealth:
-        """Return one atomic immutable cache snapshot."""
+    def deregister_watchdog(
+        self,
+        *,
+        kind: WatchdogKind,
+        identity: str,
+        worker_instance: str,
+        token: str,
+    ) -> None:
+        """Remove exactly the current matching registration."""
+        key = (kind, identity, worker_instance, token)
+        with self._lock:
+            registration = self._watchdogs.get(key)
+            if registration is None:
+                return
+            del self._watchdogs[key]
+            self._operator_targets.pop(key, None)
+            self._samples.pop(key, None)
+            if kind == 'source':
+                self._sources.pop(identity, None)
+                for group, owner in tuple(self._pending_groups.items()):
+                    if owner == (identity, worker_instance):
+                        self._pending_groups.pop(group)
+                        self._groups.pop(group, None)
+            elif kind == 'lane':
+                self._groups.pop(identity, None)
+
+    def publish_event_socket(self, health: EventSocketHealth) -> None:
+        """Replace one owner-thread event-socket projection."""
+        with self._lock:
+            self._event_sockets[(health.role, health.source, health.group)] = health
+
+    def publish_group(
+        self,
+        health: GroupHealth,
+        *,
+        sample: WatchdogSample,
+    ) -> None:
+        """Replace one lane-thread group projection."""
+        key = self._key(sample)
+        with self._lock:
+            registration = self._watchdogs.get(key)
+            if (
+                registration is None
+                or registration.token != sample.registration_token
+                or sample.kind != 'lane'
+                or sample.identity != health.group
+                or sample.worker_instance != health.worker_instance
+            ):
+                return
+            self._groups[health.group] = health
+            self._pending_groups.pop(health.group, None)
+            current = self._samples.get(key)
+            if current is None or sample.transition_sequence >= current.transition_sequence:
+                self._samples[key] = sample
+
+    def publish_pending_group(self, health: GroupHealth, *, sample: WatchdogSample) -> None:
+        """Cache one source-owned parked group without creating a lane watchdog."""
+        with self._lock:
+            registration = self._watchdogs.get(self._key(sample))
+            if (
+                registration is None
+                or sample.kind != 'source'
+                or sample.identity != health.source
+                or sample.worker_instance != health.worker_instance
+            ):
+                return
+            self._groups[health.group] = health
+            self._pending_groups[health.group] = (health.source, health.worker_instance)
+
+    def publish_source(
+        self,
+        health: SourceHealth,
+        *,
+        sample: WatchdogSample,
+    ) -> None:
+        """Replace one source-thread source projection."""
+        key = self._key(sample)
+        with self._lock:
+            registration = self._watchdogs.get(key)
+            if (
+                registration is None
+                or registration.token != sample.registration_token
+                or sample.kind != 'source'
+                or sample.identity != health.source
+                or sample.worker_instance != health.worker_instance
+            ):
+                return
+            self._sources[health.source] = health
+            current = self._samples.get(key)
+            if current is None or sample.transition_sequence >= current.transition_sequence:
+                self._samples[key] = sample
+
+    def register_watchdog(
+        self,
+        *,
+        key: _WatchdogKey,
+        supplier: Callable[[], WatchdogSample],
+        conditions: Callable[[], tuple[str, ...]] = lambda: (),
+    ) -> None:
+        """Register one current body-free watchdog supplier.
+
+        A new token replaces prior registrations for the same kind, identity,
+        and worker instance and retires their cached health.
+
+        Args:
+            key: Component kind, identity, worker instance, and registration
+                token.
+            supplier: Callable returning that exact registration's current
+                watchdog sample.
+            conditions: Callable returning its current condition names.
+
+        Raises:
+            ValueError: The identity, worker instance, or registration token is
+                empty.
+        """
+        kind, identity, worker_instance, token = key
+        if not identity or not worker_instance or not token:
+            raise ValueError('watchdog registration identity must not be empty')
+        owner_key = (kind, identity, worker_instance)
+        with self._lock:
+            predecessors = tuple(
+                registered
+                for registered in self._watchdogs
+                if registered[:3] == owner_key and registered != key
+            )
+            for predecessor in predecessors:
+                del self._watchdogs[predecessor]
+                self._operator_targets.pop(predecessor, None)
+                self._samples.pop(predecessor, None)
+            if predecessors:
+                if kind == 'source':
+                    self._sources.pop(identity, None)
+                elif kind == 'lane':
+                    self._groups.pop(identity, None)
+            self._watchdogs[key] = _WatchdogRegistration(
+                token=token,
+                supplier=supplier,
+                conditions=conditions,
+            )
+
+    def remove_pending_group(self, group: str, *, sample: WatchdogSample) -> None:
+        """Remove only a parked record still owned by this source watchdog."""
+        with self._lock:
+            registration = self._watchdogs.get(self._key(sample))
+            if (
+                registration is None
+                or registration.token != sample.registration_token
+                or self._pending_groups.get(group) != (sample.identity, sample.worker_instance)
+            ):
+                return
+            self._pending_groups.pop(group)
+            self._groups.pop(group, None)
+
+    def set_operator_target(
+        self,
+        *,
+        sample: WatchdogSample,
+        source: str | None,
+        group: str | None,
+    ) -> None:
+        """Attach or clear the exact owner routed to one operator cell."""
+        key = self._key(sample)
+        with self._lock:
+            registration = self._watchdogs.get(key)
+            if registration is None or registration.token != sample.registration_token:
+                return
+            if source is None:
+                self._operator_targets.pop(key, None)
+            else:
+                self._operator_targets[key] = (source, group)
+
+    def snapshot(self) -> _ComponentHealth:
+        """Return an immutable health projection from current registrations.
+
+        Returns:
+            Current source, group, socket, and watchdog projections. Suppliers
+            are sampled outside the cache lock; a supplier failure or
+            mismatched identity returns empty projections with
+            `watchdog_failure='watchdog-sampling-failed'`.
+        """
         with self._lock:
             registrations = tuple(self._watchdogs.items())
             sources = dict(self._sources)
             groups = dict(self._groups)
             event_sockets = dict(self._event_sockets)
-        sampled: list[tuple[_WatchdogKey, WatchdogSample]] = []
+        sampled: list[tuple[_WatchdogKey, WatchdogSample, tuple[str, ...]]] = []
         for key, registration in registrations:
             try:
-                sample = registration._supplier()
+                sample = registration.supplier()
+                conditions = registration.conditions()
             except Exception:  # noqa: BLE001
                 return _ComponentHealth(
-                    _watchdogs=(),
-                    _sources=(),
-                    _groups=(),
-                    _event_sockets=(),
-                    _watchdog_failure='watchdog-sampling-failed',
+                    watchdogs=(),
+                    sources=(),
+                    groups=(),
+                    event_sockets=(),
+                    watchdog_failure='watchdog-sampling-failed',
                 )
-            if self._key(sample) != key or sample.registration_token != registration._token:
+            if self._key(sample) != key or sample.registration_token != registration.token:
                 return _ComponentHealth(
-                    _watchdogs=(),
-                    _sources=(),
-                    _groups=(),
-                    _event_sockets=(),
-                    _watchdog_failure='watchdog-sampling-failed',
+                    watchdogs=(),
+                    sources=(),
+                    groups=(),
+                    event_sockets=(),
+                    watchdog_failure='watchdog-sampling-failed',
                 )
-            sampled.append((key, sample))
+            sampled.append((key, sample, conditions))
         kind_order = {'source': 0, 'lane': 1, 'operator': 2}
         with self._lock:
-            for key, sample in sampled:
+            conditions_by_owner: dict[_WatchdogOwnerKey, tuple[str, ...]] = {}
+            for key, sample, conditions in sampled:
                 registration = self._watchdogs.get(key)
-                if registration is None or registration._token != sample.registration_token:
+                if registration is None or registration.token != sample.registration_token:
                     continue
+                conditions_by_owner[self._owner_key(sample)] = conditions
                 current = self._samples.get(key)
                 if current is None or sample.transition_sequence >= current.transition_sequence:
                     self._samples[key] = sample
@@ -907,12 +1004,13 @@ class _ComponentHealthCache:
                     key=lambda item: (kind_order[item[0]], item[1], item[2]),
                 )
                 if key in self._samples
-                and self._watchdogs[key]._token == self._samples[key].registration_token
+                and self._watchdogs[key].token == self._samples[key].registration_token
             )
             merged_sources = {
                 name: self._merge_source(
                     health,
                     samples_by_owner[('source', name, health.worker_instance)],
+                    conditions_by_owner.get(('source', name, health.worker_instance), ()),
                 )
                 if ('source', name, health.worker_instance) in samples_by_owner
                 else health
@@ -922,6 +1020,7 @@ class _ComponentHealthCache:
                 name: self._merge_group(
                     health,
                     samples_by_owner[('lane', name, health.worker_instance)],
+                    conditions_by_owner.get(('lane', name, health.worker_instance), ()),
                 )
                 if ('lane', name, health.worker_instance) in samples_by_owner
                 else health
@@ -930,13 +1029,13 @@ class _ComponentHealthCache:
             self._sources.update(merged_sources)
             self._groups.update(merged_groups)
             return _ComponentHealth(
-                _watchdogs=tuple(
+                watchdogs=tuple(
                     self._transport(sample, merged_sources, merged_groups) for sample in accepted
                 ),
-                _sources=tuple(merged_sources[name] for name in sorted(merged_sources)),
-                _groups=tuple(merged_groups[name] for name in sorted(merged_groups)),
-                _event_sockets=tuple(event_sockets[key] for key in sorted(event_sockets)),
-                _watchdog_failure=None,
+                sources=tuple(merged_sources[name] for name in sorted(merged_sources)),
+                groups=tuple(merged_groups[name] for name in sorted(merged_groups)),
+                event_sockets=tuple(event_sockets[key] for key in sorted(event_sockets)),
+                watchdog_failure=None,
             )
 
 
@@ -946,7 +1045,7 @@ class _SourceComponentOptions(TypedDict):
     assignment: WorkerAssignment
     checkpoint_host: CheckpointHost
     config: Config
-    control: WorkerControl
+    control: WorkerControlOutbox
     health_cache: _ComponentHealthCache
     source: str
     spec: WorkerSpec
@@ -967,14 +1066,18 @@ class _LaneCallBusyError(Exception):
     """Reject a lane command that remained queued past its admission budget."""
 
 
+class _SourceCallBusyError(Exception):
+    """Reject an operator call withdrawn before the source starts it."""
+
+
 @dataclass
 class _OwnerCall(Generic[_OwnerT]):
     """Carry one call from a requesting thread to its owner thread."""
 
-    _invoke: Callable[[_OwnerT], object]
-    _complete: threading.Event = field(default_factory=threading.Event)
-    _result: object | None = None
-    _error: Exception | None = None
+    invoke: Callable[[_OwnerT], object]
+    complete: threading.Event = field(default_factory=threading.Event)
+    result: object | None = None
+    error: Exception | None = None
 
 
 class _OwnerMailbox(Generic[_OwnerT]):
@@ -987,7 +1090,7 @@ class _OwnerMailbox(Generic[_OwnerT]):
         self._name = name
         self._wake = wake
 
-    def _submit(self, invoke: Callable[[_OwnerT], object]) -> _OwnerCall[_OwnerT]:
+    def submit(self, invoke: Callable[[_OwnerT], object]) -> _OwnerCall[_OwnerT]:
         """Queue one call and wake its owner."""
         call = _OwnerCall(invoke)
         with self._lock:
@@ -996,12 +1099,12 @@ class _OwnerMailbox(Generic[_OwnerT]):
             self._wake.set()
         return call
 
-    def _take(self) -> _OwnerCall[_OwnerT] | None:
+    def take(self) -> _OwnerCall[_OwnerT] | None:
         """Dequeue the next call, marking it started, or return None if empty."""
         with self._lock:
             return self._calls.popleft() if self._calls else None
 
-    def _withdraw(self, call: _OwnerCall[_OwnerT]) -> bool:
+    def withdraw(self, call: _OwnerCall[_OwnerT]) -> bool:
         """Remove a call that is still queued and report whether it was removed."""
         with self._lock:
             try:
@@ -1023,7 +1126,7 @@ class _SourceJoinSurface:
         self._index_revision: int | None = None
         self._durable_generations: dict[str, int] = {}
         self._inactive_groups: set[str] = set()
-        self._state = options['state']
+        self.state = options['state']
         self._strict_buffer = options['strict_buffer']
 
     def _restore_group_policy(self, policy: DurableGroupPolicy) -> None:
@@ -1039,82 +1142,9 @@ class _SourceJoinSurface:
                 is_operator_replay=policy.is_operator_replay,
             )
 
-    def _reconcile_groups(self) -> None:
-        """Refresh file-owned generations and replace every old live release authority."""
-        revision, policies = self._state.group_policies(after_revision=self._index_revision)
-        if revision == self._index_revision:
-            return
-        for policy in policies:
-            assignment = self._inventory.get(policy.group)
-            if assignment is None:
-                continue
-            previous = self._durable_generations.get(policy.group)
-            was_inactive = policy.group in self._inactive_groups
-            if not policy.active:
-                self._inactive_groups.add(policy.group)
-            else:
-                self._inactive_groups.discard(policy.group)
-            if previous == policy.generation and was_inactive == (not policy.active):
-                continue
-            if previous is not None:
-                self._coordinator.group_died(policy.group, previous)
-                self._poller.event_channel_lost(policy.group, reason='operator-disposition')
-            if policy.active:
-                self._inventory[policy.group] = ActiveSourceGroupAssignment(
-                    source=assignment.source,
-                    group=policy.group,
-                    group_generation=policy.generation,
-                    start_mode='resume',
-                )
-            self._restore_group_policy(policy)
-            self._durable_generations[policy.group] = policy.generation
-        self._state.invalidate_strict_ranges()
-        self._index_revision = revision
-
-    def _adopt_stream(
-        self,
-        *,
-        adoption_id: str,
-        command_fingerprint: str,
-        new_stream_fingerprint: str,
-        reason: str,
-        groups_parked: bool,
-    ) -> SourceSnapshot:
-        """Detach old lanes, adopt, initialize, and resume source polling."""
-        self._reconcile_groups()
-        with self._state.operator_writes():
-            for group in self._inventory:
-                self._poller.event_channel_lost(
-                    group,
-                    reason='stream-adopted',
-                )
-            self._index_revision = None
-            return self._poller.adopt_stream(
-                adoption_id=adoption_id,
-                command_fingerprint=command_fingerprint,
-                new_stream_fingerprint=new_stream_fingerprint,
-                reason=reason,
-                groups_parked=groups_parked,
-            )
-
-    def _reserve_stream_adoption(
-        self,
-        *,
-        command_fingerprint: str,
-        reason: str,
-    ) -> tuple[StreamAdoptionReservation, SourceSnapshot]:
-        """Reserve one qualifying adoption before supervisor quiescence."""
-        self._reconcile_groups()
-        with self._state.operator_writes():
-            reservation = self._state.reserve_stream_adoption(
-                command_fingerprint=command_fingerprint,
-                reason=reason,
-            )
-            return reservation, self._state.snapshot()
-
     def _restore_resumed_group(self, group: str) -> None:
         """Refresh same-generation durable delivery progress for a replacement peer."""
-        _revision, policies = self._state.group_policies()
+        _revision, policies = self.state.group_policies()
         for policy in policies:
             if policy.group == group:
                 self._coordinator.group_died(group, policy.generation)
@@ -1132,12 +1162,12 @@ class _SourceJoinSurface:
 
     def acknowledge_strict_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Retire one exact lane-committed strict control.
 
         Args:
-            control: Capacity or ordering control committed by the lane.
+            control: Ordering halt committed by the lane.
 
         Raises:
             JoinProtocolError: The control is stale or is not finalized.
@@ -1187,6 +1217,38 @@ class _SourceJoinSurface:
         """
         return self._coordinator.finalize(finalization)
 
+    def reconcile_groups(self) -> None:
+        """Refresh file-owned generations and replace every old live release authority."""
+        revision, policies = self.state.group_policies(after_revision=self._index_revision)
+        if revision == self._index_revision:
+            return
+        for policy in policies:
+            assignment = self._inventory.get(policy.group)
+            if assignment is None:
+                continue
+            previous = self._durable_generations.get(policy.group)
+            was_inactive = policy.group in self._inactive_groups
+            if not policy.active:
+                self._inactive_groups.add(policy.group)
+            else:
+                self._inactive_groups.discard(policy.group)
+            if previous == policy.generation and was_inactive == (not policy.active):
+                continue
+            if previous is not None:
+                self._coordinator.group_died(policy.group, previous)
+                self._poller.event_channel_lost(policy.group, reason='operator-disposition')
+            if policy.active:
+                self._inventory[policy.group] = ActiveSourceGroupAssignment(
+                    source=assignment.source,
+                    group=policy.group,
+                    group_generation=policy.generation,
+                    start_mode='resume',
+                )
+            self._restore_group_policy(policy)
+            self._durable_generations[policy.group] = policy.generation
+        self.state.invalidate_strict_ranges()
+        self._index_revision = revision
+
     def observe_group(
         self,
         request: GroupBootstrapRequest,
@@ -1202,7 +1264,14 @@ class _SourceJoinSurface:
         Raises:
             ValueError: The request conflicts with the source inventory.
         """
-        self._reconcile_groups()
+        if not self.state.stamped:
+            return GroupBootstrapPending(
+                source=request.source,
+                group=request.group,
+                group_generation=request.group_generation,
+                retry_after_secs=self._bootstrap_retry_secs,
+            )
+        self.reconcile_groups()
         expected = self._inventory.get(request.group)
         if isinstance(expected, ActiveSourceGroupAssignment):
             valid = (
@@ -1222,7 +1291,7 @@ class _SourceJoinSurface:
             raise ValueError('group bootstrap request conflicts with source inventory')
         if request.start_mode == 'resume':
             self._restore_resumed_group(request.group)
-        snapshot = self._state.snapshot()
+        snapshot = self.state.snapshot()
         incarnation = snapshot.stream_incarnation
         if not snapshot.initialized or incarnation is None:
             return GroupBootstrapPending(
@@ -1260,7 +1329,7 @@ class _SourceJoinSurface:
                 state.
             RuntimeError: The source stream is not initialized.
         """
-        self._reconcile_groups()
+        self.reconcile_groups()
         expected = self._inventory.get(request.attempt.group)
         if not isinstance(expected, ActiveSourceGroupAssignment):
             raise JoinProtocolError('pending disposition source inventory forbids fanout')
@@ -1278,7 +1347,7 @@ class _SourceJoinSurface:
         result = self._coordinator.request(request, channel)
         if isinstance(result, JoinRetry):
             return result
-        snapshot = self._state.snapshot()
+        snapshot = self.state.snapshot()
         incarnation = snapshot.stream_incarnation
         if incarnation is None:
             raise RuntimeError('source stream is not initialized')
@@ -1287,6 +1356,59 @@ class _SourceJoinSurface:
             incarnation,
             snapshot.successful_clock,
         )
+
+    def require_stamped(self) -> None:
+        """Fence operator writes from the previous process generation.
+
+        Raises:
+            SourceDatabaseBusyError: This source owner's generation stamp has
+                not committed.
+        """
+        if not self.state.stamped:
+            raise SourceDatabaseBusyError('source generation stamp is pending')
+
+    def adopt_stream(
+        self,
+        *,
+        adoption_id: str,
+        command_fingerprint: str,
+        new_stream_fingerprint: str,
+        reason: str,
+        groups_parked: bool,
+    ) -> SourceSnapshot:
+        """Detach old lanes, adopt, initialize, and resume source polling."""
+        self.require_stamped()
+        self.reconcile_groups()
+        with self.state.operator_writes():
+            for group in self._inventory:
+                self._poller.event_channel_lost(
+                    group,
+                    reason='stream-adopted',
+                )
+            self._index_revision = None
+            return self._poller.adopt_stream(
+                adoption_id=adoption_id,
+                command_fingerprint=command_fingerprint,
+                new_stream_fingerprint=new_stream_fingerprint,
+                reason=reason,
+                groups_parked=groups_parked,
+            )
+
+    def reserve_stream_adoption(
+        self,
+        *,
+        command_fingerprint: str,
+        reason: str,
+    ) -> tuple[StreamAdoptionReservation, SourceSnapshot]:
+        """Reserve one qualifying adoption before supervisor quiescence."""
+        self.require_stamped()
+        self.reconcile_groups()
+        with self.state.operator_writes():
+            reservation = self.state.reserve_stream_adoption(
+                command_fingerprint=command_fingerprint,
+                reason=reason,
+            )
+            return reservation, self.state.snapshot()
 
 
 class _SourceComponent:
@@ -1297,6 +1419,7 @@ class _SourceComponent:
         self._assignment = options['assignment']
         self._checkpoint_host = options['checkpoint_host']
         self._checkpoint_view = CheckpointView()
+        self._conditions = ConditionFlags()
         self._config = options['config']
         self._control = options['control']
         self._grant_lock = threading.Lock()
@@ -1331,59 +1454,22 @@ class _SourceComponent:
             startup_deadline_secs=self._coordination_deadline_secs,
         )
         sample = self._watchdog.sample()
-        self._health_cache._register_watchdog(
-            kind=sample.kind,
-            identity=sample.identity,
-            worker_instance=sample.worker_instance,
-            token=sample.registration_token,
+        self._health_cache.register_watchdog(
+            key=(sample.kind, sample.identity, sample.worker_instance, sample.registration_token),
             supplier=self._watchdog.sample,
+            conditions=self._checkpoint_conditions,
         )
 
-    def _check_local_call(
-        self,
-        deadline: float,
-        stop: threading.Event,
-    ) -> None:
-        """Raise for caller stop, component stop, or deadline in precedence order."""
-        if stop.is_set():
+    def _check_local_call(self, stop: threading.Event) -> None:
+        """End a source call only when its caller or source stops."""
+        if stop.is_set() or self._stop.is_set():
             error = ConnectionError('source component stopped during local call')
             raise _CooperativeComponentStopError('local-call') from error
-        if self._stop.is_set():
-            error = ConnectionError('source component stopped during local call')
-            raise _CooperativeComponentStopError('local-call') from error
-        if time.monotonic() >= deadline:
-            raise ConnectionError('source component call timed out')
 
-    def _call(
-        self,
-        invoke: Callable[[_SourceJoinSurface], _Result],
-        *,
-        deadline_secs: float,
-        stop: threading.Event,
-    ) -> _Result:
-        """Bound queue-inclusive waiting without cancelling dequeued source work."""
-        deadline = time.monotonic() + deadline_secs
-        self._check_local_call(deadline, stop)
-        call = self._mailbox._submit(invoke)
-        while True:
-            try:
-                self._check_local_call(deadline, stop)
-            except (ConnectionError, _CooperativeComponentStopError):
-                self._mailbox._withdraw(call)
-                raise
-            remaining = max(0.0, deadline - time.monotonic())
-            if not call._complete.wait(min(0.1, remaining)):
-                continue
-            try:
-                self._check_local_call(deadline, stop)
-            except (ConnectionError, _CooperativeComponentStopError):
-                self._mailbox._withdraw(call)
-                raise
-            return cast('_Result', _owner_call_result(call))
-
-    def _close(self) -> None:
-        """Retire health after the owner and monitor stop; `_run` closes resources."""
-        _retire_component_watchdog(self._watchdog, self._health_cache)
+    def _checkpoint_conditions(self) -> tuple[str, ...]:
+        """Merge the independently updated checkpoint view into monitor health."""
+        names = self._conditions.names()
+        return (*names, 'checkpoint-stalled') if self._checkpoint_view.stalled() else names
 
     def _database_paths(self) -> tuple[Path, Path]:
         """Create secure parents and return source database and socket paths."""
@@ -1399,6 +1485,7 @@ class _SourceComponent:
                 sources_dir,
                 socket_kind,
                 (self._spec.site, self._source),
+                timeout_secs=shutdown_slice_secs(self._config.daemon.shutdown_deadline_secs),
             ),
         )
 
@@ -1429,53 +1516,6 @@ class _SourceComponent:
         self._source_health_dirty = True
         self._pending_group_detail_dirty = True
 
-    def _publish_health(
-        self,
-        poller: SourcePoller,
-        server: EventServer,
-        *,
-        snapshot: SourceSnapshot | None = None,
-    ) -> None:
-        """Publish source and server-adapter health from this thread."""
-        statuses = server.connected_group_statuses()
-        buffers = server.socket_buffers
-        now = time.monotonic()
-        deadline = self._next_health_refresh_at
-        if (
-            snapshot is not None
-            or self._source_health is None
-            or self._source_health_dirty
-            or (deadline is not None and now >= deadline)
-        ):
-            self._source_health = (
-                poller.health if snapshot is None else poller.health_from_snapshot(snapshot)
-            )
-            self._source_health_dirty = False
-            self._next_health_refresh_at = _advance_health_refresh_deadline(
-                deadline,
-                now,
-                self._health_interval_secs,
-            )
-        source_health = self._source_health
-        self._health_cache._publish_source(
-            source_health,
-            sample=self._watchdog.sample(),
-        )
-        self._health_cache._publish_event_socket(
-            EventSocketHealth(
-                source=self._source,
-                group=None,
-                role='server',
-                connected=server.connected,
-                requested=buffers.requested,
-                send=buffers.send,
-                receive=buffers.receive,
-                queue_event_count=sum(status.queued_count for status in statuses),
-                queue_byte_count=sum(status.queued_bytes for status in statuses),
-                reason=None if server.connected else 'not-listening',
-            )
-        )
-
     def _publish_pending_groups(self, surface: _SourceJoinSurface) -> None:
         """Refresh configured lane-less records without a lane liveness cell."""
         assignments = tuple(
@@ -1490,14 +1530,14 @@ class _SourceComponent:
             }
             for group in removed:
                 self._pending_group_detail.pop(group, None)
-                self._health_cache._remove_pending_group(group, sample=self._watchdog.sample())
+                self._health_cache.remove_pending_group(group, sample=self._watchdog.sample())
             self._pending_group_assignments = assignments
             self._pending_group_detail_dirty = True
         now = time.monotonic()
         deadline = self._next_pending_health_refresh_at
         if self._pending_group_detail_dirty or deadline is None or now >= deadline:
             self._pending_group_detail = {
-                assignment.group: surface._state.pending_group_record(
+                assignment.group: surface.state.pending_group_record(
                     assignment.group, limit=HEALTH_LATE_ID_LIMIT
                 )
                 for assignment in assignments
@@ -1536,91 +1576,15 @@ class _SourceComponent:
                 queue_event_count=0,
                 queue_byte_count=0,
                 catchup_frontier=None,
-                pending_catchup_epoch_count=len(current.epochs),
-                oldest_catchup_epoch_age=None,
                 join_phase='parked',
-                outstanding_late_obligation_count=current.obligation_count,
-                outstanding_late_id_count=detail.late_id_count,
-                outstanding_late_ids=detail.late_ids,
-                outstanding_late_ids_truncated=detail.late_id_count > len(detail.late_ids),
-                parked=current.parked,
-                park_reason=detail.park_reason,
-                failure_kind=_group_failure_kind(current.failure_code),
-                failure_text=current.failure_text,
-                checkpoint_state=self._checkpoint_view.state(),
-                conditions=current.conditions,
-                audit_count=detail.audit_count,
+                **_snapshot_health_options(
+                    current,
+                    (detail.late_id_count, detail.late_ids),
+                    detail.park_reason,
+                    detail.audit_count,
+                ),
             )
-            self._health_cache._publish_pending_group(health, sample=self._watchdog.sample())
-
-    def _request_grant(self, grant: EventPeerGrant) -> None:
-        """Post one exact event grant for source-thread installation."""
-        if grant.source != self._source:
-            raise ValueError('event grant source conflicts with component')
-        with self._grant_lock:
-            self._grants.append(grant)
-
-    def _request_stop(self, *, shutdown_deadline_at: float | None = None) -> None:
-        """Interrupt polling and retain the runtime's absolute deadline."""
-        if shutdown_deadline_at is not None:
-            if not isfinite(shutdown_deadline_at) or shutdown_deadline_at < 0:
-                raise ValueError('source shutdown deadline must be finite and nonnegative')
-            self._shutdown_deadline_at = shutdown_deadline_at
-        self._stop.set()
-        poller = self._poller
-        if poller is not None:
-            poller.stop()
-
-    def _service_internal(
-        self,
-        server: EventServer,
-        surface: _SourceJoinSurface,
-        poller: SourcePoller,
-    ) -> None:
-        """Drive endpoint work and grants on this thread."""
-        surface._reconcile_groups()
-        server.poll(0.0)
-        server.dispatch_join_requests(surface)
-        mutation_snapshot: SourceSnapshot | None = None
-        while True:
-            call = self._mailbox._take()
-            if call is None:
-                break
-            capture = _ExceptionCapture()
-            with capture:
-                call._result = call._invoke(surface)
-            raise_owner_write_failure(capture._error)
-            call._error = capture._error
-            # Synchronization only reads metadata and outboxes. Preserve a prior
-            # mutation's snapshot or dirty flag while serving this read.
-            if call._error is None:
-                mutation_snapshot = self._health_snapshot_from_result(call._result)
-            call._complete.set()
-        while True:
-            with self._grant_lock:
-                grant = self._grants.popleft() if self._grants else None
-            if grant is None:
-                break
-            ready = server.install_grant(grant)
-            self._control.send(ready)
-        self._publish_pending_groups(surface)
-        if mutation_snapshot is None:
-            self._publish_health(poller, server)
-        else:
-            self._publish_health(poller, server, snapshot=mutation_snapshot)
-
-    def _service(
-        self,
-        server: EventServer,
-        surface: _SourceJoinSurface,
-        poller: SourcePoller,
-    ) -> None:
-        """Publish one bounded internal phase around source-owned service."""
-        with self._watchdog.watch(
-            'internal',
-            deadline_at=time.monotonic() + self._coordination_deadline_secs,
-        ):
-            self._service_internal(server, surface, poller)
+            self._health_cache.publish_pending_group(health, sample=self._watchdog.sample())
 
     def _shutdown_resources(
         self,
@@ -1651,15 +1615,83 @@ class _SourceComponent:
         daemon = self._config.daemon
         lock = SourceWriteLock(
             source_write_lock_path(self._config, self._spec.site, self._source),
+            database_path=source_database_path(self._config, self._spec.site, self._source),
             timeout_secs=write_lock_timeout_secs(
                 daemon.health_interval_secs,
                 daemon.supervisor_poll_interval_secs,
             ),
-            wait_phase_grace_secs=daemon.health_interval_secs,
+            wait_phase_grace_secs=watchdog_grace_secs(daemon.health_interval_secs),
         )
-        return WriteContext(lock, watch=self._write_watch, stop=self._stop)
+        return WriteContext(
+            lock,
+            watch=self._write_watch,
+            stop=self._stop,
+            policy='one-attempt',
+            conditions=self._conditions,
+            logger=logging.getLogger('sg_event_daemon.source'),
+            log_extra={'site': self._spec.site, 'source': self._source},
+            slice_secs=shutdown_slice_secs(daemon.shutdown_deadline_secs),
+        )
 
-    def _execute_group_disposition(self, command: OperatorCommand) -> Mapping[str, object]:
+    def call(
+        self,
+        invoke: Callable[[_SourceJoinSurface], _Result],
+        *,
+        stop: threading.Event,
+        wait_phase: Callable[[], AbstractContextManager[None]],
+        queue_deadline_secs: float | None = None,
+    ) -> _Result:
+        """Renew caller health while awaiting source work or cooperative stop.
+
+        Args:
+            invoke: Operation executed against the source-thread-owned surface.
+            stop: Caller stop signal, checked alongside the source stop signal.
+            wait_phase: Context factory publishing the caller's wait phase.
+            queue_deadline_secs: Optional admission timeout in seconds. Once
+                dequeued, the operation owns its result and this timeout no
+                longer limits its execution.
+
+        Returns:
+            The source operation's result.
+
+        Raises:
+            RuntimeError: The caller or source component stops while waiting.
+            Exception: The admission timeout withdraws a still-queued
+                operation, or the source operation or wait-phase context fails.
+                Source operation failures propagate unchanged.
+        """
+        self._check_local_call(stop)
+        deadline = None if queue_deadline_secs is None else time.monotonic() + queue_deadline_secs
+        call = self._mailbox.submit(invoke)
+        interval = self._health_interval_secs
+        slice_secs = shutdown_slice_secs(self._config.daemon.shutdown_deadline_secs)
+        try:
+            while True:
+                phase_end = time.monotonic() + interval
+                with wait_phase():
+                    while True:
+                        self._check_local_call(stop)
+                        now = time.monotonic()
+                        if deadline is not None and now >= deadline:
+                            if self._mailbox.withdraw(call):
+                                raise _SourceCallBusyError(SOURCE_BUSY_CODE)
+                            # A dequeued call owns its result, however long it takes.
+                            deadline = None
+                        if call.complete.is_set():
+                            return cast('_Result', _owner_call_result(call))
+                        if now >= phase_end:
+                            break
+                        wait = min(slice_secs, phase_end - now)
+                        if deadline is not None:
+                            wait = min(wait, max(0.0, deadline - now))
+                        call.complete.wait(wait)
+        except _CooperativeComponentStopError:
+            self._mailbox.withdraw(call)
+            raise
+
+    def _execute_group_disposition(
+        self, command: OperatorCommand, *, wait_phase: Callable[[], AbstractContextManager[None]]
+    ) -> Mapping[str, object]:
         """Run a lane-less group's transaction on the source owner thread."""
         if (
             command.arguments.get('site') != self._spec.site
@@ -1668,10 +1700,14 @@ class _SourceComponent:
             raise ValueError('group disposition source conflicts with owner')
         group = command.arguments.get('group')
         inner_command = command.arguments.get('command')
+        reserved_generation = command.arguments.get('reserved_generation')
+        expected_revision = command.arguments.get('expected_revision')
         if (
             not isinstance(group, str)
             or not isinstance(inner_command, str)
             or inner_command not in {'replay', 'reset-to-latest'}
+            or type(reserved_generation) is not int
+            or type(expected_revision) is not int
         ):
             raise ValueError('group disposition target is invalid')
         disposition_id = command.arguments.get('disposition_id')
@@ -1689,9 +1725,13 @@ class _SourceComponent:
         )
 
         def execute(surface: _SourceJoinSurface) -> GroupSnapshot:
-            source_state = surface._state
+            surface.require_stamped()
+            source_state = surface.state
             current = source_state.group_snapshot(group)
             authority = source_state.snapshot()
+            incarnation = authority.stream_incarnation
+            if incarnation is None:
+                raise RuntimeError('durable group source incarnation is unavailable')
             site = self._config.sites[self._spec.site]
             configured = site.groups.get(group)
             source_config = site.sources[self._source]
@@ -1708,119 +1748,124 @@ class _SourceComponent:
                 site_server_url=site.server,
                 stream_fingerprint=source_stream_fingerprint(site, source_config),
                 source_generation=authority.source_generation,
-                verified_incarnation=authority.stream_incarnation or '',
+                verified_incarnation=incarnation,
                 start_mode='resume',
             ) as state:
                 return state.dispose(
                     request.request(
                         group,
-                        cast('int', command.arguments['reserved_generation']),
-                        cast('int', command.arguments['expected_revision']),
+                        reserved_generation,
+                        expected_revision,
                     )
                 )
 
-        result = self._call(
-            execute, deadline_secs=self._coordination_deadline_secs, stop=self._stop
+        result = self.call(
+            execute,
+            queue_deadline_secs=self._coordination_deadline_secs,
+            stop=self._stop,
+            wait_phase=wait_phase,
         )
         return group_result_mapping(result)
 
-    def _execute_operator_command(
+    def _publish_health(
         self,
-        command: OperatorCommand,
-    ) -> Mapping[str, object]:
-        """Execute one source-owned lifecycle command."""
-        if command.command == 'group-disposition':
-            return self._execute_group_disposition(command)
-        if command.command not in {
-            'adopt-source-stream',
-            'preflight-source-adoption',
-        }:
-            raise ValueError(f'unsupported source operator command {command.command!r}')
-        expected_arguments = (
-            {'reason', 'site', 'source'}
-            if command.command == 'preflight-source-adoption'
-            else {
-                'adoption_id',
-                'command_fingerprint',
-                'groups_parked',
-                'reason',
-                'site',
-                'source',
-            }
-        )
-        if set(command.arguments) != expected_arguments:
-            raise ValueError('source adoption arguments are invalid')
+        poller: SourcePoller,
+        server: EventServer,
+        *,
+        snapshot: SourceSnapshot | None = None,
+    ) -> None:
+        """Publish source and server-adapter health from this thread."""
+        statuses = server.connected_group_statuses()
+        buffers = server.socket_buffers
+        now = time.monotonic()
+        deadline = self._next_health_refresh_at
         if (
-            command.arguments.get('site') != self._spec.site
-            or command.arguments.get('source') != self._source
+            snapshot is not None
+            or self._source_health is None
+            or self._source_health_dirty
+            or (deadline is not None and now >= deadline)
         ):
-            raise ValueError('source adoption target conflicts with owner')
-        if (
-            command.command == 'adopt-source-stream'
-            and command.arguments.get('groups_parked') is not True
-        ):
-            raise ValueError('source adoption requires parked-group evidence')
-        reason = _operator_reason(command.arguments)
-        site = self._config.sites[self._spec.site]
-        source_config = site.sources[self._source]
-        semantic_arguments = {
-            'site': self._spec.site,
-            'source': self._source,
-            'reason': reason,
-        }
-        command_fingerprint = stable_operator_id(
-            'adopt-source-stream-fingerprint',
-            semantic_arguments,
-        )
-        if command.command == 'preflight-source-adoption':
-            reservation, snapshot = self._call(
-                lambda surface: surface._reserve_stream_adoption(
-                    command_fingerprint=command_fingerprint,
-                    reason=reason,
-                ),
-                deadline_secs=self._coordination_deadline_secs,
-                stop=self._stop,
+            self._source_health = (
+                poller.health if snapshot is None else poller.health_from_snapshot(snapshot)
             )
-            return {
-                'adoption_id': reservation.adoption_id,
-                'command_fingerprint': reservation.command_fingerprint,
-                'recorded': reservation.recorded,
-                'site': snapshot.site,
-                'source': snapshot.source,
-                'status': snapshot.status,
-                'conditions': snapshot.conditions,
-                'stream_incarnation': snapshot.stream_incarnation,
-                'initialized': snapshot.initialized,
-                'adoption_count': snapshot.adoption_count,
-            }
-        adoption_id = command.arguments.get('adoption_id')
-        supplied_fingerprint = command.arguments.get('command_fingerprint')
-        if (
-            not isinstance(adoption_id, str)
-            or not adoption_id
-            or supplied_fingerprint != command_fingerprint
-        ):
-            raise ValueError('source adoption reservation identity is invalid')
-        snapshot = self._call(
-            lambda surface: surface._adopt_stream(
-                adoption_id=adoption_id,
-                command_fingerprint=command_fingerprint,
-                new_stream_fingerprint=source_stream_fingerprint(site, source_config),
-                reason=reason,
-                groups_parked=True,
-            ),
-            deadline_secs=self._coordination_deadline_secs,
-            stop=self._stop,
+            self._source_health_dirty = False
+            self._next_health_refresh_at = _advance_health_refresh_deadline(
+                deadline,
+                now,
+                self._health_interval_secs,
+            )
+        source_health = self._source_health
+        self._health_cache.publish_source(
+            source_health,
+            sample=self._watchdog.sample(),
         )
-        return {
-            'site': snapshot.site,
-            'source': snapshot.source,
-            'status': snapshot.status,
-            'conditions': snapshot.conditions,
-            'stream_incarnation': snapshot.stream_incarnation,
-            'initialized': snapshot.initialized,
-            'adoption_count': snapshot.adoption_count,
-        }
+        self._health_cache.publish_event_socket(
+            EventSocketHealth(
+                source=self._source,
+                group=None,
+                role='server',
+                connected=server.connected,
+                requested=buffers.requested,
+                send=buffers.send,
+                receive=buffers.receive,
+                queue_event_count=sum(status.queued_count for status in statuses),
+                queue_byte_count=sum(status.queued_bytes for status in statuses),
+                reason=None if server.connected else 'not-listening',
+            )
+        )
+
+    def _service_internal(
+        self,
+        server: EventServer,
+        surface: _SourceJoinSurface,
+        poller: SourcePoller,
+    ) -> None:
+        """Drive endpoint work and grants on this thread."""
+        surface.reconcile_groups()
+        server.poll(0.0)
+        server.dispatch_join_requests(surface)
+        mutation_snapshot: SourceSnapshot | None = None
+        while True:
+            call = self._mailbox.take()
+            if call is None:
+                break
+            capture = _ExceptionCapture()
+            with capture:
+                call.result = call.invoke(surface)
+            if isinstance(capture.error, SourceOwnerError):
+                raise capture.error.error from capture.error.error.__cause__
+            raise_owner_write_failure(capture.error)
+            call.error = capture.error
+            # Synchronization only reads metadata and outboxes. Preserve a prior
+            # mutation's snapshot or dirty flag while serving this read.
+            if call.error is None:
+                mutation_snapshot = self._health_snapshot_from_result(call.result)
+            call.complete.set()
+        while True:
+            with self._grant_lock:
+                grant = self._grants.popleft() if self._grants else None
+            if grant is None:
+                break
+            ready = server.install_grant(grant)
+            self._control.enqueue(ready)
+        self._publish_pending_groups(surface)
+        if mutation_snapshot is None:
+            self._publish_health(poller, server)
+        else:
+            self._publish_health(poller, server, snapshot=mutation_snapshot)
+
+    def _service(
+        self,
+        server: EventServer,
+        surface: _SourceJoinSurface,
+        poller: SourcePoller,
+    ) -> None:
+        """Publish one bounded internal phase around source-owned service."""
+        with self._watchdog.watch(
+            'internal',
+            deadline_at=time.monotonic() + self._coordination_deadline_secs,
+        ):
+            self._service_internal(server, surface, poller)
 
     def _run_body(self) -> None:
         """Open and drive all source-owned resources on this thread."""
@@ -1881,6 +1926,7 @@ class _SourceComponent:
                 database_path,
                 source_identity(site.name, self._source),
                 SOURCE_SCHEMA,
+                log_extra={'site': site.name, 'source': self._source},
             )
             server = EventServer(
                 path=socket_path,
@@ -1888,6 +1934,9 @@ class _SourceComponent:
                 max_frame_bytes=self._config.daemon.max_ipc_frame_bytes,
                 queue_max_entries=source_config.queue_max_events,
                 queue_max_bytes=source_config.queue_max_bytes,
+                socket_probe_timeout_secs=shutdown_slice_secs(
+                    self._config.daemon.shutdown_deadline_secs
+                ),
             )
             waiter = _ComponentWaiter(self._stop)
             poller = SourcePoller(
@@ -1900,13 +1949,14 @@ class _SourceComponent:
                 max_ipc_frame_bytes=self._config.daemon.max_ipc_frame_bytes,
                 source_generation=source_generation,
                 waiter=waiter,
+                service=waiter.pump,
+                query_service=partial(server.poll, 0.0),
                 random_value=random.random,
                 watchdog=self._watchdog,
                 internal_deadline_secs=self._coordination_deadline_secs,
                 wait_tolerance_secs=watchdog_grace_secs(self._health_interval_secs),
                 health_dirty=self._mark_source_health_dirty,
                 worker_instance=self._assignment.spawn_instance,
-                checkpoint_state=self._checkpoint_view.state,
                 strict_buffer=strict_buffer,
                 strict_retention_health=(
                     (lambda: ()) if strict_buffer is None else strict_buffer.retention_health
@@ -1919,17 +1969,14 @@ class _SourceComponent:
                 strict_retention=strict_buffer,
             )
             surface = _SourceJoinSurface(
-                bootstrap_retry_secs=min(
-                    source_config.poll_retry_base_secs,
-                    _BOOTSTRAP_RETRY_POLL_SECS,
-                ),
+                bootstrap_retry_secs=source_config.poll_retry_base_secs,
                 coordinator=coordinator,
                 poller=poller,
                 state=state,
                 inventory=inventory,
                 strict_buffer=strict_buffer,
             )
-            waiter._configure_service(
+            waiter.configure_service(
                 lambda: self._service(
                     server,
                     surface,
@@ -1939,7 +1986,7 @@ class _SourceComponent:
             self._poller = poller
             server.start()
             self._publish_health(poller, server)
-            self._control.send(
+            self._control.enqueue(
                 SourceEndpointReady(
                     source=self._source,
                     source_generation=source_generation,
@@ -1948,15 +1995,15 @@ class _SourceComponent:
             )
             poller.__enter__()
             while not self._stop.is_set():
-                waiter._pump()
+                waiter.pump()
                 try:
-                    surface._reconcile_groups()
+                    surface.reconcile_groups()
                     poller.run(max_cycles=1)
                 except SourceHaltedError:
                     self._source_health_dirty = True
                     self._publish_health(poller, server)
                     source_health = self._source_health
-                    if source_health is None or source_health.status != 'stream-identity-changed':
+                    if source_health is None or source_health.status not in HALTS_IN_PLACE:
                         raise
                     waiter.wait(source_config.fetch_interval_secs)
         except BaseException as error:  # noqa: BLE001
@@ -1964,8 +2011,162 @@ class _SourceComponent:
         finally:
             self._shutdown_resources(poller, server, state, first_error)
 
-    def _run(self) -> None:
-        """Complete thread-owned resources while retaining health until close."""
+    def close(self) -> None:
+        """Retire health after the owner and monitor stop; `run` closes resources."""
+        _retire_component_watchdog(self._watchdog, self._health_cache)
+
+    def request_grant(self, grant: EventPeerGrant) -> None:
+        """Post one exact event grant for source-thread installation.
+
+        Raises:
+            ValueError: The grant names a different source from this component.
+        """
+        if grant.source != self._source:
+            raise ValueError('event grant source conflicts with component')
+        with self._grant_lock:
+            self._grants.append(grant)
+
+    def request_stop(self, *, shutdown_deadline_at: float | None = None) -> None:
+        """Interrupt polling and retain the runtime's absolute deadline.
+
+        Args:
+            shutdown_deadline_at: Finite nonnegative monotonic deadline, or
+                `None` to preserve the previously retained deadline.
+
+        Raises:
+            ValueError: The deadline is negative or non-finite.
+        """
+        if shutdown_deadline_at is not None:
+            if not isfinite(shutdown_deadline_at) or shutdown_deadline_at < 0:
+                raise ValueError('source shutdown deadline must be finite and nonnegative')
+            self._shutdown_deadline_at = shutdown_deadline_at
+        self._stop.set()
+        poller = self._poller
+        if poller is not None:
+            poller.stop()
+
+    def execute_operator_command(
+        self,
+        command: OperatorCommand,
+        *,
+        wait_phase: Callable[[], AbstractContextManager[None]] = nullcontext,
+    ) -> Mapping[str, object]:
+        """Execute one source-owned lifecycle command.
+
+        Args:
+            command: Group disposition, source-adoption preflight, or source
+                adoption with exact target and audit arguments.
+            wait_phase: Context factory publishing waits for source-thread
+                work.
+
+        Returns:
+            A body-free mapping of group disposition or source adoption state.
+            Adoption preflight also returns the reserved adoption identity,
+            command fingerprint, and whether completion was already recorded.
+
+        Raises:
+            ValueError: The command, target, arguments, reason, or adoption
+                reservation identity is invalid.
+            RuntimeError: The source component stops while the command waits.
+            Exception: Queue admission expires, or the source-owned state,
+                provider, or wait-phase operation fails. Owner failures
+                propagate unchanged.
+        """
+        if command.command == 'group-disposition':
+            return self._execute_group_disposition(command, wait_phase=wait_phase)
+        if command.command not in SOURCE_OPERATOR_COMMANDS:
+            raise ValueError(f'unsupported source operator command {command.command!r}')
+        expected_arguments = (
+            SOURCE_ADOPTION_ARGUMENTS
+            if command.command == 'preflight-source-adoption'
+            else SOURCE_ADOPTION_EXECUTION_ARGUMENTS
+        )
+        if frozenset(command.arguments) != expected_arguments:
+            raise ValueError('source adoption arguments are invalid')
+        if (
+            command.arguments.get('site') != self._spec.site
+            or command.arguments.get('source') != self._source
+        ):
+            raise ValueError('source adoption target conflicts with owner')
+        if (
+            command.command == 'adopt-source-stream'
+            and command.arguments.get('groups_parked') is not True
+        ):
+            raise ValueError('source adoption requires parked-group evidence')
+        reason = _operator_reason(command.arguments)
+        site = self._config.sites[self._spec.site]
+        source_config = site.sources[self._source]
+        semantic_arguments = {
+            'site': self._spec.site,
+            'source': self._source,
+            'reason': reason,
+        }
+        command_fingerprint = stable_operator_id(
+            'adopt-source-stream-fingerprint',
+            semantic_arguments,
+        )
+        if command.command == 'preflight-source-adoption':
+            reservation, snapshot = self.call(
+                lambda surface: surface.reserve_stream_adoption(
+                    command_fingerprint=command_fingerprint,
+                    reason=reason,
+                ),
+                queue_deadline_secs=self._coordination_deadline_secs,
+                stop=self._stop,
+                wait_phase=wait_phase,
+            )
+            return {
+                'adoption_id': reservation.adoption_id,
+                'command_fingerprint': reservation.command_fingerprint,
+                'recorded': reservation.recorded,
+                'site': snapshot.site,
+                'source': snapshot.source,
+                'status': snapshot.status,
+                'conditions': snapshot.conditions,
+                'stream_incarnation': snapshot.stream_incarnation,
+                'initialized': snapshot.initialized,
+                'adoption_count': snapshot.adoption_count,
+            }
+        adoption_id = command.arguments.get('adoption_id')
+        supplied_fingerprint = command.arguments.get('command_fingerprint')
+        if (
+            not isinstance(adoption_id, str)
+            or not adoption_id
+            or supplied_fingerprint != command_fingerprint
+        ):
+            raise ValueError('source adoption reservation identity is invalid')
+        snapshot = self.call(
+            lambda surface: surface.adopt_stream(
+                adoption_id=adoption_id,
+                command_fingerprint=command_fingerprint,
+                new_stream_fingerprint=source_stream_fingerprint(site, source_config),
+                reason=reason,
+                groups_parked=True,
+            ),
+            queue_deadline_secs=self._coordination_deadline_secs,
+            stop=self._stop,
+            wait_phase=wait_phase,
+        )
+        return {
+            'site': snapshot.site,
+            'source': snapshot.source,
+            'status': snapshot.status,
+            'conditions': snapshot.conditions,
+            'stream_incarnation': snapshot.stream_incarnation,
+            'initialized': snapshot.initialized,
+            'adoption_count': snapshot.adoption_count,
+        }
+
+    def run(self) -> None:
+        """Complete thread-owned resources while retaining health until close.
+
+        Run the owner's service loop on the calling thread until stop or
+        failure, then clean up its thread-owned resources. Health registration
+        remains until `close()`.
+
+        Raises:
+            Exception: Resource setup, owner-thread work, or cleanup fails.
+        """
         self._run_body()
 
 
@@ -1975,7 +2176,7 @@ class _LaneComponentOptions(TypedDict):
     assignment: WorkerAssignment
     checkpoint_host: CheckpointHost
     config: Config
-    control: WorkerControl
+    control: WorkerControlOutbox
     group: str
     health_cache: _ComponentHealthCache
     limiter: _CatchupLimiter
@@ -1990,13 +2191,13 @@ class _LocalJoinClient:
         self,
         source: _SourceComponent,
         *,
-        deadline_secs: float,
+        wait_phase: Callable[[], AbstractContextManager[None]],
         source_name: str,
         group: str,
         stop: threading.Event,
     ) -> None:
         """Store the source component that owns the join authority."""
-        self._deadline_secs = deadline_secs
+        self._wait_phase = wait_phase
         self._group = group
         self._last_join_target: JoinTarget | None = None
         self._source = source
@@ -2010,32 +2211,30 @@ class _LocalJoinClient:
             abort: Exact join attempt to abort.
 
         Raises:
-            ConnectionError: The source-thread call times out.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The lane or source component stops.
         """
-        self._source._call(
+        self._source.call(
             lambda surface: surface.abort(abort),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
 
     def acknowledge_strict_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Acknowledge one exact in-process strict control.
 
         Args:
-            control: Capacity or ordering control committed by the lane.
+            control: Ordering halt committed by the lane.
 
         Raises:
-            ConnectionError: The source-thread call times out.
             JoinProtocolError: The control is stale or is not finalized.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The lane or source component stops.
         """
-        self._source._call(
+        self._source.call(
             lambda surface: surface.acknowledge_strict_control(control),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
 
@@ -2052,13 +2251,12 @@ class _LocalJoinClient:
             Attached identity or retry instruction.
 
         Raises:
-            ConnectionError: The source-thread call times out.
             JoinProtocolError: The attempt identity or phase conflicts.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The lane or source component stops.
         """
-        return self._source._call(
+        return self._source.call(
             lambda surface: surface.confirm(confirmation),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
 
@@ -2069,15 +2267,14 @@ class _LocalJoinClient:
             reason: Body-free channel-loss condition.
 
         Raises:
-            ConnectionError: The source-thread call times out.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The lane or source component stops.
         """
-        self._source._call(
+        self._source.call(
             lambda surface: surface.event_channel_lost(
                 self._group,
                 reason=reason,
             ),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
 
@@ -2091,13 +2288,12 @@ class _LocalJoinClient:
             Finalized join identity.
 
         Raises:
-            ConnectionError: The source-thread call times out.
             JoinProtocolError: The attempt identity or phase conflicts.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The lane or source component stops.
         """
-        return self._source._call(
+        return self._source.call(
             lambda surface: surface.finalize(finalization),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
 
@@ -2106,7 +2302,8 @@ class _LocalJoinClient:
         """Return the last captured in-process source observation.
 
         Returns:
-            Current join target or `None` after a retry.
+            Current join target, or `None` before a target is captured or after
+            a retry.
         """
         return self._last_join_target
 
@@ -2123,13 +2320,12 @@ class _LocalJoinClient:
             Current source observation or pending retry instruction.
 
         Raises:
-            ConnectionError: The source-thread call times out.
             ValueError: The request conflicts with the source inventory.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The lane or source component stops.
         """
-        return self._source._call(
+        return self._source.call(
             lambda surface: surface.observe_group(request),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
 
@@ -2148,15 +2344,14 @@ class _LocalJoinClient:
             Captured join target or retry instruction.
 
         Raises:
-            ConnectionError: The source-thread call times out.
             JoinProtocolError: The request or attempt conflicts with source
                 state.
-            RuntimeError: The source stream is not initialized.
-            _CooperativeComponentStopError: The lane or source component stops.
+            RuntimeError: The source stream is not initialized, or the lane or
+                source component stops.
         """
-        result = self._source._call(
+        result = self._source.call(
             lambda surface: surface.request(request, channel),
-            deadline_secs=self._deadline_secs,
+            wait_phase=self._wait_phase,
             stop=self._stop,
         )
         self._last_join_target = result if isinstance(result, JoinTarget) else None
@@ -2171,9 +2366,21 @@ class _LaneRefreshOptions(TypedDict):
     """Define one lane-owned body-free coordination driver."""
 
     lane: GroupLane
-    limiter: _CatchupLimiter
+    slot: Callable[[], AbstractContextManager[None]]
     reader: CatchupReader
     state: GroupState
+    joined: Callable[[], bool]
+    fetch_interval_secs: float
+    late_event_window_secs: float
+    log_extra: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class _ScanView:
+    """Hold one pass's group snapshot and strict obligation fence."""
+
+    snapshot: GroupSnapshot
+    strict_fence: tuple[str, int, int] | None
 
 
 class _LaneRefresh:
@@ -2184,10 +2391,18 @@ class _LaneRefresh:
         self._last_revision: int | None = None
         self._pending: tuple[PendingRange, ...] = ()
         self._lane = options['lane']
-        self._limiter = options['limiter']
+        self._slot = options['slot']
         self._mutation_snapshot: GroupSnapshot | None = None
         self._reader = options['reader']
         self._state = options['state']
+        self._joined = options['joined']
+        self._fetch_interval_secs = options['fetch_interval_secs']
+        self._late_event_window_secs = options['late_event_window_secs']
+        self._log_extra = options['log_extra']
+        self._retries = CloseoutRetries(
+            fetch_interval_secs=self._fetch_interval_secs,
+            window_secs=self._late_event_window_secs,
+        )
 
     def _eligible_scan_fence(
         self,
@@ -2235,164 +2450,398 @@ class _LaneRefresh:
         self._halt_history_truncated(error)
         raise error
 
-    def _scan_events(self, low_id: int, high_id: int) -> Generator[Event]:
-        """Isolate lazy provider failures from lane and callback failures."""
-        scanned = _scan_provider_call(lambda: self._reader.scan_range(low_id, high_id))
-        with closing(scanned):
-            while (event := _scan_provider_call(lambda: next(scanned, None))) is not None:
-                yield event
-
-    @staticmethod
-    def _scan_required_event_id(
+    def _scan_ready(
+        self,
         revision: PendingRange,
-        delivery_floor: int,
-    ) -> int | None:
-        """Return the oldest above-floor position bound by one obligation."""
-        if revision.high_id <= delivery_floor:
-            return None
-        return max(revision.low_id, delivery_floor + 1)
-
-    def _skip_below_floor(self, event: Event) -> bool:
-        """Record a revision-fenced skip for one event at or below the floor."""
-        event_id = event['id']
-        if type(event_id) is not int:
-            raise ValueError('post-close scan event id is invalid')
-        snapshot = self._state.snapshot()
-        if event_id > snapshot.delivery_floor:
+        synchronization: SourceProgress,
+        scan_fence: tuple[str, int, int] | None,
+        view: _ScanView,
+    ) -> bool:
+        """Reject ineligible work before any retention or missing-ID provider call."""
+        snapshot = view.snapshot
+        if not revision.closed:
             return False
-        self._remember_mutation(
-            self._state.record_delivery_floor_skip(
-                event_id,
-                expected_revision=snapshot.revision,
-            )
+        if scan_fence is not None and (
+            view.strict_fence != scan_fence
+            or (revision.obligation_id, revision.low_id, revision.high_id) != scan_fence
+            or snapshot.source_generation != synchronization.source_generation
+            or snapshot.verified_incarnation != synchronization.stream_incarnation
+        ):
+            return False
+        if snapshot.ordering == 'eager':
+            return snapshot.cursor >= revision.high_id
+        if scan_fence is None:
+            if view.strict_fence != (
+                revision.obligation_id,
+                revision.low_id,
+                revision.high_id,
+            ):
+                return False
+            if max(snapshot.cursor, snapshot.delivery_floor) < revision.low_id - 1:
+                return False
+        return synchronization.source_successful_clock >= revision.eligibility_point
+
+    def _scan_view(self, snapshot: GroupSnapshot) -> _ScanView:
+        """Read the strict fence once for a durable group snapshot."""
+        return _ScanView(
+            snapshot,
+            self._state.strict_obligation_fence() if snapshot.ordering == 'strict' else None,
         )
+
+    def _take_retry_turn(
+        self,
+        revision: PendingRange,
+        synchronization: SourceProgress,
+        scan_fence: tuple[str, int, int] | None,
+        view: _ScanView,
+        selection: dict[int, ObligationKey | None],
+    ) -> bool:
+        """Reuse retry selection until a durable mutation changes eligibility."""
+        snapshot = view.snapshot
+        key = (snapshot.group_generation, revision.obligation_id)
+        if not self._retries.retrying(key):
+            return True
+        clock = synchronization.source_successful_clock
+        if snapshot.revision not in selection:
+            selection.clear()
+            keys = [(snapshot.group_generation, item.obligation_id) for item in self._pending]
+            # Check cadence and due times before issuing eligibility reads.
+            if self._retries.next_retry(keys, clock) is not None:
+                keys = [
+                    (snapshot.group_generation, item.obligation_id)
+                    for item in self._pending
+                    if self._scan_ready(item, synchronization, scan_fence, view)
+                    and (
+                        snapshot.ordering != 'eager'
+                        or not self._joined()
+                        or clock >= item.visibility_deadline
+                    )
+                ]
+            else:
+                keys = []
+            selection[snapshot.revision] = self._retries.next_retry(keys, clock)
+        if key != selection[snapshot.revision]:
+            return False
+        self._retries.take_turn(clock)
+        selection.clear()
+        selection[snapshot.revision] = None
         return True
 
-    def _post_checked_scan(
-        self,
-        first: Event | None,
-        remaining: Iterator[Event],
-        *,
-        frontier: int,
-        required_event_id: int | None,
-    ) -> Generator[Event]:
-        """Filter current-floor rows and recheck retention before exhaustion."""
-        events = remaining if first is None else chain((first,), remaining)
-        for event in events:
-            if self._skip_below_floor(event):
-                continue
-            yield event
-        self._require_retained(required_event_id, frontier)
-
-    def _scan_obligations(
-        self,
-        synchronization: SourceProgress,
-        scan_fence: tuple[str, int, int] | None = None,
-    ) -> None:
-        """Drive complete post-close scans from synchronized source evidence."""
-        for revision in self._pending:
-            if not revision.closed:
-                continue
-            if scan_fence is not None and not self._eligible_scan_fence(
-                revision,
-                synchronization,
-                scan_fence,
-            ):
-                continue
-            with self._limiter._slot():
-                delivery_floor = self._state.snapshot().delivery_floor
-                required_event_id = self._scan_required_event_id(
-                    revision,
-                    delivery_floor,
-                )
-                try:
-                    self._require_retained(required_event_id, synchronization.frontier)
-                    with closing(self._scan_events(revision.low_id, revision.high_id)) as scanned:
-                        first: Event | None = None
-                        for event in scanned:
-                            if not self._skip_below_floor(event):
-                                first = event
-                                break
-                        with closing(
-                            self._post_checked_scan(
-                                first,
-                                scanned,
-                                frontier=synchronization.frontier,
-                                required_event_id=required_event_id,
-                            )
-                        ) as checked:
-                            snapshot = self._remember_mutation(
-                                self._lane.scan_obligation(
-                                    revision,
-                                    checked,
-                                    source_successful_clock=synchronization.source_successful_clock,
-                                )
-                            )
-                except (HistoryTruncatedError, _ObligationScanUnavailableError):
-                    return
-            if snapshot.status == 'running':
-                self._pending = self._state.pending_ranges()
-            if snapshot.status != 'running' or scan_fence is not None:
-                return
-
-    def _service(
-        self,
-        *,
-        scan_obligations: bool = True,
-        scan_fence: tuple[str, int, int] | None = None,
-        force: bool = False,
-    ) -> GroupSnapshot | None:
-        """Refresh from one read transaction and retry every outstanding closed scan."""
-        self._mutation_snapshot = None
-        progress, pending = self._state.refresh_ranges(None if force else self._last_revision)
-        self._last_revision = progress.range_revision
-        if pending is not None:
-            self._pending = pending
-        if scan_obligations and self._state.snapshot().status == 'running':
-            self._scan_obligations(progress, scan_fence)
-        return self._mutation_snapshot
-
     def synchronize(self) -> SourceProgress:
-        """Read durable source facts and refresh outstanding work unconditionally."""
+        """Read durable source facts and refresh outstanding work unconditionally.
+
+        Raises:
+            DatabaseError: Reading or completing the SQLite read transaction
+                fails.
+            RuntimeError: Source metadata or its stream incarnation is missing.
+        """
         progress, pending = self._state.refresh_ranges()
         self._last_revision = progress.range_revision
         if pending is not None:
             self._pending = pending
         return progress
 
+    def _retry_after_pass(
+        self,
+        key: ObligationKey,
+        synchronization: SourceProgress,
+        *,
+        missed: bool = False,
+    ) -> bool:
+        """Start retry waits from fresh completion evidence with the same identity."""
+        progress = self.synchronize()
+        snapshot = self._state.snapshot()
+        if (
+            snapshot.group_generation != key[0]
+            or progress.source_generation != synchronization.source_generation
+            or progress.stream_incarnation != synchronization.stream_incarnation
+            or snapshot.source_generation != progress.source_generation
+            or snapshot.verified_incarnation != progress.stream_incarnation
+        ):
+            return False
+        if missed:
+            return self._retries.missed(key, progress.source_successful_clock)
+        self._retries.failed(key, progress.source_successful_clock)
+        return False
+
+    def _strict_prefix(
+        self,
+        revision: PendingRange,
+        events: Sequence[Event],
+        omitted: tuple[IdRun, ...],
+        synchronization: SourceProgress,
+        required_event_id: int | None,
+    ) -> None:
+        """Confirm a first omission only after its safe prefix finishes delivery."""
+        clock = synchronization.source_successful_clock
+        key = (self._state.snapshot().group_generation, revision.obligation_id)
+        snapshot, consumed = self._lane.deliver_obligation_rows(
+            revision,
+            (event for event in events if cast('int', event['id']) < omitted[0][0]),
+            source_successful_clock=clock,
+        )
+        self._remember_mutation(snapshot)
+        if not consumed:
+            self._retry_after_pass(key, synchronization)
+            return
+        self._require_retained(required_event_id, synchronization.frontier)
+        if self._retry_after_pass(key, synchronization, missed=True):
+            log_closeout_retrying(
+                self._log_extra,
+                revision.low_id,
+                revision.high_id,
+                omitted,
+                self._late_event_window_secs,
+            )
+
+    def _fetch_strict_obligation(
+        self,
+        revision: PendingRange,
+        missing: tuple[IdRun, ...],
+        synchronization: SourceProgress,
+    ) -> GroupSnapshot | None:
+        """Confirm each omitted page before any callback can cross its missing IDs."""
+        snapshot = self._state.snapshot()
+        given_up = list(clip_runs(missing, high=snapshot.cursor))
+        remaining = clip_runs(missing, low=snapshot.cursor + 1)
+        required_event_id = remaining[0][0] if remaining else None
+        clock = synchronization.source_successful_clock
+        key = (snapshot.group_generation, revision.obligation_id)
+        ended = self._retries.grace_ended(key, clock)
+        try:
+            self._require_retained(required_event_id, synchronization.frontier)
+            pages = _scan_provider_call(partial(self._reader.fetch_id_runs, remaining))
+            with closing(pages):
+                while (page := _scan_provider_call(partial(next, pages, None))) is not None:
+                    omitted = subtract_ids(
+                        clip_runs(remaining, high=page.covered_through),
+                        (cast('int', event['id']) for event in page.events),
+                    )
+                    remaining = clip_runs(remaining, low=page.covered_through + 1)
+                    if omitted and not ended:
+                        self._strict_prefix(
+                            revision, page.events, omitted, synchronization, required_event_id
+                        )
+                        return None
+                    if omitted:
+                        self._require_retained(required_event_id, synchronization.frontier)
+                        log_closeout_gave_up(
+                            self._log_extra, revision.low_id, revision.high_id, omitted
+                        )
+                        given_up.extend(omitted)
+                    snapshot, consumed = self._lane.deliver_obligation_rows(
+                        revision, page.events, source_successful_clock=clock
+                    )
+                    self._remember_mutation(snapshot)
+                    del page
+                    if not consumed:
+                        self._retry_after_pass(key, synchronization)
+                        return None
+            self._require_retained(required_event_id, synchronization.frontier)
+            return self._remember_mutation(
+                self._lane.complete_obligation(revision.obligation_id, excused=given_up)
+            )
+        except (HistoryTruncatedError, _ObligationScanUnavailableError):
+            self._retry_after_pass(key, synchronization)
+            return None
+
+    def _fetch_obligation(
+        self,
+        revision: PendingRange,
+        missing: tuple[IdRun, ...],
+        synchronization: SourceProgress,
+    ) -> GroupSnapshot | None:
+        """Complete one retained fetch, stopping before completion on interruption."""
+        if self._state.snapshot().ordering == 'strict':
+            return self._fetch_strict_obligation(revision, missing, synchronization)
+        required_event_id = missing[0][0] if missing else None
+        clock = synchronization.source_successful_clock
+        key = (self._state.snapshot().group_generation, revision.obligation_id)
+        try:
+            self._require_retained(required_event_id, synchronization.frontier)
+            pages = _scan_provider_call(partial(self._reader.fetch_id_runs, missing))
+            with closing(pages):
+                while (page := _scan_provider_call(partial(next, pages, None))) is not None:
+                    snapshot, consumed = self._lane.deliver_obligation_rows(
+                        revision,
+                        page.events,
+                        source_successful_clock=synchronization.source_successful_clock,
+                    )
+                    self._remember_mutation(snapshot)
+                    # The provider must never overlap ownership of two pages.
+                    del page
+                    if not consumed:
+                        if snapshot.status == 'running':
+                            self._retry_after_pass(key, synchronization)
+                        return None
+            self._require_retained(required_event_id, synchronization.frontier)
+            omitted = self._state.missing_late_runs(revision.obligation_id)
+            if omitted:
+                snapshot = self._state.snapshot()
+                if snapshot.ordering == 'eager' and self._retries.grace_ended(key, clock):
+                    queued = self._lane.queued_event_ids(revision.low_id, revision.high_id)
+                    if any(
+                        low <= event_id <= high for low, high in omitted for event_id in queued
+                    ):
+                        self._retry_after_pass(key, synchronization)
+                        return None
+                    log_closeout_gave_up(
+                        self._log_extra, revision.low_id, revision.high_id, omitted
+                    )
+                else:
+                    if self._retry_after_pass(key, synchronization, missed=True):
+                        log_closeout_retrying(
+                            self._log_extra,
+                            revision.low_id,
+                            revision.high_id,
+                            omitted,
+                            self._late_event_window_secs,
+                        )
+                    return snapshot
+            snapshot = self._remember_mutation(
+                self._lane.complete_obligation(revision.obligation_id, excused=omitted)
+            )
+        except (HistoryTruncatedError, _ObligationScanUnavailableError):
+            self._retry_after_pass(key, synchronization)
+            return None
+        return snapshot
+
+    def _scan_obligations(
+        self,
+        synchronization: SourceProgress,
+        scan_fence: tuple[str, int, int] | None = None,
+        *,
+        slot_held: bool = False,
+    ) -> None:
+        """Fetch only unfinished IDs once a closed obligation may be serviced."""
+        snapshot = self._state.snapshot()
+        view = self._scan_view(snapshot)
+        self._retries.keep(
+            {(snapshot.group_generation, item.obligation_id) for item in self._pending}
+        )
+        selection: dict[int, ObligationKey | None] = {}
+        for revision in self._pending:
+            if not self._scan_ready(revision, synchronization, scan_fence, view):
+                continue
+            missing = self._state.missing_late_runs(revision.obligation_id)
+            if snapshot.ordering == 'eager':
+                if not missing:
+                    snapshot = self._remember_mutation(
+                        self._lane.complete_obligation(revision.obligation_id)
+                    )
+                    view = self._scan_view(snapshot)
+                    if snapshot.status != 'running':
+                        return
+                    self._pending = tuple(
+                        item
+                        for item in self._pending
+                        if item.obligation_id != revision.obligation_id
+                    )
+                    continue
+                if (
+                    self._joined()
+                    and synchronization.source_successful_clock < revision.visibility_deadline
+                ):
+                    continue
+            if not self._take_retry_turn(revision, synchronization, scan_fence, view, selection):
+                continue
+            with nullcontext() if slot_held else self._slot():
+                if (
+                    snapshot.ordering == 'strict'
+                    and view.strict_fence is not None
+                    and not self._eligible_scan_fence(revision, synchronization, view.strict_fence)
+                ):
+                    return
+                snapshot = (
+                    self._fetch_obligation(revision, missing, synchronization)
+                    or self._state.snapshot()
+                )
+            if snapshot.status != 'running' or scan_fence is not None:
+                return
+            self._pending = self._state.pending_ranges()
+            view = self._scan_view(snapshot)
+
+    def service(
+        self,
+        *,
+        scan_obligations: bool = True,
+        scan_fence: tuple[str, int, int] | None = None,
+        force: bool = False,
+        slot_held: bool = False,
+    ) -> GroupSnapshot | None:
+        """Refresh durable ranges and service eligible closed obligations.
+
+        Args:
+            scan_obligations: Whether to attempt scans for a running group.
+                Source facts and pending ranges are refreshed even when false.
+            scan_fence: Optional exact obligation identity and inclusive bounds
+                limiting which strict scan may advance.
+            force: Read pending-range rows even when their revision is
+                unchanged.
+            slot_held: Whether the caller already owns a catch-up reader slot.
+
+        Returns:
+            The last group snapshot changed during this pass, or `None` when no
+            mutation was recorded. Outstanding scans still obey retry,
+            visibility, ordering, and reader-slot admission rules.
+
+        Raises:
+            DatabaseError: A state transaction fails or write acquisition is
+                stopped or expires under a bounded policy.
+            sqlite3.Error: Reading durable group state outside a transaction
+                fails.
+            InvalidTransitionError: Durable state rejects an obligation
+                transition.
+            RevisionConflictError: A required group revision changed.
+            ValueError: Retained manifest or delivery data is invalid.
+            SecurityError: A source write-lock path fails safety checks.
+            OSError: WAL inspection or lock acquisition or release fails.
+            RuntimeError: Required source metadata is missing or a lock helper
+                thread cannot start.
+        """
+        self._mutation_snapshot = None
+        progress, pending = self._state.refresh_ranges(None if force else self._last_revision)
+        self._last_revision = progress.range_revision
+        if pending is not None:
+            self._pending = pending
+        if scan_obligations and self._state.snapshot().status == 'running':
+            self._scan_obligations(progress, scan_fence, slot_held=slot_held)
+        return self._mutation_snapshot
+
 
 @dataclass(frozen=True)
 class _LaneResources:
     """Hold thread-owned resources composed for one concrete lane."""
 
-    _context: _LaneConfiguration
-    _client: EventClient | _LocalJoinClient
-    _reader: CatchupReader
-    _state: GroupState
-    _lane: GroupLane
-    _channel: GroupChannelInterface
-    _coordination: _LaneRefresh
+    context: _LaneConfiguration
+    client: EventClient | _LocalJoinClient
+    reader: CatchupReader
+    state: GroupState
+    lane: GroupLane
+    channel: GroupChannelInterface
+    coordination: _LaneRefresh
 
 
 @dataclass
 class _PartialLaneAttempt:
     """Track resources opened during one incomplete lane construction."""
 
-    _channel: GroupChannelInterface | None = None
-    _client: EventClient | _LocalJoinClient | None = None
-    _lane: GroupLane | None = None
-    _reader: CatchupReader | None = None
-    _state: GroupState | None = None
+    channel: GroupChannelInterface | None = None
+    client: EventClient | _LocalJoinClient | None = None
+    lane: GroupLane | None = None
+    reader: CatchupReader | None = None
+    state: GroupState | None = None
 
 
 @dataclass
 class _GroupHealthRefresh:
-    """Retain a lane's cached projection, invalidation, revision, and deadline."""
+    """Retain a lane's projection, late-ID display, revision, and deadline."""
 
-    _cached: GroupHealth | None = None
-    _dirty: bool = True
-    _revision: int | None = None
-    _deadline_at: float | None = None
+    cached: GroupHealth | None = None
+    dirty: bool = True
+    revision: int | None = None
+    deadline_at: float | None = None
+    late_projection: tuple[int, tuple[int, ...]] | None = None
 
 
 class _LaneComponent:
@@ -2402,7 +2851,7 @@ class _LaneComponent:
         """Store immutable lane bootstrap inputs without opening resources."""
         self._assignment = options['assignment']
         self._checkpoint_host = options['checkpoint_host']
-        self._checkpoint_view = CheckpointView()
+        self._conditions = ConditionFlags()
         self._config = options['config']
         self._control = options['control']
         self._group = options['group']
@@ -2413,6 +2862,7 @@ class _LaneComponent:
         self._lifecycle: _LaneLifecycle | None = None
         self._limiter = options['limiter']
         self._local_source = options['local_source']
+        self._next_catchup_closeout_at = 0.0
         self._pending_health_snapshot: GroupSnapshot | None = None
         self._reload = threading.Event()
         self._resolved_recovery: set[str] = set()
@@ -2421,12 +2871,25 @@ class _LaneComponent:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._mailbox = _OwnerMailbox[_LaneResources](self._group, self._wake)
-        self._internal_stall_deadline_secs, self._watchdog = _register_group_watchdog(
-            self._config,
-            self._spec,
-            self._assignment,
-            self._group,
-            self._health_cache,
+        site = self._config.sites[self._spec.site]
+        group = site.groups[self._group]
+        source = site.sources[group.source]
+        credential = site.credentials[source.credentials]
+        self._internal_stall_deadline_secs = internal_stall_deadline_secs(
+            self._health_interval_secs, credential
+        )
+        self._watchdog = ComponentWatchdog(
+            kind='lane',
+            identity=self._group,
+            worker_instance=self._assignment.spawn_instance,
+            registration_token=os.urandom(16).hex(),
+            startup_deadline_secs=self._internal_stall_deadline_secs,
+        )
+        sample = self._watchdog.sample()
+        self._health_cache.register_watchdog(
+            key=(sample.kind, sample.identity, sample.worker_instance, sample.registration_token),
+            supplier=self._watchdog.sample,
+            conditions=self._conditions.names,
         )
 
     @staticmethod
@@ -2449,12 +2912,12 @@ class _LaneComponent:
         """Build one fresh attempt-owned bounded live channel."""
         channel = _DeliveryFloorChannel(
             group=self._group,
-            ordering=context._group.ordering,
-            max_events=context._source_config.queue_max_events,
-            max_bytes=context._source_config.queue_max_bytes,
+            ordering=context.group.ordering,
+            max_events=context.source_config.queue_max_events,
+            max_bytes=context.source_config.queue_max_bytes,
             delivery_floor=state.snapshot().delivery_floor,
         )
-        channel._set_wake(self._wake)
+        channel.set_wake(self._wake)
         return channel
 
     def _call(
@@ -2466,30 +2929,29 @@ class _LaneComponent:
     ) -> _Result:
         """Execute one command on the lane-owner thread."""
         admission_deadline: float | None = time.monotonic() + _LANE_OPERATOR_ADMISSION_SECS
-        call = self._mailbox._submit(lambda resources: invoke(resources._state, resources._client))
+        call = self._mailbox.submit(lambda resources: invoke(resources.state, resources.client))
         while True:
-            if call._complete.is_set():
+            if call.complete.is_set():
                 return cast('_Result', _owner_call_result(call))
             if self._stop.is_set():
-                self._mailbox._withdraw(call)
+                self._mailbox.withdraw(call)
                 error = ConnectionError('lane component stopped during local call')
                 raise _CooperativeComponentStopError('local-call') from error
-            wait_secs = 0.1
+            wait_secs = min(0.1, shutdown_slice_secs(self._config.daemon.shutdown_deadline_secs))
             if admission_deadline is not None:
                 remaining = admission_deadline - time.monotonic()
                 if remaining <= 0:
-                    if self._mailbox._withdraw(call):
+                    if self._mailbox.withdraw(call):
                         raise _LaneCallBusyError('lane is busy; retry the command')
                     admission_deadline = None
                 else:
                     wait_secs = min(wait_secs, remaining)
-            call._complete.wait(wait_secs)
+            call.complete.wait(wait_secs)
 
     def _catchup_deliveries(self, events: Sequence[Event]) -> Generator[Delivery]:
-        """Yield a page prefix ending at the next coordination deadline."""
-        lifecycle = self._lifecycle
+        """Yield the retained page suffix until component stop is requested."""
         for event in events:
-            if lifecycle is not None and time.monotonic() >= lifecycle._next_coordination_at:
+            if self._stop.is_set():
                 return
             yield Delivery(event)
 
@@ -2499,10 +2961,6 @@ class _LaneComponent:
             self._shutdown_deadline_at,
             self._internal_stall_deadline_secs,
         )
-
-    def _close(self) -> None:
-        """Retire health after the owner and monitor stop; `_run` closes resources."""
-        _retire_component_watchdog(self._watchdog, self._health_cache)
 
     def _configuration(self) -> _LaneConfiguration:
         """Resolve the immutable configuration owned by this lane."""
@@ -2514,12 +2972,12 @@ class _LaneComponent:
             item for item in self._assignment.group_assignments if item.group == self._group
         )
         return _LaneConfiguration(
-            _assignment=group_assignment,
-            _credential=credential,
-            _group=group,
-            _holdback_secs=source_registration_holdback_secs(group, source_config),
-            _site=site,
-            _source_config=source_config,
+            assignment=group_assignment,
+            credential=credential,
+            group=group,
+            holdback_secs=source_registration_holdback_secs(group, source_config),
+            site=site,
+            source_config=source_config,
         )
 
     def _database_path(self) -> Path:
@@ -2625,15 +3083,17 @@ class _LaneComponent:
         """Retry failed setup or the exact failed callback or required event."""
         with state.operator_writes():
             lifecycle = self._lifecycle
-            if lifecycle is not None and lifecycle._setup_failure is not None:
+            if lifecycle is not None and lifecycle.setup_failure is not None:
                 if self._stop.is_set() or snapshot.status != 'running':
                     raise ValueError('setup retry requires a running group and lane')
                 lane = self._lane
                 if lane is None:
                     raise ValueError('setup retry requires an active lane')
-                lifecycle._setup_attempted = True
-                lifecycle._setup_failure = lane.setup()
-                self._health_refresh._dirty = True
+                lifecycle.setup_attempted = True
+                lifecycle.setup_failure = lane.setup()
+                self._health_refresh.dirty = True
+                if lifecycle.setup_failure is not None:
+                    raise ValueError(f'setup retry failed again: {lifecycle.setup_failure}')
                 return snapshot
             event_id = (
                 snapshot.required_event_id
@@ -2658,7 +3118,7 @@ class _LaneComponent:
     def _health_snapshot_from_result(self, result: object) -> None:
         """Retain a complete mutation snapshot or dirty the projection."""
         self._pending_health_snapshot = _group_health_snapshot(result)
-        self._health_refresh._dirty = self._pending_health_snapshot is None
+        self._health_refresh.dirty = self._pending_health_snapshot is None
 
     def _promote_group_assignment(self, group_generation: int) -> None:
         """Replace this lane's exact assignment after terminal disposition."""
@@ -2684,42 +3144,20 @@ class _LaneComponent:
             group_assignments=tuple(group_assignments),
         )
 
-    def _provider_reader(
-        self,
-        context: _LaneConfiguration,
-    ) -> tuple[Provider, CatchupReader]:
-        """Build the selected provider and detached catch-up reader."""
-        required = {'sync'}
-        if context._group.execution == 'async':
-            required.add('async')
-        provider = load_provider(
-            self._config.daemon.sg_api_provider,
-            required,
-        )
-        reader = CatchupReader(
-            provider=provider,
-            site_url=context._site.server,
-            credential=context._credential,
-            batch_size=context._source_config.batch_size,
-            fetch_interval_secs=context._source_config.fetch_interval_secs,
-            waiter=_EventWaiter(self._stop),
-        )
-        return provider, reader
-
     def _resolve_conditional_park(
         self,
         context: _LaneConfiguration,
         state: GroupState,
     ) -> _LaneConfiguration:
         """Resolve and acknowledge assigned recovery before source registration."""
-        directive = context._assignment.conditional_park
+        directive = context.assignment.conditional_park
         if directive is None:
             return context
         if directive.evidence_id in self._resolved_recovery:
             return replace(
                 context,
-                _assignment=replace(
-                    context._assignment,
+                assignment=replace(
+                    context.assignment,
                     conditional_park=None,
                 ),
             )
@@ -2730,13 +3168,13 @@ class _LaneComponent:
         )
         if result.evidence_id != directive.evidence_id:
             raise RuntimeError('group recovery result evidence identity conflicts')
-        self._control.send(
+        self._control.enqueue(
             GroupRecoveryReady(
                 spawn_instance=self._assignment.spawn_instance,
                 evidence_id=result.evidence_id,
-                site=context._site.name,
+                site=context.site.name,
                 group=self._group,
-                group_generation=context._assignment.group_generation,
+                group_generation=context.assignment.group_generation,
                 outcome=result.outcome,
                 resulting_revision=result.resulting_revision,
             )
@@ -2744,8 +3182,8 @@ class _LaneComponent:
         self._resolved_recovery.add(directive.evidence_id)
         return replace(
             context,
-            _assignment=replace(
-                context._assignment,
+            assignment=replace(
+                context.assignment,
                 conditional_park=None,
             ),
         )
@@ -2766,309 +3204,6 @@ class _LaneComponent:
             deadline_at = time.monotonic() + self._internal_stall_deadline_secs
         with self._watchdog.watch(phase, deadline_at=deadline_at):
             yield
-
-    def _build_client(
-        self,
-        context: _LaneConfiguration,
-    ) -> tuple[EventClient | _LocalJoinClient, str]:
-        """Build the assigned local or authenticated remote source client."""
-        with self._watch_phase('startup'):
-            group = context._group
-            if self._local_source is not None:
-                client: EventClient | _LocalJoinClient = _LocalJoinClient(
-                    self._local_source,
-                    deadline_secs=self._internal_stall_deadline_secs,
-                    source_name=group.source,
-                    group=self._group,
-                    stop=self._stop,
-                )
-                source_generation = dict(self._assignment.source_generations)[group.source]
-                return client, source_generation
-            endpoint = next(
-                (
-                    item
-                    for item in self._assignment.source_endpoints
-                    if item.source == group.source
-                ),
-                None,
-            )
-            grant = next(
-                (
-                    item
-                    for item in self._assignment.event_grants
-                    if item.source == group.source and item.group == self._group
-                ),
-                None,
-            )
-            if endpoint is None or grant is None:
-                raise ValueError('dependent lane endpoint grant is missing')
-            if endpoint.source_generation == '':
-                raise ValueError('dependent lane source generation is empty')
-            client = EventClient(
-                path=Path(endpoint.path),
-                source=group.source,
-                group=self._group,
-                spawn_instance=self._assignment.spawn_instance,
-                capability=grant.capability,
-                max_frame_bytes=self._config.daemon.max_ipc_frame_bytes,
-                queue_max_entries=context._source_config.queue_max_events,
-                queue_max_bytes=context._source_config.queue_max_bytes,
-                coordination_deadline_secs=self._internal_stall_deadline_secs,
-                stop=self._stop,
-            )
-            try:
-                client.connect()
-            except ConnectionError as error:
-                client.close()
-                raise _RemoteBootstrapTransportError(str(error)) from error
-            except BaseException:
-                client.close()
-                raise
-            return client, endpoint.source_generation
-
-    def _coordinate(
-        self,
-        resources: _LaneResources,
-        lifecycle: _LaneLifecycle,
-        *,
-        scan: bool,
-        force: bool,
-        observed: GroupSnapshot | None = None,
-    ) -> None:
-        """Run one due coordination tick across every persistent lane state."""
-        current = time.monotonic()
-        channel = lifecycle._channel
-        hinted = isinstance(channel, _DeliveryFloorChannel) and channel._take_hint()
-        if (
-            observed is None
-            and lifecycle._was_running
-            and current < lifecycle._next_coordination_at
-            and not hinted
-            and not force
-        ):
-            return
-        running = (
-            resources._state.snapshot() if observed is None else observed
-        ).status == 'running'
-        force = force or (running and not lifecycle._was_running)
-        lifecycle._was_running = running
-        if current < lifecycle._next_coordination_at and not hinted and not force:
-            return
-        interval = resources._context._source_config.fetch_interval_secs
-        lifecycle._next_coordination_at = current + interval
-        try:
-            with self._watch_phase('internal'):
-                snapshot = resources._coordination._service(
-                    scan_obligations=scan and running, force=force or hinted
-                )
-        except (ConnectionError, JoinProtocolError):
-            self._health_snapshot_from_result(None)
-            raise
-        finally:
-            lifecycle._next_coordination_at = time.monotonic() + interval
-        if isinstance(snapshot, GroupSnapshot):
-            lifecycle._was_running = snapshot.status == 'running'
-            self._health_snapshot_from_result(snapshot)
-
-    @staticmethod
-    def _expected_remote_failure(
-        client: EventClient | _LocalJoinClient,
-        channel: GroupChannelInterface,
-        error: ConnectionError | JoinProtocolError,
-    ) -> bool:
-        """Classify only transport-caused remote lifecycle failures."""
-        if not isinstance(client, EventClient):
-            return False
-        if isinstance(error, ConnectionError):
-            return True
-        return not client.connected or not channel.status.attached
-
-    @staticmethod
-    def _disposition_fence(command: OperatorCommand) -> _DispositionFence:
-        """Validate and return one exact reserved generation fence."""
-        orphan_generation = command.arguments.get('orphan_generation')
-        reserved_generation = command.arguments.get('reserved_generation')
-        if (
-            type(orphan_generation) is not int
-            or type(reserved_generation) is not int
-            or orphan_generation <= 0
-            or reserved_generation < orphan_generation
-        ):
-            raise ValueError('group disposition generation fence is invalid')
-        return _DispositionFence(
-            _orphan_generation=orphan_generation,
-            _reserved_generation=reserved_generation,
-        )
-
-    def _execute_disposition_operator(
-        self,
-        state: GroupState,
-        client: EventClient | _LocalJoinClient,
-        command: OperatorCommand,
-    ) -> Mapping[str, object]:
-        """Apply reserved generation replacement on the lane owner thread."""
-        del client
-        with state.operator_writes():
-            fence = self._disposition_fence(command)
-            disposition_id = stable_operator_id(
-                command.command, _stable_operator_arguments(command.arguments)
-            )
-            command_request = self._disposition_request(command, disposition_id)
-            snapshot = state.snapshot()
-            if fence._orphan_generation == fence._reserved_generation:
-                terminal = state.terminal_disposition_identity(fence._reserved_generation)
-                if terminal is not None and terminal[0] == disposition_id:
-                    request = command_request.request(
-                        self._group, fence._reserved_generation, snapshot.revision
-                    )
-                    return group_result_mapping(state.dispose(request))
-                state.validate_disposition(
-                    command_request.request(
-                        self._group,
-                        fence._reserved_generation + 1,
-                        snapshot.revision,
-                    )
-                )
-                return {'disposition_required': True}
-            result = state.dispose(
-                command_request.request(
-                    self._group,
-                    fence._reserved_generation,
-                    snapshot.revision,
-                )
-            )
-            self._promote_group_assignment(fence._reserved_generation)
-            self._reload.set()
-            return group_result_mapping(result)
-
-    def _execute_operator_command(
-        self,
-        command: OperatorCommand,
-    ) -> Mapping[str, object]:
-        """Execute one audited recovery command against the owned group."""
-        _validate_group_operator_target(
-            command,
-            site=self._spec.site,
-            group=self._group,
-        )
-
-        def _execute(
-            state: GroupState,
-            client: EventClient | _LocalJoinClient,
-        ) -> GroupSnapshot | Mapping[str, object]:
-            if command.command in {'replay', 'reset-group-to-latest'}:
-                return self._execute_disposition_operator(state, client, command)
-            snapshot = state.snapshot()
-            if command.command == 'retry':
-                return self._execute_retry(state, snapshot, command)
-            return self._execute_reasoned_operator(state, snapshot, command)
-
-        result = self._call(_execute)
-        if isinstance(result, Mapping):
-            return result
-        return group_result_mapping(result)
-
-    @staticmethod
-    def _lane_health(
-        resources: _LaneResources,
-        snapshot: GroupSnapshot,
-    ) -> LaneHealth:
-        """Combine process-local lane phase with durable in-flight identity."""
-        health = resources._lane.health()
-        event_id = snapshot.in_flight_event_id
-        manifest = snapshot.manifest
-        if health.event_id is not None or event_id is None or manifest is None:
-            return health
-        ordinal = snapshot.failure_ordinal
-        if ordinal is None:
-            ordinal = next(
-                (mark[0] for mark in snapshot.callback_marks if mark[3] == 'pending'),
-                None,
-            )
-        callback = next(
-            (item for item in manifest.callbacks if item.ordinal == ordinal),
-            None,
-        )
-        mark = next(
-            (item for item in snapshot.callback_marks if item[0] == ordinal),
-            None,
-        )
-        return replace(
-            health,
-            event_id=event_id,
-            plugin_id=None if callback is None else callback.plugin_id,
-            callback_id=None if callback is None else callback.callback_id,
-            delivery_attempt=None if mark is None else mark[4],
-        )
-
-    def _group_health(
-        self,
-        resources: _LaneResources,
-        lifecycle: _LaneLifecycle,
-        snapshot: GroupSnapshot,
-    ) -> GroupHealth:
-        """Build one complete immutable lane-thread health projection."""
-        channel = lifecycle._channel.status
-        join_target = resources._client.last_join_target
-        catchup_frontier = (
-            snapshot.latest_join_boundary if join_target is None else join_target.identity.boundary
-        )
-        oldest_catchup_epoch_age = (
-            None
-            if not snapshot.epochs
-            else max(
-                0.0,
-                snapshot.reader_clock_checkpoint
-                - min(epoch.captured_at for epoch in snapshot.epochs),
-            )
-        )
-        if snapshot.parked:
-            join_phase = 'parked'
-        elif lifecycle._joined and channel.attached:
-            join_phase = 'attached'
-        elif isinstance(resources._client, EventClient) and not resources._client.connected:
-            join_phase = 'detached'
-        elif join_target is not None:
-            join_phase = 'catching-up'
-        else:
-            join_phase = 'joining'
-        setup_failure = lifecycle._setup_failure
-        failure_kind = (
-            'setup' if setup_failure is not None else _group_failure_kind(snapshot.failure_code)
-        )
-        failure_text = (
-            str(setup_failure)
-            if setup_failure is not None
-            else snapshot.failure_text
-            if failure_kind == 'callback'
-            else None
-        )
-        conditions = snapshot.conditions
-        if setup_failure is not None:
-            conditions = (*conditions, 'callback-failed')
-        outstanding_late_id_count, outstanding_late_ids = (
-            resources._state.unresolved_late_id_projection(limit=HEALTH_LATE_ID_LIMIT)
-        )
-        return GroupHealth.from_lane(
-            self._lane_health(resources, snapshot),
-            queue_event_count=channel.queued_count,
-            queue_byte_count=channel.queued_bytes,
-            catchup_frontier=catchup_frontier,
-            pending_catchup_epoch_count=len(snapshot.epochs),
-            oldest_catchup_epoch_age=oldest_catchup_epoch_age,
-            join_phase=join_phase,
-            outstanding_late_obligation_count=snapshot.obligation_count,
-            outstanding_late_id_count=outstanding_late_id_count,
-            outstanding_late_ids=outstanding_late_ids,
-            outstanding_late_ids_truncated=(outstanding_late_id_count > len(outstanding_late_ids)),
-            parked=snapshot.parked,
-            park_reason=(resources._state.park_reason() if snapshot.parked else None),
-            failure_kind=failure_kind,
-            failure_text=failure_text,
-            checkpoint_state=self._checkpoint_view.state(),
-            conditions=conditions,
-            audit_count=resources._state.audit_count(),
-        )
 
     def _observe_source(
         self,
@@ -3107,6 +3242,626 @@ class _LaneComponent:
         error = InterruptedError('lane stopped during source bootstrap')
         raise _CooperativeComponentStopError('bootstrap') from error
 
+    def _provider_reader(
+        self,
+        context: _LaneConfiguration,
+    ) -> tuple[Provider, CatchupReader]:
+        """Build the selected provider and detached catch-up reader."""
+        required = {'sync'}
+        if context.group.execution == 'async':
+            required.add('async')
+        provider = load_provider(
+            self._config.daemon.sg_api_provider,
+            required,
+        )
+        reader = CatchupReader(
+            provider=provider,
+            site_url=context.site.server,
+            credential=context.credential,
+            batch_size=context.source_config.batch_size,
+            fetch_interval_secs=context.source_config.fetch_interval_secs,
+            waiter=_EventWaiter(self._stop),
+            log_extra={
+                'site': context.site.name,
+                'source': context.group.source,
+                'group': context.group.name,
+            },
+            provider_watch=lambda: self._watch_phase('internal'),
+        )
+        return provider, reader
+
+    @contextmanager
+    def _reader_slot(self) -> Generator[None]:
+        """Wait for a reader permit in bounded, stop-aware idle phases."""
+        interval = self._health_interval_secs
+        slice_secs = shutdown_slice_secs(self._config.daemon.shutdown_deadline_secs)
+        acquired = False
+        while not acquired:
+            phase_end = time.monotonic() + interval
+            with self._watch_phase('idle', deadline_at=phase_end + watchdog_grace_secs(interval)):
+                while not acquired:
+                    if self._stop.is_set():
+                        raise _CooperativeComponentStopError('reader-slot')
+                    remaining = phase_end - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    acquired = self._limiter.acquire(timeout=min(slice_secs, remaining))
+        try:
+            yield
+        finally:
+            self._limiter.release()
+
+    def _coordinate(
+        self,
+        resources: _LaneResources,
+        lifecycle: _LaneLifecycle,
+        *,
+        scan: bool,
+        force: bool,
+        observed: GroupSnapshot | None = None,
+    ) -> None:
+        """Run one due coordination tick across every persistent lane state."""
+        current = time.monotonic()
+        channel = lifecycle.channel
+        hinted = isinstance(channel, _DeliveryFloorChannel) and channel.take_hint()
+        if (
+            observed is None
+            and lifecycle.was_running
+            and current < lifecycle.next_coordination_at
+            and not hinted
+            and not force
+        ):
+            return
+        running = (
+            resources.state.snapshot() if observed is None else observed
+        ).status == 'running'
+        force = force or (running and not lifecycle.was_running)
+        lifecycle.was_running = running
+        if current < lifecycle.next_coordination_at and not hinted and not force:
+            return
+        interval = resources.context.source_config.fetch_interval_secs
+        lifecycle.next_coordination_at = current + interval
+        try:
+            with self._watch_phase('internal'):
+                snapshot = resources.coordination.service(
+                    scan_obligations=scan and running, force=force or hinted
+                )
+        except (ConnectionError, JoinProtocolError):
+            self._health_snapshot_from_result(None)
+            raise
+        finally:
+            lifecycle.next_coordination_at = time.monotonic() + interval
+        if isinstance(snapshot, GroupSnapshot):
+            lifecycle.was_running = snapshot.status == 'running'
+            self._health_snapshot_from_result(snapshot)
+
+    @staticmethod
+    def _expected_lane_failure(error: BaseException, *, remote: bool) -> bool:
+        """Classify the original cause without inspecting already settled owners."""
+        if isinstance(error, LiveChannelDetachedError):
+            return error.reason != 'channel-closed'
+        return isinstance(error, JoinCapacityError) or (
+            remote and isinstance(error, ConnectionError)
+        )
+
+    @staticmethod
+    def _disposition_fence(command: OperatorCommand) -> _DispositionFence:
+        """Validate and return one exact reserved generation fence."""
+        orphan_generation = command.arguments.get('orphan_generation')
+        reserved_generation = command.arguments.get('reserved_generation')
+        if (
+            type(orphan_generation) is not int
+            or type(reserved_generation) is not int
+            or orphan_generation <= 0
+            or reserved_generation < orphan_generation
+        ):
+            raise ValueError('group disposition generation fence is invalid')
+        return _DispositionFence(
+            orphan_generation=orphan_generation,
+            reserved_generation=reserved_generation,
+        )
+
+    def _execute_disposition_operator(
+        self,
+        state: GroupState,
+        client: EventClient | _LocalJoinClient,
+        command: OperatorCommand,
+    ) -> Mapping[str, object]:
+        """Apply reserved generation replacement on the lane owner thread."""
+        del client
+        with state.operator_writes():
+            fence = self._disposition_fence(command)
+            disposition_id = command.arguments.get('disposition_id')
+            if not isinstance(disposition_id, str) or not disposition_id:
+                raise ValueError('group disposition identity must be nonempty text')
+            command_request = self._disposition_request(command, disposition_id)
+            snapshot = state.snapshot()
+            if fence.orphan_generation == fence.reserved_generation:
+                terminal = state.terminal_disposition_identity(fence.reserved_generation)
+                if terminal is not None and terminal[0] == disposition_id:
+                    request = command_request.request(
+                        self._group, fence.reserved_generation, snapshot.revision
+                    )
+                    return group_result_mapping(state.dispose(request))
+                state.validate_disposition(
+                    command_request.request(
+                        self._group,
+                        fence.reserved_generation + 1,
+                        snapshot.revision,
+                    )
+                )
+                return {'disposition_required': True}
+            result = state.dispose(
+                command_request.request(
+                    self._group,
+                    fence.reserved_generation,
+                    snapshot.revision,
+                )
+            )
+            self._promote_group_assignment(fence.reserved_generation)
+            self._reload.set()
+            return group_result_mapping(result)
+
+    def _reconnect_remote(
+        self,
+        resources: _LaneResources,
+        channel: GroupChannelInterface,
+    ) -> tuple[GroupChannelInterface, bool]:
+        """Reconnect the same grant and allocate a fresh join channel."""
+        client = resources.client
+        if not isinstance(client, EventClient):
+            raise TypeError('local source client cannot reconnect remotely')
+        with self._watch_phase('internal'):
+            channel.close()
+        with self._watch_phase('startup'):
+            try:
+                client.reconnect()
+            except ConnectionError:
+                return channel, False
+        with self._watch_phase('internal'):
+            replacement = self._build_channel(resources.context, resources.state)
+        return replacement, True
+
+    def _retire_channel(
+        self,
+        resources: _LaneResources,
+        channel: GroupChannelInterface,
+        *,
+        reason: str,
+    ) -> GroupChannelInterface:
+        """Retire one live attempt and return a fresh detached channel."""
+        with self._watch_phase('internal'):
+            channel.close()
+            client = resources.client
+            if isinstance(client, EventClient):
+                client.close()
+            else:
+                client.event_channel_lost(reason=reason)
+            return self._build_channel(resources.context, resources.state)
+
+    def _recover_lane_failure(
+        self,
+        resources: _LaneResources,
+        lifecycle: _LaneLifecycle,
+        error: ConnectionError | JoinProtocolError,
+    ) -> bool:
+        """Retire an expected detach and rejoin through a fresh catch-up attempt."""
+        remote = isinstance(resources.client, EventClient)
+        if not self._expected_lane_failure(error, remote=remote):
+            return False
+        reason = (
+            error.reason
+            if isinstance(error, LiveChannelDetachedError)
+            else 'strict-buffer-capacity'
+            if isinstance(error, JoinCapacityError)
+            else 'transport-lost'
+        )
+        if remote:
+            lifecycle.channel, _connected = self._reconnect_remote(
+                resources,
+                lifecycle.channel,
+            )
+        else:
+            lifecycle.channel = self._retire_channel(
+                resources,
+                lifecycle.channel,
+                reason=reason,
+            )
+        lifecycle.joined = False
+        lifecycle.rejoin_reason = reason
+        return True
+
+    def _coordinate_detached(self, resources: _LaneResources, lifecycle: _LaneLifecycle) -> None:
+        """Service returned lifecycle calls and recover expected remote failures."""
+        try:
+            self._coordinate(resources, lifecycle, scan=False, force=False)
+        except (ConnectionError, JoinProtocolError) as error:
+            if not self._recover_lane_failure(resources, lifecycle, error):
+                raise
+
+    def _callback_gate_snapshot(
+        self,
+        resources: _LaneResources,
+        lifecycle: _LaneLifecycle,
+    ) -> GroupSnapshot | None:
+        """Open the callback gate and return this iteration's durable observation."""
+        if self._stop.is_set():
+            return None
+        snapshot = resources.state.snapshot()
+        if snapshot.status != 'running':
+            lifecycle.was_running = False
+            return None
+        if not lifecycle.setup_attempted:
+            lifecycle.setup_attempted = True
+            lifecycle.setup_failure = resources.lane.setup()
+            self._coordinate_detached(resources, lifecycle)
+        if lifecycle.setup_failure is None:
+            lifecycle.halt_logged = None
+            return snapshot
+        return None
+
+    def _service_calls(self, resources: _LaneResources) -> None:
+        """Execute every queued command on the group-owner thread."""
+        while True:
+            call = self._mailbox.take()
+            if call is None:
+                return
+            capture = _ExceptionCapture()
+            with capture, self._watch_phase('internal'):
+                call.result = call.invoke(resources)
+            raise_owner_write_failure(capture.error)
+            call.error = capture.error
+            if call.error is None:
+                self._health_snapshot_from_result(call.result)
+            call.complete.set()
+
+    def _service_closeout_in_catch_up(self, resources: _LaneResources) -> None:
+        """Finish eligible gaps between pages using catch-up's held reader permit."""
+        if resources.state.snapshot().status == 'running':
+            current = time.monotonic()
+            if current >= self._next_catchup_closeout_at:
+                interval = resources.context.source_config.fetch_interval_secs
+                self._next_catchup_closeout_at = current + interval
+                with self._watch_phase('internal'):
+                    snapshot = resources.coordination.service(
+                        scan_obligations=True, slot_held=True
+                    )
+                if snapshot is not None:
+                    self._health_snapshot_from_result(snapshot)
+        if resources.state.snapshot().status != 'running':
+            raise _GroupHaltedCatchupError('group halted during eager catch-up')
+
+    def _source_wait_phase(self) -> AbstractContextManager[None]:
+        """Renew the lane's bounded phase while another owner serves a call."""
+        interval = self._health_interval_secs
+        return self._watch_phase(
+            'idle', deadline_at=time.monotonic() + interval + watchdog_grace_secs(interval)
+        )
+
+    def _build_client(
+        self,
+        context: _LaneConfiguration,
+    ) -> tuple[EventClient | _LocalJoinClient, str]:
+        """Build the assigned local or authenticated remote source client."""
+        with self._watch_phase('startup'):
+            group = context.group
+            if self._local_source is not None:
+                client: EventClient | _LocalJoinClient = _LocalJoinClient(
+                    self._local_source,
+                    wait_phase=self._source_wait_phase,
+                    source_name=group.source,
+                    group=self._group,
+                    stop=self._stop,
+                )
+                source_generation = dict(self._assignment.source_generations)[group.source]
+                return client, source_generation
+            endpoint = next(
+                (
+                    item
+                    for item in self._assignment.source_endpoints
+                    if item.source == group.source
+                ),
+                None,
+            )
+            grant = next(
+                (
+                    item
+                    for item in self._assignment.event_grants
+                    if item.source == group.source and item.group == self._group
+                ),
+                None,
+            )
+            if endpoint is None or grant is None:
+                raise ValueError('dependent lane endpoint grant is missing')
+            if endpoint.source_generation == '':
+                raise ValueError('dependent lane source generation is empty')
+            client = EventClient(
+                path=Path(endpoint.path),
+                source=group.source,
+                group=self._group,
+                spawn_instance=self._assignment.spawn_instance,
+                capability=grant.capability,
+                max_frame_bytes=self._config.daemon.max_ipc_frame_bytes,
+                queue_max_entries=context.source_config.queue_max_events,
+                queue_max_bytes=context.source_config.queue_max_bytes,
+                coordination_deadline_secs=self._internal_stall_deadline_secs,
+                stop=self._stop,
+                wait_phase=self._source_wait_phase,
+                wait_slice_secs=min(
+                    self._health_interval_secs,
+                    shutdown_slice_secs(self._config.daemon.shutdown_deadline_secs),
+                ),
+            )
+            try:
+                client.connect()
+            except ConnectionError as error:
+                client.close()
+                raise _RemoteBootstrapTransportError(str(error)) from error
+            except BaseException:
+                client.close()
+                raise
+            return client, endpoint.source_generation
+
+    def _synchronize(self, resources: _LaneResources) -> SourceProgress:
+        """Bound the source progress read within one catch-up pass."""
+        with self._watch_phase('internal'):
+            return resources.coordination.synchronize()
+
+    def _write_watch(
+        self, phase: WritePhase, deadline_at: float, /
+    ) -> AbstractContextManager[None]:
+        """Publish source-file arbitration on this component's watchdog."""
+        return self._watch_phase(phase, deadline_at=deadline_at)
+
+    def _write_context(self) -> WriteContext:
+        """Open the source-file lock owned by the next state facade."""
+        daemon = self._config.daemon
+        lock = SourceWriteLock(
+            source_write_lock_path(
+                self._config, self._spec.site, self._configuration().group.source
+            ),
+            database_path=self._database_path(),
+            timeout_secs=write_lock_timeout_secs(
+                daemon.health_interval_secs,
+                daemon.supervisor_poll_interval_secs,
+            ),
+            wait_phase_grace_secs=watchdog_grace_secs(daemon.health_interval_secs),
+        )
+        group = self._configuration().group
+        return WriteContext(
+            lock,
+            watch=self._write_watch,
+            stop=self._stop,
+            policy='wait',
+            conditions=self._conditions,
+            logger=logging.getLogger('sg_event_daemon.group'),
+            log_extra={'site': self._spec.site, 'source': group.source, 'group': group.name},
+            slice_secs=shutdown_slice_secs(daemon.shutdown_deadline_secs),
+        )
+
+    def _open_group_state(
+        self,
+        context: _LaneConfiguration,
+        observation: GroupBootstrapObservation,
+        reader: CatchupReader,
+    ) -> GroupState:
+        """Open initialized or resumed group state from captured source facts."""
+        initial_delivery_floor = 0
+        if context.assignment.start_mode == 'initialize':
+            with self._reader_slot(), self._watch_phase('startup'), reader:
+                try:
+                    fresh_latest = reader.latest_visible_id()
+                except _CooperativeComponentStopError:
+                    raise
+                except Exception as error:
+                    raise _InitialGroupQueryError(str(error)) from error
+            initial_delivery_floor = max(
+                observation.captured_frontier,
+                0 if fresh_latest is None else fresh_latest,
+            )
+        database_path = self._database_path()
+        lock_path = group_lock_path(self._config, self._spec.site, self._group)
+        options: GroupOpenOptions = {
+            'writes': self._write_context(),
+            **group_state_options(self._config.daemon, context.source_config, context.group),
+            'site': context.site.name,
+            'site_server_url': context.site.server,
+            'source': context.group.source,
+            'group': self._group,
+            'group_generation': context.assignment.group_generation,
+            'ordering': context.group.ordering,
+            'stream_fingerprint': source_stream_fingerprint(context.site, context.source_config),
+            'source_generation': observation.source_generation,
+            'verified_incarnation': observation.stream_incarnation,
+            'start_mode': context.assignment.start_mode,
+        }
+        if context.assignment.start_mode == 'initialize':
+            options['initial_cursor'] = observation.captured_frontier
+            options['initial_delivery_floor'] = initial_delivery_floor
+            options['initial_last_delivered_id'] = initial_delivery_floor
+        return GroupState.open(
+            database_path,
+            lock_path,
+            **options,
+        )
+
+    def close(self) -> None:
+        """Retire health after the owner and monitor stop; `run` closes resources."""
+        _retire_component_watchdog(self._watchdog, self._health_cache)
+
+    def execute_operator_command(
+        self,
+        command: OperatorCommand,
+        *,
+        wait_phase: Callable[[], AbstractContextManager[None]] = nullcontext,
+    ) -> Mapping[str, object]:
+        """Execute one audited recovery command against the owned group.
+
+        Args:
+            command: Exact group-targeted recovery command and audit arguments.
+            wait_phase: Accepted for the shared component interface; unused by
+                this lane's command path.
+
+        Returns:
+            A body-free mapping of the resulting group recovery state or the
+            disposition command's recorded result.
+
+        Raises:
+            ValueError: The command target, arguments, or reason is invalid.
+            RuntimeError: The lane stops or is unavailable while the command
+                waits.
+            Exception: The lane-owned recovery, provider, or coordination
+                operation fails. Owner failures propagate unchanged.
+        """
+        del wait_phase
+        _validate_group_operator_target(
+            command,
+            site=self._spec.site,
+            group=self._group,
+        )
+
+        def _execute(
+            state: GroupState,
+            client: EventClient | _LocalJoinClient,
+        ) -> GroupSnapshot | Mapping[str, object]:
+            if command.command in {'replay', 'reset-group-to-latest'}:
+                return self._execute_disposition_operator(state, client, command)
+            snapshot = state.snapshot()
+            if command.command == 'retry':
+                return self._execute_retry(state, snapshot, command)
+            return self._execute_reasoned_operator(state, snapshot, command)
+
+        result = self._call(_execute)
+        if isinstance(result, Mapping):
+            return result
+        return group_result_mapping(result)
+
+    @staticmethod
+    def _lane_health(
+        resources: _LaneResources,
+        snapshot: GroupSnapshot,
+    ) -> LaneHealth:
+        """Combine process-local lane phase with durable in-flight identity."""
+        return _LaneComponent._snapshot_lane_health(resources.lane.health(), snapshot)
+
+    def _group_health(
+        self,
+        resources: _LaneResources,
+        lifecycle: _LaneLifecycle,
+        snapshot: GroupSnapshot,
+        *,
+        refresh_late_ids: bool,
+    ) -> GroupHealth:
+        """Build one complete immutable lane-thread health projection."""
+        channel = lifecycle.channel.status
+        join_target = resources.client.last_join_target
+        catchup_frontier = (
+            snapshot.latest_join_boundary if join_target is None else join_target.identity.boundary
+        )
+        if snapshot.parked:
+            join_phase = 'parked'
+        elif lifecycle.joined and channel.attached:
+            join_phase = 'attached'
+        elif isinstance(resources.client, EventClient) and not resources.client.connected:
+            join_phase = 'detached'
+        elif join_target is not None:
+            join_phase = 'catching-up'
+        else:
+            join_phase = 'joining'
+        late_projection = self._health_refresh.late_projection
+        if refresh_late_ids or late_projection is None:
+            late_projection = resources.state.unresolved_late_id_projection(
+                limit=HEALTH_LATE_ID_LIMIT
+            )
+            self._health_refresh.late_projection = late_projection
+        durable_health = _snapshot_health_options(
+            snapshot,
+            late_projection,
+            resources.state.park_reason() if snapshot.parked else None,
+            resources.state.audit_count(),
+        )
+        if lifecycle.setup_failure is not None:
+            durable_health['failure_kind'] = 'setup'
+            durable_health['failure_text'] = str(lifecycle.setup_failure)
+            durable_health['conditions'] = (*snapshot.conditions, 'callback-failed')
+        return GroupHealth.from_lane(
+            self._lane_health(resources, snapshot),
+            queue_event_count=channel.queued_count,
+            queue_byte_count=channel.queued_bytes,
+            catchup_frontier=catchup_frontier,
+            join_phase=join_phase,
+            **durable_health,
+        )
+
+    def _publish_health(
+        self,
+        resources: _LaneResources,
+        lifecycle: _LaneLifecycle,
+    ) -> None:
+        """Publish one owner-thread group projection to the monitor cache."""
+        pending = self._pending_health_snapshot
+        self._pending_health_snapshot = None
+        health = _refresh_group_health(
+            pending,
+            self._health_refresh,
+            self._health_interval_secs,
+            resources.state.snapshot,
+            lambda snapshot, refresh_late_ids: self._group_health(
+                resources, lifecycle, snapshot, refresh_late_ids=refresh_late_ids
+            ),
+        )
+        self._health_cache.publish_group(
+            health,
+            sample=self._watchdog.sample(),
+        )
+        client = resources.client
+        if isinstance(client, EventClient):
+            channel = lifecycle.channel.status
+            buffers = client.socket_buffers
+            self._health_cache.publish_event_socket(
+                EventSocketHealth(
+                    source=resources.context.group.source,
+                    group=self._group,
+                    role='client',
+                    connected=client.connected,
+                    requested=buffers.requested,
+                    send=buffers.send,
+                    receive=buffers.receive,
+                    queue_event_count=channel.queued_count,
+                    queue_byte_count=channel.queued_bytes,
+                    reason=(channel.reason if client.connected else client.detach_reason),
+                )
+            )
+
+    @staticmethod
+    def _snapshot_lane_health(health: LaneHealth, snapshot: GroupSnapshot) -> LaneHealth:
+        """Retain persisted in-flight identity before a callback begins running."""
+        event_id = snapshot.in_flight_event_id
+        manifest = snapshot.manifest
+        if health.event_id is not None or event_id is None or manifest is None:
+            return health
+        ordinal = snapshot.failure_ordinal
+        if ordinal is None:
+            ordinal = next(
+                (mark[0] for mark in snapshot.callback_marks if mark[3] == 'pending'),
+                None,
+            )
+        callback = next(
+            (item for item in manifest.callbacks if item.ordinal == ordinal),
+            None,
+        )
+        mark = next(
+            (item for item in snapshot.callback_marks if item[0] == ordinal),
+            None,
+        )
+        return replace(
+            health,
+            event_id=event_id,
+            plugin_id=None if callback is None else callback.plugin_id,
+            callback_id=None if callback is None else callback.callback_id,
+            delivery_attempt=None if mark is None else mark[4],
+        )
+
     @staticmethod
     def _poll_remote(client: EventClient) -> None:
         """Drain readable transport frames before releasing live bodies."""
@@ -3132,141 +3887,50 @@ class _LaneComponent:
                 self._wake.wait(0.01)
                 self._wake.clear()
 
-    def _publish_health(
-        self,
-        resources: _LaneResources,
-        lifecycle: _LaneLifecycle,
+    def _publish_startup_group_health(
+        self, context: _LaneConfiguration, state: GroupState
     ) -> None:
-        """Publish one owner-thread group projection to the monitor cache."""
-        pending = self._pending_health_snapshot
-        self._pending_health_snapshot = None
-        health = _refresh_group_health(
-            pending,
-            self._health_refresh,
-            self._health_interval_secs,
-            resources._state.snapshot,
-            lambda snapshot: self._group_health(resources, lifecycle, snapshot),
+        """Publish persisted lane state before recovery can wait on an outside writer."""
+        snapshot = state.snapshot()
+        sample = self._watchdog.sample()
+        lane = self._snapshot_lane_health(
+            LaneHealth(
+                site=context.site.name,
+                source=context.group.source,
+                group=self._group,
+                worker_instance=self._assignment.spawn_instance,
+                execution=context.group.execution,
+                ordering=context.group.ordering,
+                phase=cast('GroupPhase', sample.phase),
+                status=snapshot.status,
+                cursor=snapshot.cursor,
+                event_id=sample.event_id,
+                plugin_id=sample.plugin_id,
+                callback_id=sample.callback_id,
+                delivery_attempt=sample.delivery_attempt,
+                heartbeat_at=sample.heartbeat_at,
+                heartbeat_age=max(0.0, time.monotonic() - sample.heartbeat_at),
+                deadline_at=sample.deadline_at,
+                internal_stall_deadline_secs=self._internal_stall_deadline_secs,
+                overdue_reason=None,
+            ),
+            snapshot,
         )
-        self._health_cache._publish_group(
-            health,
-            sample=self._watchdog.sample(),
+        late_count, late_ids = state.unresolved_late_id_projection(limit=HEALTH_LATE_ID_LIMIT)
+        health = GroupHealth.from_lane(
+            lane,
+            queue_event_count=0,
+            queue_byte_count=0,
+            catchup_frontier=snapshot.latest_join_boundary,
+            join_phase='parked' if snapshot.parked else 'joining',
+            **_snapshot_health_options(
+                snapshot,
+                (late_count, late_ids),
+                state.park_reason() if snapshot.parked else None,
+                state.audit_count(),
+            ),
         )
-        client = resources._client
-        if isinstance(client, EventClient):
-            channel = lifecycle._channel.status
-            buffers = client.socket_buffers
-            self._health_cache._publish_event_socket(
-                EventSocketHealth(
-                    source=resources._context._group.source,
-                    group=self._group,
-                    role='client',
-                    connected=client.connected,
-                    requested=buffers.requested,
-                    send=buffers.send,
-                    receive=buffers.receive,
-                    queue_event_count=channel.queued_count,
-                    queue_byte_count=channel.queued_bytes,
-                    reason=(channel.reason if client.connected else client.detach_reason),
-                )
-            )
-
-    def _reconnect_remote(
-        self,
-        resources: _LaneResources,
-        channel: GroupChannelInterface,
-    ) -> tuple[GroupChannelInterface, bool]:
-        """Reconnect the same grant and allocate a fresh join channel."""
-        client = resources._client
-        if not isinstance(client, EventClient):
-            raise TypeError('local source client cannot reconnect remotely')
-        with self._watch_phase('internal'):
-            channel.close()
-        with self._watch_phase('startup'):
-            try:
-                client.reconnect()
-            except ConnectionError:
-                return channel, False
-        with self._watch_phase('internal'):
-            replacement = self._build_channel(resources._context, resources._state)
-        return replacement, True
-
-    def _recover_remote_failure(
-        self,
-        resources: _LaneResources,
-        lifecycle: _LaneLifecycle,
-        error: ConnectionError | JoinProtocolError,
-    ) -> bool:
-        """Reconnect only an expected remote transport-caused failure."""
-        if not self._expected_remote_failure(
-            resources._client,
-            lifecycle._channel,
-            error,
-        ):
-            return False
-        lifecycle._channel, _connected = self._reconnect_remote(
-            resources,
-            lifecycle._channel,
-        )
-        lifecycle._joined = False
-        return True
-
-    def _coordinate_detached(self, resources: _LaneResources, lifecycle: _LaneLifecycle) -> None:
-        """Service returned lifecycle calls and recover expected remote failures."""
-        try:
-            self._coordinate(resources, lifecycle, scan=False, force=False)
-        except (ConnectionError, JoinProtocolError) as error:
-            if not self._recover_remote_failure(resources, lifecycle, error):
-                raise
-
-    def _callback_gate_snapshot(
-        self,
-        resources: _LaneResources,
-        lifecycle: _LaneLifecycle,
-    ) -> GroupSnapshot | None:
-        """Open the callback gate and return this iteration's durable observation."""
-        if self._stop.is_set():
-            return None
-        snapshot = resources._state.snapshot()
-        if snapshot.status != 'running':
-            lifecycle._was_running = False
-            return None
-        if not lifecycle._setup_attempted:
-            lifecycle._setup_attempted = True
-            lifecycle._setup_failure = resources._lane.setup()
-            self._coordinate_detached(resources, lifecycle)
-        return snapshot if lifecycle._setup_failure is None else None
-
-    def _retire_channel(
-        self,
-        resources: _LaneResources,
-        channel: GroupChannelInterface,
-        *,
-        reason: str,
-    ) -> GroupChannelInterface:
-        """Retire one live attempt and return a fresh detached channel."""
-        with self._watch_phase('internal'):
-            channel.close()
-            client = resources._client
-            if isinstance(client, EventClient):
-                client.close()
-            else:
-                client.event_channel_lost(reason=reason)
-            return self._build_channel(resources._context, resources._state)
-
-    def _service_calls(self, resources: _LaneResources) -> None:
-        """Execute every queued command on the group-owner thread."""
-        while True:
-            call = self._mailbox._take()
-            if call is None:
-                return
-            capture = _ExceptionCapture()
-            with capture, self._watch_phase('internal'):
-                call._result = call._invoke(resources)
-            raise_owner_write_failure(capture._error)
-            call._error = capture._error
-            if call._error is None:
-                self._health_snapshot_from_result(call._result)
-            call._complete.set()
+        self._health_cache.publish_group(health, sample=sample)
 
     @staticmethod
     def _validate_source_generation(
@@ -3285,9 +3949,96 @@ class _LaneComponent:
         """Close only resources opened by one failed construction attempt."""
         try:
             self._watchdog.transition('shutdown', deadline_at=self._cleanup_deadline())
-            _close_lane_resources(attempt, attempt._channel, first_error)
+            _close_lane_resources(attempt, attempt.channel, first_error)
         finally:
             self._lane = None
+
+    def _build_resources(self, context: _LaneConfiguration) -> _LaneResources:
+        """Compose all resources after source observation and state registration."""
+        attempt = _PartialLaneAttempt()
+        try:
+            with self._watch_phase('startup'):
+                client, expected_source_generation = self._build_client(context)
+                attempt.client = client
+                observation = self._observe_source(
+                    client,
+                    assignment=GroupBootstrapRequest(
+                        source=context.group.source,
+                        group=self._group,
+                        group_generation=context.assignment.group_generation,
+                        start_mode=context.assignment.start_mode,
+                    ),
+                )
+                self._validate_source_generation(
+                    observation,
+                    expected_source_generation,
+                )
+                provider, reader = self._provider_reader(context)
+                attempt.reader = reader
+                state = self._open_group_state(context, observation, reader)
+                attempt.state = state
+                self._publish_startup_group_health(context, state)
+                context = self._resolve_conditional_park(context, state)
+                plugins = _load_shared_plugins(
+                    lambda: load_plugins(context.site, context.group, provider)
+                )
+                lane = GroupLane(
+                    state=state,
+                    site=context.site,
+                    group=context.group,
+                    provider=provider,
+                    plugins=plugins,
+                    worker_instance=self._assignment.spawn_instance,
+                    health_interval_secs=self._config.daemon.health_interval_secs,
+                    watchdog=self._watchdog,
+                    async_cancel_grace_secs=self._config.daemon.async_cancel_grace_secs,
+                    wait=self._stop.wait,
+                )
+                self._lane = lane
+                attempt.lane = lane
+                channel = self._build_channel(context, state)
+                attempt.channel = channel
+                coordination = _LaneRefresh(
+                    lane=lane,
+                    slot=self._reader_slot,
+                    reader=reader,
+                    state=state,
+                    joined=lambda: (
+                        self._lifecycle is not None
+                        and self._lifecycle.joined
+                        and self._lifecycle.channel.status.attached
+                    ),
+                    fetch_interval_secs=context.source_config.fetch_interval_secs,
+                    late_event_window_secs=context.source_config.late_event_window_secs,
+                    log_extra={
+                        'site': context.site.name,
+                        'source': context.group.source,
+                        'group': context.group.name,
+                    },
+                )
+                resources = _LaneResources(
+                    context=context,
+                    client=client,
+                    reader=reader,
+                    state=state,
+                    lane=lane,
+                    channel=channel,
+                    coordination=coordination,
+                )
+        except BaseException as error:
+            self._close_partial_attempt(
+                attempt,
+                (error, error.__traceback__),
+            )
+            raise
+        intended_wake_at = time.monotonic() + context.source_config.fetch_interval_secs
+        self._watchdog.transition(
+            'idle',
+            deadline_at=(
+                intended_wake_at + watchdog_grace_secs(self._config.daemon.health_interval_secs)
+            ),
+        )
+        return resources
 
     def _pause(
         self,
@@ -3295,10 +4046,11 @@ class _LaneComponent:
         *,
         seconds: float | None = None,
         recover_remote: bool = True,
+        interrupt_on_wake: bool = True,
     ) -> None:
         """Wait with ticks, retaining join-owned recovery during catch-up."""
         interval = (
-            resources._context._source_config.fetch_interval_secs if seconds is None else seconds
+            resources.context.source_config.fetch_interval_secs if seconds is None else seconds
         )
         intended_wake_at = time.monotonic() + interval
         lifecycle = self._lifecycle
@@ -3313,7 +4065,7 @@ class _LaneComponent:
                 return
             wake_at = intended_wake_at
             if lifecycle is not None:
-                wake_at = min(wake_at, lifecycle._next_coordination_at)
+                wake_at = min(wake_at, lifecycle.next_coordination_at)
             with self._watch_phase(
                 'idle',
                 deadline_at=(wake_at + watchdog_grace_secs(self._health_interval_secs)),
@@ -3326,7 +4078,8 @@ class _LaneComponent:
                         self._coordinate_detached(resources, lifecycle)
                     else:
                         self._coordinate(resources, lifecycle, scan=False, force=False)
-                return
+                if interrupt_on_wake:
+                    return
 
     def _drive_halted(
         self,
@@ -3334,18 +4087,32 @@ class _LaneComponent:
         lifecycle: _LaneLifecycle,
     ) -> None:
         """Service body-free work while one lane cannot run callbacks."""
-        if lifecycle._joined:
-            lifecycle._channel = self._retire_channel(
+        snapshot = resources.state.snapshot()
+        status = (
+            'callback-failed'
+            if snapshot.status == 'running' and lifecycle.setup_failure is not None
+            else snapshot.status
+        )
+        if status not in {'running', 'parked'} and lifecycle.halt_logged != status:
+            group = resources.context.group
+            logging.getLogger('sg_event_daemon.group').warning(
+                'group halted: %s; delivery stops until it is cleared',
+                status,
+                extra={'site': self._spec.site, 'source': group.source, 'group': group.name},
+            )
+            lifecycle.halt_logged = status
+        if lifecycle.joined:
+            lifecycle.channel = self._retire_channel(
                 resources,
-                lifecycle._channel,
+                lifecycle.channel,
                 reason='lane-halted',
             )
-            lifecycle._joined = False
+            lifecycle.joined = False
         try:
             self._pause(resources)
         except (ConnectionError, JoinProtocolError) as error:
             self._health_snapshot_from_result(None)
-            if not self._recover_remote_failure(resources, lifecycle, error):
+            if not self._recover_lane_failure(resources, lifecycle, error):
                 raise
 
     def _resume_lane(
@@ -3354,10 +4121,10 @@ class _LaneComponent:
         lifecycle: _LaneLifecycle,
     ) -> bool:
         """Resume durable callback work before one detached lane joins."""
-        if lifecycle._joined:
+        if lifecycle.joined:
             return True
         try:
-            snapshot = resources._lane.resume()
+            snapshot = resources.lane.resume()
         except InterruptedError as error:
             if not self._stop.is_set():
                 raise
@@ -3385,7 +4152,9 @@ class _LaneComponent:
             return
         if self._lifecycle is not None:
             if seconds:
-                self._pause(resources, seconds=seconds, recover_remote=False)
+                self._pause(
+                    resources, seconds=seconds, recover_remote=False, interrupt_on_wake=False
+                )
             else:
                 self._coordinate(resources, self._lifecycle, scan=False, force=False)
         elif seconds:
@@ -3406,13 +4175,18 @@ class _LaneComponent:
         join_target: JoinTarget,
     ) -> None:
         """Drive strict catch-up to one captured live boundary."""
-        state = resources._state
+        state = resources.state
 
         def deliver_strict(
             events: Sequence[Event], _ordering_time: float
         ) -> StrictDeliveryOutcome:
-            snapshot, consumed = resources._lane.deliver_many_counted(
-                self._catchup_deliveries(events)
+            snapshot, consumed = resources.lane.deliver_many_counted(
+                self._catchup_deliveries(events),
+                deadline_at=(
+                    self._lifecycle.next_coordination_at
+                    if self._lifecycle is not None
+                    else float('inf')
+                ),
             )
             accepted = (
                 consumed > 0
@@ -3429,12 +4203,12 @@ class _LaneComponent:
         while not self._stop.is_set():
             self._service_catchup(resources)
             try:
-                with self._watch_phase('internal'), self._limiter._slot():
-                    strict_result = resources._reader.strict_step(
+                with self._reader_slot():
+                    strict_result = resources.reader.strict_step(
                         state=state,
-                        source_progress=resources._coordination.synchronize,
+                        source_progress=partial(self._synchronize, resources),
                         deliver=deliver_strict,
-                        holdback_secs=resources._context._holdback_secs,
+                        holdback_secs=resources.context.holdback_secs,
                         max_pending_epochs=self._config.daemon.max_pending_epochs,
                         unresolved_bounds=state.unresolved_obligation_bounds(),
                         join_boundary=join_target.identity.boundary,
@@ -3464,7 +4238,7 @@ class _LaneComponent:
                     and snapshot.source_generation == strict_result.source_generation
                     and snapshot.verified_incarnation == strict_result.stream_incarnation
                 ):
-                    resources._coordination._service(scan_fence=fence)
+                    resources.coordination.service(scan_fence=fence)
                 if (
                     strict_result.join_ready
                     and not snapshot.epochs
@@ -3473,7 +4247,7 @@ class _LaneComponent:
                     return
             self._service_catchup(
                 resources,
-                resources._context._source_config.fetch_interval_secs,
+                resources.context.source_config.fetch_interval_secs,
                 phase='strict-catchup',
             )
         error = InterruptedError('lane stopped during strict catch-up')
@@ -3486,8 +4260,13 @@ class _LaneComponent:
         consumed = 0
         while True:
             self._service_catchup(resources)
-            snapshot, count = resources._lane.deliver_many_counted(
-                self._catchup_deliveries(events[consumed:])
+            snapshot, count = resources.lane.deliver_many_counted(
+                self._catchup_deliveries(events[consumed:]),
+                deadline_at=(
+                    self._lifecycle.next_coordination_at
+                    if self._lifecycle is not None
+                    else float('inf')
+                ),
             )
             consumed += count
             prior_mutation = self._pending_health_snapshot
@@ -3497,14 +4276,9 @@ class _LaneComponent:
                 and self._pending_health_snapshot is not prior_mutation
             ):
                 snapshot = self._pending_health_snapshot
-            if (
-                count == 0
-                or consumed == len(events)
-                or snapshot.status != 'running'
-                or self._stop.is_set()
-            ):
+            if consumed == len(events) or snapshot.status != 'running' or self._stop.is_set():
                 return snapshot, consumed
-            if resources._lane.shutdown_requested():
+            if resources.lane.shutdown_requested():
                 return snapshot, consumed
 
     def _catch_up_eager(
@@ -3513,23 +4287,24 @@ class _LaneComponent:
         join_target: JoinTarget,
     ) -> None:
         """Drive eager catch-up to one captured live boundary."""
-        state = resources._state
+        state = resources.state
         snapshot = state.snapshot()
 
         def deliver_page(events: Sequence[Event]) -> None:
             delivered, _consumed = self._deliver_catchup_page(resources, events)
-            if resources._lane.shutdown_requested():
+            if resources.lane.shutdown_requested():
                 raise _CooperativeComponentStopError('eager-catchup')
             if delivered.status != 'running' or _consumed != len(events):
                 raise _GroupHaltedCatchupError('group halted during eager catch-up')
 
         try:
-            resources._reader.catch_up(
+            resources.reader.catch_up(
                 cursor=snapshot.cursor,
                 frontier=join_target.identity.boundary,
                 delivery_floor=snapshot.delivery_floor,
-                source_progress=resources._coordination.synchronize,
+                source_progress=partial(self._synchronize, resources),
                 deliver_page=deliver_page,
+                between_pages=partial(self._service_closeout_in_catch_up, resources),
                 replay_from=snapshot.replay_required_from,
                 unresolved_bounds=state.unresolved_obligation_bounds(),
                 service=partial(self._service_catchup, resources),
@@ -3551,12 +4326,21 @@ class _LaneComponent:
 
     def _catch_up(self, resources: _LaneResources, _frontier: int) -> None:
         """Drive eager or strict catch-up to the captured live boundary."""
+        lifecycle = self._lifecycle
+        if lifecycle is not None and lifecycle.rejoin_reason is not None:
+            group = resources.context.group
+            logging.getLogger('sg_event_daemon.group').info(
+                'live channel detached: %s; rejoining through catch-up',
+                lifecycle.rejoin_reason,
+                extra={'site': self._spec.site, 'source': group.source, 'group': group.name},
+            )
+            lifecycle.rejoin_reason = None
         with self._watch_phase('internal'):
-            join_target = resources._client.last_join_target
+            join_target = resources.client.last_join_target
             if join_target is None or join_target.stream_incarnation is None:
                 raise RuntimeError('source join observation is unavailable')
-        if resources._context._group.ordering == 'eager':
-            with self._watch_phase('internal'), self._limiter._slot():
+        if resources.context.group.ordering == 'eager':
+            with self._reader_slot():
                 self._catch_up_eager(resources, join_target)
         else:
             self._catch_up_strict(resources, join_target)
@@ -3568,39 +4352,66 @@ class _LaneComponent:
     ) -> bool:
         """Attempt one fresh-token join and retain only a live result."""
         try:
-            result = resources._lane.join(
-                resources._client,
-                lifecycle._channel,
+            result = resources.lane.join(
+                resources.client,
+                lifecycle.channel,
                 catch_up=partial(self._catch_up, resources),
             )
         except _GroupHaltedCatchupError:
             return False
         except (ConnectionError, JoinProtocolError) as error:
-            if not self._recover_remote_failure(resources, lifecycle, error):
+            if not self._recover_lane_failure(resources, lifecycle, error):
                 raise
             self._pause(resources)
             return False
         if isinstance(result, JoinRetry):
             with self._watch_phase('internal'):
-                lifecycle._channel.close()
-                lifecycle._channel = self._build_channel(
-                    resources._context,
-                    resources._state,
+                lifecycle.channel.close()
+                lifecycle.channel = self._build_channel(
+                    resources.context,
+                    resources.state,
                 )
             self._pause(
                 resources,
                 seconds=max(
                     result.retry_after_secs,
-                    resources._context._source_config.fetch_interval_secs,
+                    resources.context.source_config.fetch_interval_secs,
                 ),
             )
             return False
-        lifecycle._joined = True
-        lifecycle._next_coordination_at = time.monotonic()
+        lifecycle.joined = True
+        lifecycle.next_coordination_at = time.monotonic()
         return True
 
-    def _request_stop(self, *, shutdown_deadline_at: float | None = None) -> None:
-        """Interrupt owned work and retain the runtime's absolute deadline."""
+    def _try_remote_connect(
+        self,
+        resources: _LaneResources,
+        lifecycle: _LaneLifecycle,
+    ) -> bool:
+        """Reconnect a currently detached remote client before joining."""
+        client = resources.client
+        if not isinstance(client, EventClient) or client.connected:
+            return True
+        lifecycle.channel, connected = self._reconnect_remote(
+            resources,
+            lifecycle.channel,
+        )
+        if not connected:
+            self._pause(resources)
+        return connected
+
+    def request_stop(self, *, shutdown_deadline_at: float | None = None) -> None:
+        """Interrupt owned work and retain the runtime's absolute deadline.
+
+        Args:
+            shutdown_deadline_at: Finite nonnegative monotonic deadline, or
+                `None` to preserve the previously retained deadline.
+
+        Raises:
+            ValueError: The deadline is negative or non-finite.
+            RuntimeError: The asynchronous callback cancellation timer cannot
+                start.
+        """
         if shutdown_deadline_at is not None:
             if not isfinite(shutdown_deadline_at) or shutdown_deadline_at < 0:
                 raise ValueError('lane shutdown deadline must be finite and nonnegative')
@@ -3630,62 +4441,45 @@ class _LaneComponent:
     ) -> None:
         """Poll, deliver, and coordinate one bounded live lane cycle."""
         try:
-            self._poll_lane(resources._client)
+            self._poll_lane(resources.client)
             prior_mutation = self._pending_health_snapshot
             self._service_due(resources, lifecycle, observed=idle_snapshot)
             if self._pending_health_snapshot is not prior_mutation:
                 idle_snapshot = None
-            snapshot = resources._lane.drain_live(
-                lifecycle._channel,
+            snapshot = resources.lane.drain_live(
+                lifecycle.channel,
                 idle_snapshot=idle_snapshot,
-                deadline_at=lifecycle._next_coordination_at,
+                deadline_at=lifecycle.next_coordination_at,
             )
             self._health_snapshot_from_result(snapshot)
             self._service_due(resources, lifecycle, observed=snapshot)
         except (ConnectionError, JoinProtocolError) as error:
-            if not self._recover_remote_failure(resources, lifecycle, error):
+            if not self._recover_lane_failure(resources, lifecycle, error):
                 raise
         else:
             if snapshot.status != 'running':
-                lifecycle._channel = self._retire_channel(
+                lifecycle.channel = self._retire_channel(
                     resources,
-                    lifecycle._channel,
+                    lifecycle.channel,
                     reason='lane-halted',
                 )
-                lifecycle._joined = False
-
-    def _try_remote_connect(
-        self,
-        resources: _LaneResources,
-        lifecycle: _LaneLifecycle,
-    ) -> bool:
-        """Reconnect a currently detached remote client before joining."""
-        client = resources._client
-        if not isinstance(client, EventClient) or client.connected:
-            return True
-        lifecycle._channel, connected = self._reconnect_remote(
-            resources,
-            lifecycle._channel,
-        )
-        if not connected:
-            self._pause(resources)
-        return connected
+                lifecycle.joined = False
 
     def _drive_lane(self, resources: _LaneResources) -> None:
         """Persist one lane across local halts and remote source restarts."""
-        lifecycle = _LaneLifecycle(_channel=resources._channel)
+        lifecycle = _LaneLifecycle(channel=resources.channel)
         self._lifecycle = lifecycle
         first_error: tuple[BaseException, TracebackType | None] | None = None
         try:
             with self._watch_phase('startup'):
-                resources._reader.__enter__()
+                resources.reader.__enter__()
             while not self._stop.is_set():
                 self._service_calls(resources)
                 if self._reload.is_set():
                     break
                 self._publish_health(resources, lifecycle)
-                reuse_idle_snapshot = lifecycle._joined and lifecycle._setup_attempted
-                prior_channel = lifecycle._channel
+                reuse_idle_snapshot = lifecycle.joined and lifecycle.setup_attempted
+                prior_channel = lifecycle.channel
                 snapshot = self._callback_gate_snapshot(resources, lifecycle)
                 if snapshot is None:
                     self._drive_halted(resources, lifecycle)
@@ -3697,7 +4491,7 @@ class _LaneComponent:
                 if not self._try_remote_connect(resources, lifecycle):
                     self._publish_health(resources, lifecycle)
                     continue
-                if not lifecycle._joined and not self._join_lane(
+                if not lifecycle.joined and not self._join_lane(
                     resources,
                     lifecycle,
                 ):
@@ -3708,7 +4502,7 @@ class _LaneComponent:
                     lifecycle,
                     idle_snapshot=(
                         snapshot
-                        if reuse_idle_snapshot and lifecycle._channel is prior_channel
+                        if reuse_idle_snapshot and lifecycle.channel is prior_channel
                         else None
                     ),
                 )
@@ -3718,155 +4512,14 @@ class _LaneComponent:
         finally:
             try:
                 self._watchdog.transition('shutdown', deadline_at=self._cleanup_deadline())
-                _close_lane_resources(resources, lifecycle._channel, first_error)
+                _close_lane_resources(resources, lifecycle.channel, first_error)
             finally:
                 self._lane = None
                 self._lifecycle = None
 
-    def _write_watch(
-        self, phase: WritePhase, deadline_at: float, /
-    ) -> AbstractContextManager[None]:
-        """Publish source-file arbitration on this component's watchdog."""
-        return self._watch_phase(phase, deadline_at=deadline_at)
-
-    def _write_context(self) -> WriteContext:
-        """Open the source-file lock owned by the next state facade."""
-        daemon = self._config.daemon
-        lock = SourceWriteLock(
-            source_write_lock_path(
-                self._config, self._spec.site, self._configuration()._group.source
-            ),
-            timeout_secs=write_lock_timeout_secs(
-                daemon.health_interval_secs,
-                daemon.supervisor_poll_interval_secs,
-            ),
-            wait_phase_grace_secs=daemon.health_interval_secs,
-        )
-        return WriteContext(lock, watch=self._write_watch, stop=self._stop)
-
-    def _open_group_state(
-        self,
-        context: _LaneConfiguration,
-        observation: GroupBootstrapObservation,
-        reader: CatchupReader,
-    ) -> GroupState:
-        """Open initialized or resumed group state from captured source facts."""
-        initial_delivery_floor = 0
-        if context._assignment.start_mode == 'initialize':
-            with self._watch_phase('startup'), self._limiter._slot(), reader:
-                fresh_latest = reader.latest_visible_id()
-            initial_delivery_floor = max(
-                observation.captured_frontier,
-                0 if fresh_latest is None else fresh_latest,
-            )
-        database_path = self._database_path()
-        lock_path = group_lock_path(self._config, self._spec.site, self._group)
-        options: GroupOpenOptions = {
-            'writes': self._write_context(),
-            **group_state_options(self._config.daemon, context._source_config, context._group),
-            'site': context._site.name,
-            'site_server_url': context._site.server,
-            'source': context._group.source,
-            'group': self._group,
-            'group_generation': context._assignment.group_generation,
-            'ordering': context._group.ordering,
-            'stream_fingerprint': source_stream_fingerprint(context._site, context._source_config),
-            'source_generation': observation.source_generation,
-            'verified_incarnation': observation.stream_incarnation,
-            'start_mode': context._assignment.start_mode,
-        }
-        if context._assignment.start_mode == 'initialize':
-            options['initial_cursor'] = observation.captured_frontier
-            options['initial_delivery_floor'] = initial_delivery_floor
-            options['initial_last_delivered_id'] = initial_delivery_floor
-        return GroupState.open(
-            database_path,
-            lock_path,
-            **options,
-        )
-
-    def _build_resources(self, context: _LaneConfiguration) -> _LaneResources:
-        """Compose all resources after source observation and state registration."""
-        attempt = _PartialLaneAttempt()
-        try:
-            with self._watch_phase('startup'):
-                client, expected_source_generation = self._build_client(context)
-                attempt._client = client
-                observation = self._observe_source(
-                    client,
-                    assignment=GroupBootstrapRequest(
-                        source=context._group.source,
-                        group=self._group,
-                        group_generation=context._assignment.group_generation,
-                        start_mode=context._assignment.start_mode,
-                    ),
-                )
-                self._validate_source_generation(
-                    observation,
-                    expected_source_generation,
-                )
-                provider, reader = self._provider_reader(context)
-                attempt._reader = reader
-                state = self._open_group_state(context, observation, reader)
-                attempt._state = state
-                context = self._resolve_conditional_park(context, state)
-                database_path = self._database_path()
-                self._checkpoint_view = self._checkpoint_host.register(
-                    database_path,
-                    source_identity(context._site.name, context._group.source),
-                    SOURCE_SCHEMA,
-                )
-                plugins = _load_shared_plugins(
-                    lambda: load_plugins(context._site, context._group, provider)
-                )
-                lane = GroupLane(
-                    state=state,
-                    site=context._site,
-                    group=context._group,
-                    provider=provider,
-                    plugins=plugins,
-                    worker_instance=self._assignment.spawn_instance,
-                    health_interval_secs=self._config.daemon.health_interval_secs,
-                    watchdog=self._watchdog,
-                    async_cancel_grace_secs=self._config.daemon.async_cancel_grace_secs,
-                    wait=self._stop.wait,
-                )
-                self._lane = lane
-                attempt._lane = lane
-                channel = self._build_channel(context, state)
-                attempt._channel = channel
-                coordination = _LaneRefresh(
-                    lane=lane,
-                    limiter=self._limiter,
-                    reader=reader,
-                    state=state,
-                )
-                resources = _LaneResources(
-                    _context=context,
-                    _client=client,
-                    _reader=reader,
-                    _state=state,
-                    _lane=lane,
-                    _channel=channel,
-                    _coordination=coordination,
-                )
-        except BaseException as error:
-            self._close_partial_attempt(
-                attempt,
-                (error, error.__traceback__),
-            )
-            raise
-        intended_wake_at = time.monotonic() + context._source_config.fetch_interval_secs
-        self._watchdog.transition(
-            'idle',
-            deadline_at=(
-                intended_wake_at + watchdog_grace_secs(self._config.daemon.health_interval_secs)
-            ),
-        )
-        return resources
-
     def _run_body(self) -> None:
         """Open and drive all lane-owned resources on this thread."""
+        query_retry_attempt = 0
         while not self._stop.is_set():
             self._watchdog.transition(
                 'startup', deadline_at=time.monotonic() + self._internal_stall_deadline_secs
@@ -3874,16 +4527,51 @@ class _LaneComponent:
             context = self._configuration()
             try:
                 resources = self._build_resources(context)
-            except _RemoteBootstrapTransportError:
-                intended_wake_at = time.monotonic() + context._source_config.fetch_interval_secs
+            except _InitialGroupQueryError as error:
+                query_retry_attempt += 1
+                source = context.source_config
+                delay = saturating_retry_delay(
+                    query_retry_attempt,
+                    base_secs=source.poll_retry_base_secs,
+                    max_secs=source.poll_retry_max_secs,
+                    multiplier=source.poll_retry_multiplier,
+                )
+                delay = jitter_retry_delay(
+                    delay,
+                    fraction=source.poll_retry_jitter_fraction,
+                    sample=random.SystemRandom().random(),
+                )
+                logging.getLogger('sg_event_daemon.group').warning(
+                    'could not read the latest event from SG to start the group: '
+                    '%s; retrying in %.1fs',
+                    error,
+                    delay,
+                    extra={
+                        'site': context.site.name,
+                        'source': context.group.source,
+                        'group': context.group.name,
+                    },
+                )
+                intended_wake_at = time.monotonic() + delay
                 self._watchdog.transition(
                     'idle',
                     deadline_at=(
                         intended_wake_at + watchdog_grace_secs(self._health_interval_secs)
                     ),
                 )
-                self._stop.wait(context._source_config.fetch_interval_secs)
+                self._stop.wait(delay)
                 continue
+            except _RemoteBootstrapTransportError:
+                intended_wake_at = time.monotonic() + context.source_config.fetch_interval_secs
+                self._watchdog.transition(
+                    'idle',
+                    deadline_at=(
+                        intended_wake_at + watchdog_grace_secs(self._health_interval_secs)
+                    ),
+                )
+                self._stop.wait(context.source_config.fetch_interval_secs)
+                continue
+            query_retry_attempt = 0
             self._health_refresh = _GroupHealthRefresh()
             self._pending_health_snapshot = None
             self._drive_lane(resources)
@@ -3893,13 +4581,17 @@ class _LaneComponent:
             break
         self._watchdog.transition('shutdown', deadline_at=self._cleanup_deadline())
 
-    def _run(self) -> None:
-        """Complete thread-owned resources while retaining health until close."""
+    def run(self) -> None:
+        """Complete thread-owned resources while retaining health until close.
+
+        Run the owner's service loop on the calling thread until stop or
+        failure, then clean up its thread-owned resources. Health registration
+        remains until `close()`.
+
+        Raises:
+            Exception: Resource setup, owner-thread work, or cleanup fails.
+        """
         self._run_body()
-
-
-class _HealthControlPeerClosedError(RuntimeError):
-    """Identify peer closure reported by the concrete health control send."""
 
 
 class _WatchdogSamplingError(RuntimeError):
@@ -3907,7 +4599,7 @@ class _WatchdogSamplingError(RuntimeError):
 
 
 class _WorkerRuntimeOptions(TypedDict):
-    """Define required runtime composition and optional test injections."""
+    """Define required runtime composition and optional production or injected seams."""
 
     spec: WorkerSpec
     spawn_instance: str
@@ -3922,7 +4614,7 @@ class _WorkerRuntimeOptions(TypedDict):
     clock: NotRequired[Callable[[], float]]
     force_exit: NotRequired[_ForceExit]
     group_sources: NotRequired[Mapping[str, str]]
-    health_cache: NotRequired[_ComponentHealthCache]
+    health_cache: _ComponentHealthCache
     monitor_gate: NotRequired[_MonitorGate]
     operator_deadline_secs_by_source: NotRequired[Mapping[str, float]]
     prepare: NotRequired[Callable[[], None]]
@@ -3930,38 +4622,11 @@ class _WorkerRuntimeOptions(TypedDict):
     sqlite_synchronous: NotRequired[str]
 
 
-class WorkerRuntime:
-    """Run injected source and serial lane components under one monitor.
-
-    `start()` acquires component resources and starts the owned work and
-    monitor threads. Request shutdown with `request_stop()`, then use `wait()`
-    to join work and close resources that are no longer in use. Resources
-    required by surviving work remain owned.
-
-    The monitor invokes the configured force-exit function if work remains
-    alive beyond the shutdown deadline; the default terminates the process with
-    `os._exit(1)`.
-
-    Attributes:
-        fatal_reason: Fatal stop reason, or none while no fatal stop occurred.
-    """
+class _WorkerRuntime:
+    """Run injected source and serial lane components under one monitor."""
 
     def __init__(self, **options: Unpack[_WorkerRuntimeOptions]) -> None:
-        """Configure an unopened injected worker runtime.
-
-        Args:
-            **options: Worker identity, component factories, health sink,
-                timing and concurrency limits, and optional control, clock,
-                preparation, monitoring, and force-exit injections.
-
-        Raises:
-            ValueError: `spawn_instance` is empty; a health interval,
-                checkpoint interval, or shutdown deadline is not positive;
-                the checkpoint interval is nonfinite; the shutdown deadline is
-                nonfinite when `health_cache` enables the operator watchdog; or
-                `max_concurrent_catchup_readers` is not an exact positive
-                integer.
-        """
+        """Configure an unopened injected worker runtime."""
         spec = options['spec']
         spawn_instance = options['spawn_instance']
         health_interval_secs = options['health_interval_secs']
@@ -3981,10 +4646,11 @@ class WorkerRuntime:
         self._components: dict[str, _WorkerComponent] = {}
         self._construction_order: list[str] = []
         self._control = options.get('control')
+        self._outbox: WorkerControlOutbox | None = None
         self._fatal_reason: str | None = None
         self._force_exit = options.get('force_exit', os._exit)
         self._health_interval_secs = health_interval_secs
-        self._health_cache = options.get('health_cache')
+        self._health_cache = options['health_cache']
         self._health_sink = options['health_sink']
         self._group_sources = dict(options.get('group_sources', {}))
         self._lane_factory = options['lane_factory']
@@ -3998,7 +4664,6 @@ class WorkerRuntime:
         self._operator_result: CommandResult | None = None
         self._operator_wake = threading.Event()
         self._operator_watchdog = self._build_operator_watchdog(
-            self._health_cache,
             worker_instance=spawn_instance,
             startup_deadline_secs=shutdown_deadline_secs,
             clock=self._clock,
@@ -4009,7 +4674,6 @@ class WorkerRuntime:
         self._shutdown_deadline_secs = shutdown_deadline_secs
         self._socket_buffers = options.get('socket_buffers', _DEFAULT_SOCKET_BUFFERS)
         self._source_factory = options['source_factory']
-        self._source_outages: dict[str, str] = {}
         self._spawn_instance = spawn_instance
         self._spec = spec
         self._state_lock = threading.RLock()
@@ -4023,19 +4687,17 @@ class WorkerRuntime:
             interval_secs=checkpoint_interval_secs,
             synchronous=options.get('sqlite_synchronous', 'NORMAL'),
             on_failure=self._component_failed,
+            logger=logging.getLogger('sg_event_daemon.source'),
         )
 
     @staticmethod
     def _build_operator_watchdog(
-        cache: _ComponentHealthCache | None,
         *,
         worker_instance: str,
         startup_deadline_secs: float,
         clock: Callable[[], float],
-    ) -> ComponentWatchdog | None:
-        """Build one initially idle operator cell when live sampling is enabled."""
-        if cache is None:
-            return None
+    ) -> ComponentWatchdog:
+        """Build one initially idle operator cell."""
         return ComponentWatchdog(
             kind='operator',
             identity=_OPERATOR_EXECUTOR_IDENTITY,
@@ -4078,16 +4740,13 @@ class WorkerRuntime:
             monitor is not None and monitor.is_alive()
         ):
             return
-        watchdog = self._operator_watchdog
-        cache = self._health_cache
-        if watchdog is not None and cache is not None:
-            sample = watchdog.sample()
-            cache._deregister_watchdog(
-                kind=sample.kind,
-                identity=sample.identity,
-                worker_instance=sample.worker_instance,
-                token=sample.registration_token,
-            )
+        sample = self._operator_watchdog.sample()
+        self._health_cache.deregister_watchdog(
+            kind=sample.kind,
+            identity=sample.identity,
+            worker_instance=sample.worker_instance,
+            token=sample.registration_token,
+        )
 
     def _close_components(self) -> None:
         """Close stopped owners only after their health publisher has stopped."""
@@ -4100,16 +4759,16 @@ class WorkerRuntime:
         capture = _ExceptionCapture()
         with capture:
             self._deregister_operator_watchdog()
-        first_error = capture._error
+        first_error = capture.error
         for identity in reversed(tuple(self._construction_order)):
             if identity in live:
                 continue
             capture = _ExceptionCapture()
             with capture:
-                self._components[identity]._close()
+                self._components[identity].close()
                 self._construction_order.remove(identity)
             if first_error is None:
-                first_error = capture._error
+                first_error = capture.error
         with self._state_lock:
             self._has_open_resources = bool(self._construction_order)
         if first_error is not None:
@@ -4117,7 +4776,7 @@ class WorkerRuntime:
 
     def _monitor_wait_secs(self, pending_deadline: float | None = None) -> float:
         """Bound the next observation by its pending phase and shutdown deadlines."""
-        wait = self._health_interval_secs
+        wait = min(self._health_interval_secs, shutdown_slice_secs(self._shutdown_deadline_secs))
         now = self._clock()
         if pending_deadline is not None:
             wait = min(wait, max(0.0, pending_deadline - now))
@@ -4159,6 +4818,16 @@ class WorkerRuntime:
             return resolved, group
         raise ValueError('operator command owner is invalid')
 
+    def _operator_wait_phase(self) -> AbstractContextManager[None]:
+        """Renew the operator's bounded phase while the source serves a call."""
+        watchdog = self._operator_watchdog
+        interval = self._health_interval_secs
+        return watchdog.watch(
+            'internal',
+            deadline_at=self._clock() + interval + watchdog_grace_secs(interval),
+            operator_command=watchdog.sample().operator_command,
+        )
+
     def _operator_response(self, message: OperatorCommand) -> CommandResult:
         """Execute one owner-routed command and build its correlated result."""
         try:
@@ -4169,7 +4838,27 @@ class WorkerRuntime:
                 return self._operator_failure(
                     message, 'operator command target is not owned by worker'
                 )
-            result = component._execute_operator_command(message)
+            if group is None:
+                result = component.execute_operator_command(
+                    message, wait_phase=self._operator_wait_phase
+                )
+            else:
+                with self._state_lock:
+                    watchdog = self._operator_watchdog
+                    if self._operator_command is message and not self._stop_event.is_set():
+                        watchdog.transition('idle', deadline_at=None)
+                try:
+                    result = component.execute_operator_command(message)
+                finally:
+                    with self._state_lock:
+                        if self._operator_command is message and not self._stop_event.is_set():
+                            watchdog.transition(
+                                'internal',
+                                deadline_at=(
+                                    self._clock() + self._operator_deadline_secs_by_source[source]
+                                ),
+                                operator_command=message.command,
+                            )
         except Exception as error:  # noqa: BLE001
             return CommandResult(
                 command=message.command,
@@ -4177,9 +4866,11 @@ class WorkerRuntime:
                 message=str(error),
                 request_id=message.request_id,
                 result=(
-                    {'code': 'source-database-busy'}
+                    {'code': SOURCE_BUSY_CODE}
+                    if isinstance(error, _SourceCallBusyError)
+                    else {'code': SOURCE_DATABASE_BUSY_CODE}
                     if isinstance(error, SourceDatabaseBusyError)
-                    else {'code': 'group-busy'}
+                    else {'code': GROUP_BUSY_CODE}
                     if isinstance(error, (AlreadyLockedError, _LaneCallBusyError))
                     else {}
                 ),
@@ -4213,29 +4904,27 @@ class WorkerRuntime:
             )
 
     def _poll_operator_result(self) -> None:
-        """Send one completed or interrupted result from the monitor thread."""
+        """Queue one completed or interrupted result and release its command slot."""
         with self._state_lock:
             result = self._operator_result
         if result is None:
             return
-        control = self._control
-        if control is None:
+        outbox = self._outbox
+        if outbox is None:
             raise RuntimeError('operator response control is unavailable')
-        control.send(result)
+        outbox.enqueue(result)
         with self._state_lock:
             if self._operator_result is result:
                 self._operator_command = None
                 self._operator_result = None
                 watchdog = self._operator_watchdog
-                if watchdog is not None and not self._stop_event.is_set():
+                if not self._stop_event.is_set():
                     watchdog.transition('idle', deadline_at=None)
-                    cache = self._health_cache
-                    if cache is not None:
-                        cache._set_operator_target(
-                            sample=watchdog.sample(),
-                            source=None,
-                            group=None,
-                        )
+                    self._health_cache.set_operator_target(
+                        sample=watchdog.sample(),
+                        source=None,
+                        group=None,
+                    )
 
     def _queue_operator_command(self, message: OperatorCommand) -> CommandResult | None:
         """Queue one command or return its correlated busy rejection."""
@@ -4245,9 +4934,10 @@ class WorkerRuntime:
             return self._operator_failure(message, 'operator command owner is invalid')
         watchdog = self._operator_watchdog
         deadline_secs = self._operator_deadline_secs_by_source.get(source)
-        if watchdog is not None and deadline_secs is None:
+        if deadline_secs is None:
             return self._operator_failure(message, 'operator command owner is invalid')
         with self._state_lock:
+            self._poll_operator_result()
             if self._operator_command is not None:
                 return self._operator_failure(
                     message,
@@ -4255,35 +4945,24 @@ class WorkerRuntime:
                 )
             self._operator_command = message
             self._operator_result = None
-            if watchdog is not None:
-                if deadline_secs is None:
-                    raise RuntimeError('operator watchdog deadline is unavailable')
-                cache = self._health_cache
-                if cache is None:
-                    raise RuntimeError('operator watchdog cache is unavailable')
-                cache._set_operator_target(
-                    sample=watchdog.sample(),
-                    source=source,
-                    group=group,
-                )
-                watchdog.transition(
-                    'internal',
-                    deadline_at=self._clock() + deadline_secs,
-                    operator_command=message.command,
-                )
+            self._health_cache.set_operator_target(
+                sample=watchdog.sample(),
+                source=source,
+                group=group,
+            )
+            watchdog.transition(
+                'internal',
+                deadline_at=self._clock() + deadline_secs,
+                operator_command=message.command,
+            )
         self._operator_wake.set()
         return None
-
-    def _report_source_outage(self, source: str, error: BaseException) -> None:
-        """Record provider degradation without stopping worker heartbeat."""
-        with self._state_lock:
-            self._source_outages[source] = redact_health_text(str(error))
 
     def _request_components_stop(self) -> None:
         """Request stop in reverse construction order."""
         for identity in reversed(self._construction_order):
             component = self._components[identity]
-            component._request_stop(shutdown_deadline_at=self._shutdown_deadline_at)
+            component.request_stop(shutdown_deadline_at=self._shutdown_deadline_at)
 
     @property
     def _resources_open(self) -> bool:
@@ -4334,14 +5013,21 @@ class WorkerRuntime:
             monitor_alive=monitor.is_alive(),
             thread_names=tuple(sorted(identity for identity, _thread in self._owned_threads())),
             stuck_threads=self._stuck_threads,
-            breaker_open=False,
-            breaker_reason=None,
             socket_buffer_requested=self._socket_buffers.requested,
             socket_send_buffer=self._socket_buffers.send,
             socket_receive_buffer=self._socket_buffers.receive,
-            source_outages=tuple(sorted(self._source_outages.items())),
             watchdog_failure=self._watchdog_failure,
         )
+
+    def _publish_monitor_health(self, now: float) -> float | None:
+        """Offer one health sample and return its earliest pending phase deadline."""
+        try:
+            return self._health_sink(self._current_health(now))
+        except _WatchdogSamplingError:
+            if self._outbox is not None:
+                with suppress(EOFError):
+                    self._outbox.write_available()
+            raise
 
     @property
     def fatal_reason(self) -> str | None:
@@ -4371,15 +5057,17 @@ class WorkerRuntime:
             self._shutdown_deadline_at = self._clock() + self._shutdown_deadline_secs
             self._stop_event.set()
             watchdog = self._operator_watchdog
-            if watchdog is not None:
-                watchdog.transition(
-                    'shutdown',
-                    deadline_at=self._shutdown_deadline_at,
-                )
+            watchdog.transition(
+                'shutdown',
+                deadline_at=self._shutdown_deadline_at,
+            )
             if self._operator_command is not None and self._operator_result is None:
-                self._operator_result = self._operator_failure(
-                    self._operator_command,
-                    'operator command interrupted by worker shutdown',
+                self._operator_result = replace(
+                    self._operator_failure(
+                        self._operator_command,
+                        'operator command interrupted by worker shutdown',
+                    ),
+                    result={OUTCOME_KEY: OUTCOME_UNKNOWN},
                 )
         self._checkpoint_host.request_stop()
         self._operator_wake.set()
@@ -4412,32 +5100,66 @@ class WorkerRuntime:
         capture = _ExceptionCapture()
         try:
             with capture:
-                component._run()
+                component.run()
         except (KeyboardInterrupt, SystemExit) as error:
             self._component_interrupted(identity, error)
             raise
-        error = capture._error
+        error = capture.error
         if error is not None:
-            if isinstance(error, WorkerControlSendTimeoutError):
-                failure = 'worker-control-send-timeout'
-            else:
-                component_kind, separator, _name = identity.partition(':')
-                cooperative_stop = self._stop_event.is_set() and (
-                    isinstance(error, (CheckpointHostStoppedError, WriteLockStoppedError))
-                    or (
-                        isinstance(error, _CooperativeComponentStopError)
-                        and separator == ':'
-                        and component_kind == 'lane'
-                        and error._phase in get_args(_ComponentStopPhase)
-                    )
+            component_kind, separator, _name = identity.partition(':')
+            cooperative_stop = self._stop_event.is_set() and (
+                isinstance(error, (CheckpointHostStoppedError, WriteLockStoppedError))
+                or (
+                    isinstance(error, _CooperativeComponentStopError)
+                    and separator == ':'
+                    and component_kind == 'lane'
+                    and error.phase in get_args(_ComponentStopPhase)
                 )
-                if not cooperative_stop:
-                    failure = f'{identity} thread failed: {type(error).__name__}: {error}'
+            )
+            if not cooperative_stop:
+                failure = f'{identity} thread failed: {type(error).__name__}: {error}'
         elif not self._stop_event.is_set():
             failure = f'{identity} thread exited'
         if failure is not None:
             self._component_failed(failure)
         self._complete_runtime_thread(identity)
+
+    def _control_transport_closed(self, error: EOFError) -> None:
+        """Keep peer closure cooperative and other write transport failures fatal."""
+        cause = error.__cause__
+        if cause is None or isinstance(cause, BrokenPipeError):
+            self.request_stop('control-eof')
+        else:
+            detail = bound_health_text(str(cause))
+            self._component_failed(f'monitor thread failed: {type(cause).__name__}: {detail}')
+
+    def _finish_monitor_shutdown(self, now: float) -> bool:
+        """Give the retained shutdown deadline priority over final control traffic."""
+        if not self._stop_event.is_set():
+            return False
+        outbox = self._outbox
+        alive = self._live_thread_names()
+        deadline = self._shutdown_deadline_at
+        if deadline is not None and now >= deadline:
+            if outbox is not None:
+                outbox.abandon()
+            with self._state_lock:
+                self._stuck_thread_names = tuple(sorted(alive))
+            if outbox is None:
+                self._publish_monitor_health(now)
+            if alive:
+                self._force_exit(1)
+            return True
+        if alive:
+            return False
+        self._publish_monitor_health(now)
+        if outbox is not None:
+            try:
+                outbox.write_available()
+            except EOFError as error:
+                self._control_transport_closed(error)
+            outbox.abandon()
+        return True
 
     def _install_event_grant(self, grant: EventPeerGrant) -> None:
         """Route one source grant or fail the worker closed."""
@@ -4445,7 +5167,7 @@ class WorkerRuntime:
         if not isinstance(component, _SourceComponent):
             self.request_stop('event grant source is not owned by worker')
             return
-        component._request_grant(grant)
+        component.request_grant(grant)
 
     def _apply_control_message(self, message: object) -> None:
         """Apply one decoded post-assignment control message."""
@@ -4456,10 +5178,10 @@ class WorkerRuntime:
         elif isinstance(message, OperatorCommand):
             result = self._queue_operator_command(message)
             if result is not None:
-                control = self._control
-                if control is None:
+                outbox = self._outbox
+                if outbox is None:
                     raise RuntimeError('operator response control is unavailable')
-                control.send(result)
+                outbox.enqueue(result)
         else:
             reason = f'unsupported runtime control message: {type(message).__name__}'
             self._component_failed(reason)
@@ -4470,7 +5192,7 @@ class WorkerRuntime:
         capture = _ExceptionCapture()
         with capture:
             self._run_operator_commands()
-        error = capture._error
+        error = capture.error
         if error is not None:
             failure = (
                 f'{_OPERATOR_EXECUTOR_IDENTITY} thread failed: {type(error).__name__}: {error}'
@@ -4494,36 +5216,31 @@ class WorkerRuntime:
             return
         self._apply_control_message(message)
 
-    def _publish_monitor_health(self, now: float) -> float | None:
-        """Return the sent frame's pending deadline, or stop when its peer closes."""
-        try:
-            return self._health_sink(self._current_health(now))
-        except _HealthControlPeerClosedError:
-            self.request_stop('control-eof')
-            return None
-
     def _monitor(self) -> None:
-        """Publish health and enforce monitor-only hard exit."""
+        """Sample health and service control without waiting for a receiver."""
+        outbox = self._outbox
         with self._monitor_gate():
             while True:
                 self._monitor_wake.clear()
                 now = self._clock()
                 self._poll_control()
                 self._poll_operator_result()
-                alive = self._live_thread_names()
-                if self._stop_event.is_set():
-                    deadline = self._shutdown_deadline_at
-                    if not alive:
-                        self._publish_monitor_health(now)
-                        return
-                    if deadline is not None and now >= deadline:
-                        with self._state_lock:
-                            self._stuck_thread_names = tuple(sorted(alive))
-                        self._publish_monitor_health(now)
-                        self._force_exit(1)
-                        return
+                if self._finish_monitor_shutdown(now):
+                    return
                 pending_deadline = self._publish_monitor_health(now)
-                self._monitor_wake.wait(self._monitor_wait_secs(pending_deadline))
+                next_sample = now + self._health_interval_secs
+                if pending_deadline is not None:
+                    next_sample = min(next_sample, pending_deadline)
+                if outbox is None:
+                    self._monitor_wake.wait(self._monitor_wait_secs(next_sample))
+                else:
+                    try:
+                        outbox.write_available()
+                        outbox.wait(self._monitor_wait_secs(next_sample))
+                    except EOFError as error:
+                        self._control_transport_closed(error)
+                        outbox.abandon()
+                        outbox = None
 
     def _monitor_main(self) -> None:
         """Run the monitor behind the worker-fatal thread boundary."""
@@ -4531,12 +5248,10 @@ class WorkerRuntime:
         capture = _ExceptionCapture()
         with capture:
             self._monitor()
-        error = capture._error
+        error = capture.error
         if error is not None:
             if isinstance(error, _WatchdogSamplingError):
                 failure = 'watchdog-sampling-failed'
-            elif isinstance(error, WorkerControlSendTimeoutError):
-                failure = 'worker-control-send-timeout'
             else:
                 detail = bound_health_text(str(error))
                 failure = f'monitor thread failed: {type(error).__name__}: {detail}'
@@ -4561,14 +5276,14 @@ class WorkerRuntime:
             with capture:
                 thread.join(max(0.0, deadline - self._clock()))
             if first_error is None:
-                first_error = capture._error
+                first_error = capture.error
         monitor = self._monitor_thread
         if monitor is not None and monitor is not threading.current_thread():
             capture = _ExceptionCapture()
             with capture:
                 monitor.join(max(0.0, deadline - self._clock()))
             if first_error is None:
-                first_error = capture._error
+                first_error = capture.error
         live = tuple(
             sorted(identity for identity, thread in self._owned_threads() if thread.is_alive())
         )
@@ -4579,7 +5294,7 @@ class WorkerRuntime:
         with capture:
             self._close_components()
         if first_error is None:
-            first_error = capture._error
+            first_error = capture.error
         if first_error is not None:
             raise first_error
         return live
@@ -4600,16 +5315,16 @@ class WorkerRuntime:
             thread.start()
             self._threads[identity] = thread
         watchdog = self._operator_watchdog
-        cache = self._health_cache
-        if watchdog is not None and cache is not None:
-            sample = watchdog.sample()
-            cache._register_watchdog(
-                kind=sample.kind,
-                identity=sample.identity,
-                worker_instance=sample.worker_instance,
-                token=sample.registration_token,
-                supplier=watchdog.sample,
-            )
+        sample = watchdog.sample()
+        self._health_cache.register_watchdog(
+            key=(
+                sample.kind,
+                sample.identity,
+                sample.worker_instance,
+                sample.registration_token,
+            ),
+            supplier=watchdog.sample,
+        )
         operator_thread = threading.Thread(
             target=self._operator_main,
             name=f'sg-event-daemon:{_OPERATOR_EXECUTOR_IDENTITY}',
@@ -4623,6 +5338,13 @@ class WorkerRuntime:
         monitor.start()
         self._monitor_thread = monitor
 
+    def require_outbox(self) -> WorkerControlOutbox:
+        """Require start to have transferred socket writing to the monitor."""
+        outbox = self._outbox
+        if outbox is None:
+            raise RuntimeError('worker control outbox is not started')
+        return outbox
+
     def start(self) -> None:
         """Start owned work, unwinding a failed attempt within the shutdown budget.
 
@@ -4631,7 +5353,11 @@ class WorkerRuntime:
         A runtime whose startup failed cannot be started again.
 
         Raises:
-            RuntimeError: An earlier startup attempt failed.
+            RuntimeError: An earlier startup attempt failed or an owned thread
+                cannot start.
+            Exception: The supplied preparation callback or a component factory
+                fails; the original startup failure is re-raised after bounded
+                cleanup.
         """
         with self._state_lock:
             if self._startup_failed:
@@ -4640,8 +5366,10 @@ class WorkerRuntime:
                 return
         capture = _ExceptionCapture()
         with capture:
+            if self._control is not None:
+                self._outbox = WorkerControlOutbox(self._control)
             self._start_threads()
-        error = capture._error
+        error = capture.error
         if error is not None:
             with self._state_lock:
                 self._startup_failed = True
@@ -4668,6 +5396,9 @@ class WorkerRuntime:
 
         Raises:
             RuntimeError: The runtime has not started.
+            Exception: Stopping or closing an owned component fails. Close
+                failures are re-raised after other eligible component cleanup
+                is attempted.
         """
         monitor = self._monitor_thread
         if monitor is None:
@@ -4740,9 +5471,28 @@ def _close_lane_resources(
 ) -> None:
     """Close a lane's current channel before its execution and storage resources."""
     _close_resources(
-        (channel, resources._lane, resources._state, resources._reader, resources._client),
+        (channel, resources.lane, resources.state, resources.reader, resources.client),
         first_error,
     )
+
+
+class _SnapshotHealthOptions(TypedDict):
+    """Define durable group fields shared by every health publisher."""
+
+    pending_catchup_epoch_count: int
+    oldest_catchup_epoch_age: float | None
+    outstanding_late_obligation_count: int
+    outstanding_late_id_count: int
+    outstanding_late_ids: tuple[int, ...]
+    outstanding_late_ids_truncated: bool
+    parked: bool
+    park_reason: str | None
+    failure_kind: str | None
+    failure_text: str | None
+    conditions: tuple[str, ...]
+    audit_count: int
+    replay_required_from: int | None
+    history_truncated_floor: int | None
 
 
 def _component_cleanup_deadline(deadline_at: float | None, stall_secs: float) -> float:
@@ -4763,7 +5513,7 @@ def _group_health_snapshot(result: object) -> GroupSnapshot | None:
 
 
 def _internal_worker_id(
-    kind: WorkerKind,
+    kind: _WorkerKind,
     site: str,
     name: str | None = None,
 ) -> str:
@@ -4784,9 +5534,9 @@ def _operator_reason(arguments: Mapping[str, object]) -> str:
 
 def _owner_call_result(call: _OwnerCall[_OwnerT]) -> object:
     """Raise the recorded error or return the completed owner call's result."""
-    if call._error is not None:
-        raise call._error
-    return call._result
+    if call.error is not None:
+        raise call.error
+    return call.result
 
 
 def _preflight_compact_health_update(
@@ -4820,7 +5570,11 @@ def _preflight_compact_health_update(
             _MAXIMUM_HEALTH_INT + 1,
         )
     )
-    conditions = GROUP_HEALTH_CONDITIONS
+    conditions = (*GROUP_HEALTH_CONDITIONS, *sorted(STALL_CONDITIONS))
+    join_phases = ('attached', 'catching-up', 'detached', 'joining', 'parked')
+    failure_kinds = ('callback', 'setup')
+    group_operator_command = max(OPERATOR_COMMANDS, key=len)
+    source_operator_command = max(SOURCE_OPERATOR_COMMANDS, key=len)
     sources = tuple(
         SourceHealth(
             site=spec.site,
@@ -4850,11 +5604,11 @@ def _preflight_compact_health_update(
                 for item in assignment.source_group_assignments
                 if item.source == source and site.groups[item.group].ordering == 'strict'
             ),
-            checkpoint_state='incomplete',
+            conditions=tuple(sorted(STALL_CONDITIONS)),
             stream_incarnation=_MAXIMUM_HEALTH_IDENTITY,
             audit_count=_MAXIMUM_HEALTH_INT,
             database_size_bytes=_MAXIMUM_HEALTH_INT,
-            phase='write-lock-wait',
+            phase=max(SOURCE_WATCHDOG_PHASES, key=len),
             heartbeat_at=_MAXIMUM_HEALTH_FLOAT,
             heartbeat_age=_MAXIMUM_HEALTH_FLOAT,
             deadline_at=_MAXIMUM_HEALTH_FLOAT,
@@ -4870,7 +5624,7 @@ def _preflight_compact_health_update(
             worker_instance=spawn_instance,
             execution=site.groups[group].execution,
             ordering=site.groups[group].ordering,
-            phase='write-lock-wait',
+            phase=max(GROUP_PHASES, key=len),
             status=max(GROUP_STATUSES, key=len),
             cursor=_MAXIMUM_HEALTH_INT,
             current_event_id=_MAXIMUM_HEALTH_INT,
@@ -4884,18 +5638,19 @@ def _preflight_compact_health_update(
             catchup_frontier=_MAXIMUM_HEALTH_INT,
             pending_catchup_epoch_count=_MAXIMUM_HEALTH_INT,
             oldest_catchup_epoch_age=_MAXIMUM_HEALTH_FLOAT,
-            join_phase='catching-up',
+            join_phase=max(join_phases, key=len),
             outstanding_late_obligation_count=_MAXIMUM_HEALTH_INT,
             outstanding_late_id_count=_MAXIMUM_HEALTH_INT,
             outstanding_late_ids=maximum_late_ids,
             outstanding_late_ids_truncated=True,
             parked=False,
             park_reason=_MAXIMUM_HEALTH_TEXT,
-            failure_kind='callback',
+            failure_kind=max(failure_kinds, key=len),
             failure_text=_MAXIMUM_HEALTH_TEXT,
-            checkpoint_state='incomplete',
             conditions=conditions,
             audit_count=_MAXIMUM_HEALTH_INT,
+            replay_required_from=_MAXIMUM_HEALTH_INT,
+            history_truncated_floor=_MAXIMUM_HEALTH_INT,
             deadline_at=_MAXIMUM_HEALTH_FLOAT,
             overdue_reason=_MAXIMUM_HEALTH_TEXT,
         )
@@ -4916,7 +5671,7 @@ def _preflight_compact_health_update(
                 source=source,
                 group=None,
                 worker_instance=spawn_instance,
-                phase='write-lock-wait',
+                phase=max(SOURCE_WATCHDOG_PHASES, key=len),
                 heartbeat_at=_MAXIMUM_HEALTH_FLOAT,
                 deadline_at=_MAXIMUM_HEALTH_FLOAT,
             )
@@ -4929,7 +5684,7 @@ def _preflight_compact_health_update(
                 source=site.groups[group].source,
                 group=group,
                 worker_instance=spawn_instance,
-                phase='write-lock-wait',
+                phase=max(GROUP_PHASES, key=len),
                 heartbeat_at=_MAXIMUM_HEALTH_FLOAT,
                 deadline_at=_MAXIMUM_HEALTH_FLOAT,
                 event_id=_MAXIMUM_HEALTH_INT,
@@ -4950,7 +5705,7 @@ def _preflight_compact_health_update(
         operator_source = site.groups[operator_group].source
         operator_phase: Literal['idle', 'internal'] = 'internal'
         operator_deadline: float | None = _MAXIMUM_HEALTH_FLOAT
-        operator_command = 'acknowledge-ordering-anomaly'
+        operator_command = group_operator_command
         if spec.sources:
             source_name = max(spec.sources, key=lambda source: len(canonical_bytes(source)))
             group_record = canonical_bytes(
@@ -4964,19 +5719,19 @@ def _preflight_compact_health_update(
                 {
                     'group': None,
                     'source': source_name,
-                    'operator_command': 'preflight-source-adoption',
+                    'operator_command': source_operator_command,
                 }
             )
             if len(source_record) > len(group_record):
                 operator_group = None
                 operator_source = source_name
-                operator_command = 'preflight-source-adoption'
+                operator_command = source_operator_command
     elif spec.sources:
         operator_group = None
         operator_source = max(spec.sources, key=len)
         operator_phase = 'internal'
         operator_deadline = _MAXIMUM_HEALTH_FLOAT
-        operator_command = 'preflight-source-adoption'
+        operator_command = source_operator_command
     else:
         operator_group = None
         operator_source = None
@@ -5039,12 +5794,9 @@ def _preflight_compact_health_update(
             monitor_alive=False,
             thread_names=thread_names,
             stuck_threads=thread_names,
-            breaker_open=False,
-            breaker_reason=_MAXIMUM_HEALTH_TEXT,
             socket_buffer_requested=socket_buffers.requested,
             socket_send_buffer=socket_buffers.send,
             socket_receive_buffer=socket_buffers.receive,
-            source_outages=tuple((source, _MAXIMUM_HEALTH_TEXT) for source in spec.sources),
             heartbeat_age=_MAXIMUM_HEALTH_FLOAT,
             watchdog_failure=_MAXIMUM_HEALTH_TEXT,
         ),
@@ -5053,7 +5805,7 @@ def _preflight_compact_health_update(
         groups=groups,
         event_sockets=event_sockets,
     )
-    required_bytes = len(encode_control_message(update)) - 4
+    required_bytes = len(encode_control_message(update)) - IPC_LENGTH_BYTES
     if required_bytes > config.daemon.max_ipc_frame_bytes:
         raise ConfigError(
             f'worker {spec.worker_id} compact health requires {required_bytes} bytes; '
@@ -5090,56 +5842,26 @@ def _refresh_group_health(
     cache: _GroupHealthRefresh,
     interval: float,
     snapshot_supplier: Callable[[], GroupSnapshot],
-    project: Callable[[GroupSnapshot], GroupHealth],
+    project: Callable[[GroupSnapshot, bool], GroupHealth],
 ) -> GroupHealth:
     """Refresh a group projection only for a change or elapsed interval."""
-    cached = cache._cached
-    dirty = cache._dirty
-    revision = cache._revision
-    deadline = cache._deadline_at
+    cached = cache.cached
+    dirty = cache.dirty
+    revision = cache.revision
+    deadline = cache.deadline_at
     now = time.monotonic()
     snapshot_is_new = pending is not None and pending.revision != revision
-    if cached is None or dirty or snapshot_is_new or (deadline is not None and now >= deadline):
+    deadline_due = deadline is not None and now >= deadline
+    if cached is None or dirty or snapshot_is_new or deadline_due:
         if pending is None or (dirty and not snapshot_is_new):
             pending = snapshot_supplier()
-        cached = project(pending)
+        cached = project(pending, cached is None or deadline_due)
         deadline = _advance_health_refresh_deadline(deadline, now, interval)
-        cache._cached = cached
-        cache._dirty = False
-        cache._revision = pending.revision
-        cache._deadline_at = deadline
+        cache.cached = cached
+        cache.dirty = False
+        cache.revision = pending.revision
+        cache.deadline_at = deadline
     return cached
-
-
-def _register_group_watchdog(
-    config: Config,
-    spec: WorkerSpec,
-    assignment: WorkerAssignment,
-    group_name: str,
-    health_cache: _ComponentHealthCache,
-) -> tuple[float, ComponentWatchdog]:
-    """Create and register one group owner's startup watchdog."""
-    site = config.sites[spec.site]
-    group = site.groups[group_name]
-    source = site.sources[group.source]
-    credential = site.credentials[source.credentials]
-    stall_secs = internal_stall_deadline_secs(config.daemon.health_interval_secs, credential)
-    watchdog = ComponentWatchdog(
-        kind='lane',
-        identity=group_name,
-        worker_instance=assignment.spawn_instance,
-        registration_token=os.urandom(16).hex(),
-        startup_deadline_secs=stall_secs,
-    )
-    sample = watchdog.sample()
-    health_cache._register_watchdog(
-        kind=sample.kind,
-        identity=sample.identity,
-        worker_instance=sample.worker_instance,
-        token=sample.registration_token,
-        supplier=watchdog.sample,
-    )
-    return stall_secs, watchdog
 
 
 def _restorable_signals() -> tuple[signal.Signals, ...]:
@@ -5175,7 +5897,7 @@ def _retire_component_watchdog(
 ) -> None:
     """Retire one live component watchdog from the shared health cache."""
     sample = watchdog.sample()
-    cache._deregister_watchdog(
+    cache.deregister_watchdog(
         kind=sample.kind,
         identity=sample.identity,
         worker_instance=sample.worker_instance,
@@ -5187,20 +5909,44 @@ def _scan_provider_call(call: Callable[[], _Result]) -> _Result:
     """Capture only provider execution, preserving storage ownership failures."""
     with _ExceptionCapture() as capture:
         return call()
-    if capture._error is None:
+    if capture.error is None:
         raise RuntimeError('provider capture has no error')
-    raise_owner_write_failure(capture._error)
-    raise _ObligationScanUnavailableError from capture._error
+    raise_owner_write_failure(capture.error)
+    raise _ObligationScanUnavailableError from capture.error
 
 
-def _stable_operator_arguments(
-    arguments: Mapping[str, object],
-) -> Mapping[str, object]:
-    """Remove supervisor-owned generation fences from semantic identity."""
+def _snapshot_health_options(
+    snapshot: GroupSnapshot,
+    late_projection: tuple[int, tuple[int, ...]],
+    park_reason: str | None,
+    audit_count: int,
+) -> _SnapshotHealthOptions:
+    """Project durable recovery fields identically for pending, startup, and live groups."""
+    late_count, late_ids = late_projection
+    failure_kind = _group_failure_kind(snapshot.failure_code)
     return {
-        key: value
-        for key, value in arguments.items()
-        if key not in {'orphan_generation', 'reserved_generation'}
+        'pending_catchup_epoch_count': len(snapshot.epochs),
+        'oldest_catchup_epoch_age': (
+            max(
+                0.0,
+                snapshot.reader_clock_checkpoint
+                - min(epoch.captured_at for epoch in snapshot.epochs),
+            )
+            if snapshot.epochs
+            else None
+        ),
+        'outstanding_late_obligation_count': snapshot.obligation_count,
+        'outstanding_late_id_count': late_count,
+        'outstanding_late_ids': late_ids,
+        'outstanding_late_ids_truncated': late_count > len(late_ids),
+        'parked': snapshot.parked,
+        'park_reason': park_reason if snapshot.parked else None,
+        'failure_kind': failure_kind,
+        'failure_text': snapshot.failure_text if failure_kind == 'callback' else None,
+        'conditions': snapshot.conditions,
+        'audit_count': audit_count,
+        'replay_required_from': snapshot.replay_required_from,
+        'history_truncated_floor': snapshot.history_truncated_floor,
     }
 
 
@@ -5211,14 +5957,17 @@ def _validate_group_operator_target(
     group: str,
 ) -> None:
     """Require exact configured ownership and closed command arguments."""
-    expected = {'group', 'site'}
-    if command.command != 'retry':
-        expected.add('reason')
-    if command.command == 'replay':
-        expected.update({'acknowledge_truncation', 'from_event_id'})
-    supplied = set(command.arguments)
-    disposition_fields = {'orphan_generation', 'reserved_generation'}
-    if command.command in {'replay', 'reset-group-to-latest'}:
+    disposition_expected = GROUP_DISPOSITION_ARGUMENTS.get(command.command)
+    expected = (
+        disposition_expected
+        if disposition_expected is not None
+        else frozenset({'group', 'site'})
+        if command.command == 'retry'
+        else frozenset({'group', 'reason', 'site'})
+    )
+    supplied = frozenset(command.arguments)
+    disposition_fields = frozenset({'disposition_id', 'orphan_generation', 'reserved_generation'})
+    if disposition_expected is not None:
         valid = supplied in (expected, expected | disposition_fields)
     else:
         valid = supplied == expected
@@ -5301,7 +6050,7 @@ def build_worker_runtime(
     spec: WorkerSpec,
     assignment: WorkerAssignment,
     control: WorkerControl,
-) -> WorkerRuntime:
+) -> _WorkerRuntime:
     """Build one concrete assigned runtime without opening component resources.
 
     Construction validates the packed assignment and maximum compact health
@@ -5347,7 +6096,7 @@ def build_worker_runtime(
             assignment=assignment,
             checkpoint_host=checkpoint_host,
             config=config,
-            control=control,
+            control=runtime.require_outbox(),
             health_cache=health_cache,
             source=source,
             spec=spec,
@@ -5365,7 +6114,7 @@ def build_worker_runtime(
             assignment=assignment,
             checkpoint_host=checkpoint_host,
             config=config,
-            control=control,
+            control=runtime.require_outbox(),
             group=group,
             health_cache=health_cache,
             limiter=limiter,
@@ -5374,12 +6123,12 @@ def build_worker_runtime(
         )
 
     def _publish_health(worker: WorkerHealth) -> float | None:
-        components = health_cache._snapshot()
-        if components._watchdog_failure is not None:
+        components = health_cache.snapshot()
+        if components.watchdog_failure is not None:
             update = HealthUpdate(
                 worker=replace(
                     worker,
-                    watchdog_failure=components._watchdog_failure,
+                    watchdog_failure=components.watchdog_failure,
                 ),
                 watchdogs=(),
                 sources=(),
@@ -5389,19 +6138,15 @@ def build_worker_runtime(
         else:
             update = HealthUpdate(
                 worker=worker,
-                watchdogs=components._watchdogs,
-                sources=components._sources,
-                groups=components._groups,
-                event_sockets=components._event_sockets,
+                watchdogs=components.watchdogs,
+                sources=components.sources,
+                groups=components.groups,
+                event_sockets=components.event_sockets,
             )
-        try:
-            control.send(update)
-        except BrokenPipeError as error:
-            if components._watchdog_failure is None:
-                raise _HealthControlPeerClosedError from error
-        if components._watchdog_failure is not None:
-            raise _WatchdogSamplingError(components._watchdog_failure)
-        # A deadline crossed during send still requires an immediate observation.
+        runtime.require_outbox().offer_health(update)
+        if components.watchdog_failure is not None:
+            raise _WatchdogSamplingError(components.watchdog_failure)
+        # A deadline crossed during sampling still requires an immediate observation.
         # Filter relative to this frame, then measure the wait after publication.
         return min(
             (
@@ -5422,7 +6167,7 @@ def build_worker_runtime(
         )
         for source in operator_sources
     }
-    return WorkerRuntime(
+    runtime = _WorkerRuntime(
         spec=spec,
         spawn_instance=assignment.spawn_instance,
         source_factory=_source_factory,
@@ -5440,6 +6185,7 @@ def build_worker_runtime(
         prepare=partial(_prepare_worker_directories, config, spec),
         socket_buffers=control.socket_buffers,
     )
+    return runtime
 
 
 def build_worker_specs(site: SiteConfig) -> tuple[WorkerSpec, ...]:
@@ -5456,9 +6202,9 @@ def build_worker_specs(site: SiteConfig) -> tuple[WorkerSpec, ...]:
     )
     specs = [
         WorkerSpec(
-            worker_id=_internal_worker_id(WorkerKind._SITE, site.name),
+            worker_id=_internal_worker_id(_WorkerKind.SITE, site.name),
             site=site.name,
-            kind=WorkerKind._SITE,
+            kind=_WorkerKind.SITE,
             name=site.name,
             sources=tuple(sorted(site.sources)),
             groups=default_groups,
@@ -5473,9 +6219,9 @@ def build_worker_specs(site: SiteConfig) -> tuple[WorkerSpec, ...]:
             named.setdefault(group.worker, []).append(group.name)
     specs.extend(
         WorkerSpec(
-            worker_id=_internal_worker_id(WorkerKind._NAMED, site.name, worker_name),
+            worker_id=_internal_worker_id(_WorkerKind.NAMED, site.name, worker_name),
             site=site.name,
-            kind=WorkerKind._NAMED,
+            kind=_WorkerKind.NAMED,
             name=worker_name,
             sources=(),
             groups=tuple(sorted(groups)),
@@ -5484,9 +6230,9 @@ def build_worker_specs(site: SiteConfig) -> tuple[WorkerSpec, ...]:
     )
     specs.extend(
         WorkerSpec(
-            worker_id=_internal_worker_id(WorkerKind._DEDICATED, site.name, group_name),
+            worker_id=_internal_worker_id(_WorkerKind.DEDICATED, site.name, group_name),
             site=site.name,
-            kind=WorkerKind._DEDICATED,
+            kind=_WorkerKind.DEDICATED,
             name=group_name,
             sources=(),
             groups=(group_name,),
@@ -5497,6 +6243,32 @@ def build_worker_specs(site: SiteConfig) -> tuple[WorkerSpec, ...]:
     if len(packed) != len(site.groups) or set(packed) != set(site.groups):
         raise RuntimeError('worker packing did not assign every group exactly once')
     return tuple(specs)
+
+
+def open_file_need(site: SiteConfig, spec: WorkerSpec) -> int:
+    """Estimate packed worker descriptors before the transient-open margin.
+
+    Args:
+        site: Configuration containing every local and remote group.
+        spec: One worker assignment from `build_worker_specs`.
+
+    Returns:
+        Descriptor need from the measured source and lane ownership table.
+    """
+    groups = [site.groups[name] for name in spec.groups]
+    if spec.sources:
+        remote_lanes = sum(
+            group.source in spec.sources and group.name not in spec.groups
+            for group in site.groups.values()
+        )
+        return (
+            7
+            + 12 * len(spec.sources)
+            + sum(6 + len(group.plugins) for group in groups)
+            + 2 * remote_lanes
+        )
+    source_files = {group.source for group in groups}
+    return 5 + 2 * len(source_files) + sum(10 + len(group.plugins) for group in groups)
 
 
 def stable_operator_id(command: str, arguments: Mapping[str, object]) -> str:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import closing
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeVar, Unpack
 
 from sg_event_daemon._group_recovery import LifecycleRequest
 from sg_event_daemon._group_state import GroupOpenOptions, GroupState
@@ -20,10 +21,13 @@ from sg_event_daemon._write_lock import SourceWriteLock, WriteContext
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from concurrent.futures import Future
     from pathlib import Path
+    from threading import Event
 
-SITE = 'test'
-SOURCE = 'admin'
+_SITE = 'test'
+_SOURCE = 'admin'
+_T = TypeVar('_T')
 
 
 class _TestGroupOptions(TypedDict, total=False):
@@ -121,17 +125,26 @@ def orphan_group(state: GroupState) -> GroupSnapshot:
     )
 
 
+def wait_for_future_signal(signal: Event, future: Future[_T]) -> None:
+    while not signal.is_set():
+        if future.done():
+            future.result()
+            raise AssertionError('worker completed without the expected signal')
+        time.sleep(0.005)
+
+
 def write_context_for(database_path: Path) -> WriteContext:
     return WriteContext(
         SourceWriteLock(
             database_path.with_suffix('.db.write-lock'),
+            database_path=database_path,
             timeout_secs=10.0,
             wait_phase_grace_secs=1.0,
         )
     )
 
 
-def create_source_database(path: Path, *, site: str = SITE, source: str = SOURCE) -> None:
+def create_source_database(path: Path, *, site: str = _SITE, source: str = _SOURCE) -> None:
     writes = write_context_for(path)
     try:
         with open_database(
@@ -221,7 +234,7 @@ def open_test_group(path: Path, **selection: Unpack[_TestGroupOptions]) -> Group
     return open_group_on_source(path, **options)
 
 
-def source_database(state_dir: Path, *, site: str = SITE, source: str = SOURCE) -> Path:
+def source_database(state_dir: Path, *, site: str = _SITE, source: str = _SOURCE) -> Path:
     sites = ensure_secure_state_dir(ensure_secure_state_dir(state_dir) / 'sites')
     site_dir = ensure_secure_state_dir(sites / site)
     return ensure_secure_state_dir(site_dir / 'sources') / f'{source}.db'

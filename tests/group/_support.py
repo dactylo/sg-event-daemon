@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Unpack
 
 from sg_event_daemon._group_recovery import DispositionRequest
@@ -9,7 +10,28 @@ if TYPE_CHECKING:
     import sqlite3
 
     from sg_event_daemon._group_state import GroupState
-    from sg_event_daemon._group_types import AuditIdentity, AuditRecord, GroupSnapshot
+    from sg_event_daemon._group_types import AuditIdentity, GroupSnapshot, PreInvocationStep
+
+
+@dataclass(frozen=True)
+class _AuditRecord:
+    site: str
+    group: str
+    event_id: int | None
+    plugin_id: str | None
+    callback_id: str | None
+    command: str
+    wall_clock_time: float
+    prior_revision: int
+    new_revision: int
+    reason: str
+    operator_label: str | None
+    local_uid: int
+    username: str
+    pid: int
+    disposition_id: str | None
+    command_fingerprint: str | None
+    terminal_result: str | None
 
 
 def _expected_operational_late_id_keys(connection: sqlite3.Connection) -> set[tuple[str, int]]:
@@ -32,8 +54,54 @@ def assert_operational_count(connection: sqlite3.Connection) -> set[tuple[str, i
     return expected
 
 
-def operator_records(state: GroupState) -> tuple[AuditRecord, ...]:
-    return tuple(record for record in state._audit_records() if record.command != 'bootstrap')
+def audit_records(state: GroupState) -> tuple[_AuditRecord, ...]:
+    connection = vars(state)['_database'].connection
+    return tuple(
+        _AuditRecord(
+            site=str(row[0]),
+            group=str(row[1]),
+            event_id=None if row[2] is None else int(row[2]),
+            plugin_id=None if row[3] is None else str(row[3]),
+            callback_id=None if row[4] is None else str(row[4]),
+            command=str(row[5]),
+            wall_clock_time=float(row[6]),
+            prior_revision=int(row[7]),
+            new_revision=int(row[8]),
+            reason=str(row[9]),
+            operator_label=None if row[10] is None else str(row[10]),
+            local_uid=int(row[11]),
+            username=str(row[12]),
+            pid=int(row[13]),
+            disposition_id=None if row[14] is None else str(row[14]),
+            command_fingerprint=None if row[15] is None else str(row[15]),
+            terminal_result=None if row[16] is None else str(row[16]),
+        )
+        for row in connection.execute(
+            """
+            SELECT site, group_name, event_id, plugin_id, callback_id,
+                   command, wall_clock_time, prior_revision, new_revision,
+                   reason, operator_label, local_uid, username, pid,
+                   disposition_id, command_fingerprint, terminal_result
+            FROM audit
+            WHERE group_name = ?
+            ORDER BY audit_id
+            """,
+            (state.snapshot().group,),
+        ).fetchall()
+    )
+
+
+def commit_step(
+    state: GroupState, step: PreInvocationStep, *, expected_revision: int
+) -> GroupSnapshot:
+    result = state.commit_pre_invocation((step,), expected_revision=expected_revision)
+    if result.rejection is not None:
+        raise result.rejection
+    return result.snapshot
+
+
+def operator_records(state: GroupState) -> tuple[_AuditRecord, ...]:
+    return tuple(record for record in audit_records(state) if record.command != 'bootstrap')
 
 
 def seed_pending_range(

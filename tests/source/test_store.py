@@ -1,42 +1,34 @@
 from __future__ import annotations
 
-import sqlite3
 from typing import TYPE_CHECKING
 
 import pytest
 
 import sg_event_daemon._source_store as source_store_module
 from sg_event_daemon._identity import stream_fingerprint
-from sg_event_daemon._source_state import SourceCapacityError
 from tests.source._support import SOURCE_GENERATION as _SOURCE_GENERATION
 from tests.source._support import open_source as _open_source
+from tests.source._support import stored_range_details
 from tests.source.test_state import open_source_range, record_source_late_ids
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
     from pathlib import Path
-
-
-def _token_sequence(*tokens: str) -> Callable[[], str]:
-    iterator: Iterator[str] = iter(tokens)
-    return lambda: next(iterator)
 
 
 def test_due_range_id_reads_only_deadline_and_active_eligibility(tmp_path: Path) -> None:
     with _open_source(
         tmp_path / 'source.db',
         groups={'editorial': 7},
-        token_factory=_token_sequence('later-high', 'earliest', 'later-low'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         open_source_range(source, 101, 101, successful_clock=1.0)
         open_source_range(source, 201, 201, successful_clock=1.0)
-        open_source_range(source, 301, 301, successful_clock=1.0)
+        open_source_range(source, 301, 302, successful_clock=1.0)
         source._database.connection.execute(
             'UPDATE discovery_ranges SET visibility_deadline = 12 WHERE low_id < 301'
         )
-        record_source_late_ids(source, 'range-301-301', (301,), successful_clock=2.0)
+        record_source_late_ids(source, 'range-301-302', (301,), successful_clock=2.0)
         source.record_successful_query(12.0)
         connection = vars(source)['_database'].connection
         statements: list[str] = []
@@ -44,7 +36,7 @@ def test_due_range_id_reads_only_deadline_and_active_eligibility(tmp_path: Path)
 
         obligation_id = source_store_module.due_range_id(connection)
 
-    assert obligation_id == 'range-301-301'
+    assert obligation_id == 'range-301-302'
     touched = {
         table
         for table in (
@@ -59,16 +51,22 @@ def test_due_range_id_reads_only_deadline_and_active_eligibility(tmp_path: Path)
     assert touched == {'discovery_ranges', 'range_groups', 'source_meta'}
 
 
-def test_empty_late_id_page_enforces_lowered_capacity(tmp_path: Path) -> None:
+def test_empty_late_id_page_records_above_lowered_limit(tmp_path: Path) -> None:
     path = tmp_path / 'source.db'
     with _open_source(path, max_source_late_ids=2) as source:
         source.initialize(100, incarnation='incarnation-1')
         opened = open_source_range(source, 101, 103, successful_clock=1.0)
         record_source_late_ids(source, opened.obligation_id, (101, 102), successful_clock=2.0)
     with _open_source(path, max_source_late_ids=1) as source:
-        with pytest.raises(SourceCapacityError, match='late-capacity-exhausted'):
-            record_source_late_ids(source, opened.obligation_id, (), successful_clock=3.0)
-        assert source.snapshot().ranges[0].late_ids == (101, 102)
+        scan = source.begin_range_scan(opened.obligation_id, successful_clock=3.0)
+        source.record_range_scan_page(
+            opened.obligation_id,
+            scanned_through=scan.scan_next_id - 1,
+            event_ids=(),
+            successful_clock=3.0,
+        )
+        assert source.successful_clock() == 3.0
+        assert source.snapshot().ranges[0].late_id_count == 2
 
 
 def test_empty_source_commits_zero_frontier_with_initialized_marker(tmp_path: Path) -> None:
@@ -93,8 +91,7 @@ def test_final_scan_must_begin_after_deadline_and_page_cap_degrades(
         path,
         groups={'editorial': 7},
         max_range_query_pages=1,
-        token_factory=_token_sequence('open', 'close'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as state:
         state.initialize(100, incarnation='incarnation-1')
         obligation_id = open_source_range(state, 101, 105, successful_clock=1.0).obligation_id
@@ -110,7 +107,7 @@ def test_final_scan_must_begin_after_deadline_and_page_cap_degrades(
         assert state.snapshot().ranges[0].state == 'open'
 
         reset = state.begin_range_scan(obligation_id, successful_clock=11.0)
-        assert reset._scan_started_at == 11.0
+        assert stored_range_details(state, obligation_id).scan_started_at == 11.0
         assert reset.scan_next_id == 101
         state.record_range_scan_page(
             obligation_id,
@@ -121,7 +118,7 @@ def test_final_scan_must_begin_after_deadline_and_page_cap_degrades(
         degraded = state.snapshot().ranges[0]
         assert degraded.state == 'open'
         assert degraded.scan_next_id == 103
-        assert degraded._degraded
+        assert stored_range_details(state, obligation_id).degraded
 
         state.begin_range_scan(obligation_id, successful_clock=12.0)
         closed = state.record_range_scan_page(
@@ -131,33 +128,19 @@ def test_final_scan_must_begin_after_deadline_and_page_cap_degrades(
             successful_clock=12.0,
         )
         assert closed.range_changed
+        assert closed.closed is not None
+        assert (closed.closed.low_id, closed.closed.high_id, closed.closed.secs) == (
+            101,
+            105,
+            11.0,
+        )
+        assert closed.closed.missing == ((102, 102), (104, 105))
         assert state.snapshot().ranges[0].state == 'closed'
-        assert state.snapshot().ranges[0].late_ids == (101, 103)
-
-
-def test_late_id_capacity_halts_before_new_evidence_or_frontier(tmp_path: Path) -> None:
-    path = tmp_path / 'source.db'
-    with _open_source(
-        path,
-        max_source_late_ids=1,
-        token_factory=_token_sequence('range-1'),
-    ) as state:
-        state.initialize(100, incarnation='incarnation-1')
-        obligation_id = open_source_range(state, 101, 103, successful_clock=1.0).obligation_id
-        record_source_late_ids(state, obligation_id, (101,), successful_clock=2.0)
-        before = state.snapshot()
-
-        with pytest.raises(SourceCapacityError, match='late-capacity-exhausted'):
-            record_source_late_ids(state, obligation_id, (102,), successful_clock=3.0)
-
-        after = state.snapshot()
-        assert after.frontier == before.frontier
-        assert after.ranges[0].late_ids == (101,)
-        assert after.status == 'late-capacity-exhausted'
+        assert state.snapshot().ranges[0].late_id_count == 2
 
 
 @pytest.mark.parametrize('incoming', [(), (101,), (101, 101, 102)])
-def test_late_id_pages_use_indexed_candidates_and_preserve_exact_capacity(
+def test_late_id_pages_use_indexed_candidates_and_preserve_exact_evidence(
     tmp_path: Path, incoming: tuple[int, ...]
 ) -> None:
     with _open_source(tmp_path / 'source.db', max_source_late_ids=2) as source:
@@ -169,7 +152,15 @@ def test_late_id_pages_use_indexed_candidates_and_preserve_exact_capacity(
         connection.set_trace_callback(statements.append)
         record_source_late_ids(source, opened.obligation_id, incoming, successful_clock=3.0)
         connection.set_trace_callback(None)
-        assert source.snapshot().ranges[0].late_ids == tuple(sorted({101, *incoming}))
+        assert source.snapshot().ranges[0].late_id_count == len({101, *incoming})
+        assert source.snapshot().ranges[0].state == 'open'
+        assert tuple(
+            int(row[0])
+            for row in connection.execute(
+                'SELECT event_id FROM source_late_ids WHERE obligation_id = ? ORDER BY event_id',
+                (opened.obligation_id,),
+            )
+        ) == tuple(sorted({101, *incoming}))
         evidence_queries = [
             statement.lower()
             for statement in statements
@@ -177,6 +168,72 @@ def test_late_id_pages_use_indexed_candidates_and_preserve_exact_capacity(
         ]
         assert evidence_queries
         assert all('count(*)' in query or 'where' in query for query in evidence_queries)
+
+
+def test_late_ids_record_over_the_limit_for_open_ranges(tmp_path: Path) -> None:
+    path = tmp_path / 'source.db'
+    with _open_source(
+        path,
+        max_source_late_ids=1,
+    ) as state:
+        state.initialize(100, incarnation='incarnation-1')
+        obligation_id = open_source_range(state, 101, 103, successful_clock=1.0).obligation_id
+        record_source_late_ids(state, obligation_id, (101,), successful_clock=2.0)
+        before = state.snapshot()
+
+        record_source_late_ids(state, obligation_id, (102,), successful_clock=3.0)
+
+        after = state.snapshot()
+        assert after.frontier == before.frontier
+        assert after.ranges[0].late_id_count == 2
+        assert after.status == 'running'
+
+
+def test_missing_runs_reads_only_one_open_ranges_recorded_ids(tmp_path: Path) -> None:
+    with _open_source(tmp_path / 'source.db') as source:
+        source.initialize(100, incarnation='incarnation-1')
+        opened = open_source_range(source, 101, 107, successful_clock=1.0)
+        record_source_late_ids(
+            source, opened.obligation_id, (101, 103, 104, 107), successful_clock=2.0
+        )
+        connection = source._database.connection
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            runs = source_store_module.missing_runs(connection, opened.obligation_id)
+        finally:
+            connection.set_trace_callback(None)
+        assert runs == ((102, 102), (105, 106))
+        assert sum('source_late_ids' in statement.lower() for statement in statements) == 1
+        with pytest.raises(ValueError, match='open discovery range'):
+            source_store_module.missing_runs(connection, 'unknown')
+        connection.execute(
+            'DELETE FROM source_late_ids WHERE obligation_id = ?', (opened.obligation_id,)
+        )
+        assert source_store_module.missing_runs(connection, opened.obligation_id) == ((101, 107),)
+        connection.execute(
+            "UPDATE discovery_ranges SET range_state = 'closed' WHERE obligation_id = ?",
+            (opened.obligation_id,),
+        )
+        with pytest.raises(ValueError, match='open discovery range'):
+            source_store_module.missing_runs(connection, opened.obligation_id)
+
+
+def test_page_cap_during_pause_keeps_capacity_condition_and_returns_after(tmp_path: Path) -> None:
+    with _open_source(
+        tmp_path / 'source.db', max_open_ranges=1, max_range_query_pages=1
+    ) as source:
+        source.initialize(100, incarnation='incarnation-1')
+        opened = open_source_range(source, 101, 105, successful_clock=1)
+        assert source.commit_observations((108,), successful_clock=2).pause is not None
+        source.begin_range_scan(opened.obligation_id, successful_clock=3)
+        source.record_range_scan_page(
+            opened.obligation_id, scanned_through=101, event_ids=(101,), successful_clock=3
+        )
+        assert stored_range_details(source, opened.obligation_id).degraded
+        assert source.snapshot().conditions == ('range-capacity-exhausted',)
+        source.end_capacity_pause()
+        assert source.snapshot().conditions == ('range-query-page-cap',)
 
 
 def test_poll_state_reads_only_source_meta(tmp_path: Path) -> None:
@@ -196,19 +253,17 @@ def test_poll_state_reads_only_source_meta(tmp_path: Path) -> None:
     assert all('source_meta' in statement.lower() for statement in statements)
 
 
-def test_range_capacity_halts_before_frontier_or_evidence_eviction(tmp_path: Path) -> None:
+def test_range_capacity_pauses_before_frontier_or_evidence_eviction(tmp_path: Path) -> None:
     path = tmp_path / 'source.db'
     with _open_source(
         path,
         max_open_ranges=1,
-        token_factory=_token_sequence('range-1', 'range-2'),
     ) as state:
         state.initialize(100, incarnation='incarnation-1')
         open_source_range(state, 101, 101, successful_clock=1.0)
         before = state.snapshot()
 
-        with pytest.raises(SourceCapacityError, match='range-capacity-exhausted'):
-            state.commit_observations((104,), successful_clock=2.0)
+        assert state.commit_observations((104,), successful_clock=2.0).pause is not None
 
         after = state.snapshot()
         assert after.frontier == before.frontier
@@ -221,8 +276,7 @@ def test_range_for_reads_only_one_range_projection(tmp_path: Path) -> None:
     with _open_source(
         tmp_path / 'source.db',
         groups={'editorial': 7},
-        token_factory=_token_sequence('range-1', 'range-2'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         open_source_range(source, 101, 102, successful_clock=1.0)
@@ -237,24 +291,19 @@ def test_range_for_reads_only_one_range_projection(tmp_path: Path) -> None:
         connection.set_trace_callback(statements.append)
 
         retained = source_store_module.range_for(connection, 'range-101-102')
+        stored = stored_range_details(source, 'range-101-102')
 
     assert retained == source_store_module.DiscoveryRange(
         obligation_id='range-101-102',
         low_id=101,
         high_id=102,
         opened_successful_at=1.0,
-        _visibility_deadline=11.0,
-        _revision=2,
-        _close_generation=0,
         state='open',
-        late_ids=(101,),
-        group_eligibility=(('editorial', 1.0),),
-        _scan_started_at=2.0,
+        late_id_count=1,
         scan_next_id=102,
-        _scan_pages=0,
-        _degraded=False,
         scan_cycle_pages=0,
     )
+    assert stored == (11.0, 2, 0, 2.0, 0, False)
     touched = {
         table
         for table in (
@@ -266,44 +315,7 @@ def test_range_for_reads_only_one_range_projection(tmp_path: Path) -> None:
         )
         if any(table in statement.lower() for statement in statements)
     }
-    assert touched == {'discovery_ranges', 'range_groups', 'source_late_ids'}
-
-
-def test_range_merge_uses_intervals_and_never_shortens_frozen_times(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / 'source.db'
-    with _open_source(
-        path,
-        group_holdbacks={'editorial': 500.0, 'render': 20.0},
-        token_factory=_token_sequence('open-token', 'merge-token'),
-        visibility_overlap_secs=300.0,
-    ) as state:
-        state.initialize(100, incarnation='incarnation-1')
-        open_source_range(state, 101, 199, successful_clock=10.0)
-
-    with _open_source(
-        path,
-        group_holdbacks={'editorial': 1.0, 'render': 1.0},
-        token_factory=_token_sequence('merge-token'),
-        visibility_overlap_secs=1.0,
-    ) as reopened:
-        mutation = source_store_module.stage_open_range(
-            reopened._database.connection,
-            reopened._settings,
-            low_id=150,
-            high_id=250,
-            successful_clock=20.0,
-            new_token=lambda: 'merge-token',
-        )
-        merged = reopened.snapshot().ranges[0]
-
-        assert (merged.low_id, merged.high_id) == (101, 250)
-        assert merged.opened_successful_at == 10.0
-        assert merged._visibility_deadline == 310.0
-        assert merged.group_eligibility == (('editorial', 510.0), ('render', 30.0))
-        assert merged._revision == 2
-        assert mutation.revision == 2
+    assert touched == {'discovery_ranges', 'source_late_ids'}
 
 
 def test_range_page_cap_survives_other_range_completion(tmp_path: Path) -> None:
@@ -312,8 +324,7 @@ def test_range_page_cap_survives_other_range_completion(tmp_path: Path) -> None:
         path,
         groups={'editorial': 7},
         max_range_query_pages=1,
-        token_factory=_token_sequence('open-1', 'open-2', 'close-1', 'close-2'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as state:
         state.initialize(100, incarnation='incarnation-1')
         first_id = open_source_range(state, 101, 103, successful_clock=1.0).obligation_id
@@ -338,7 +349,7 @@ def test_range_page_cap_survives_other_range_completion(tmp_path: Path) -> None:
         ranges = {item.obligation_id: item for item in state.snapshot().ranges}
         assert ranges[first_id].state == 'closed'
         assert ranges[second_id].state == 'open'
-        assert ranges[second_id]._degraded
+        assert stored_range_details(state, second_id).degraded
         assert state.snapshot().conditions == ('range-query-page-cap',)
 
         state.begin_range_scan(second_id, successful_clock=13.0)
@@ -357,8 +368,7 @@ def test_range_page_cap_survives_unrelated_capacity_progress(tmp_path: Path) -> 
         path,
         groups={'editorial': 7},
         max_range_query_pages=1,
-        token_factory=_token_sequence('open-1'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as state:
         state.initialize(100, incarnation='incarnation-1')
         capped_id = open_source_range(state, 101, 103, successful_clock=1.0).obligation_id
@@ -375,8 +385,39 @@ def test_range_page_cap_survives_unrelated_capacity_progress(tmp_path: Path) -> 
 
         capped = next(item for item in state.snapshot().ranges if item.obligation_id == capped_id)
         assert capped.state == 'open'
-        assert capped._degraded
+        assert stored_range_details(state, capped_id).degraded
         assert state.snapshot().conditions == ('range-query-page-cap',)
+
+
+def test_range_staging_rejects_overlap_with_open_range(tmp_path: Path) -> None:
+    # Prevents a merge from deleting late-id marks written while a range is open.
+    queries = (
+        'SELECT * FROM discovery_ranges ORDER BY obligation_id',
+        'SELECT * FROM range_groups ORDER BY obligation_id, group_name',
+        'SELECT * FROM source_late_ids ORDER BY obligation_id, event_id',
+        'SELECT * FROM late_ids ORDER BY group_name, obligation_id, event_id',
+    )
+    with _open_source(tmp_path / 'source.db') as state:
+        state.initialize(100, incarnation='incarnation-1')
+        retained = open_source_range(state, 101, 199, successful_clock=10.0)
+        connection = state._database.connection
+        connection.execute(
+            'INSERT INTO late_ids (group_name, obligation_id, event_id, terminal_state) '
+            "VALUES ('editorial', ?, 150, 'done')",
+            (retained.obligation_id,),
+        )
+        before = [connection.execute(query).fetchall() for query in queries]
+        with pytest.raises(RuntimeError, match='open range overlaps an existing open range'):
+            source_store_module.stage_open_range(
+                connection,
+                state._settings,
+                low_id=150,
+                high_id=250,
+                successful_clock=20.0,
+            )
+        after = [connection.execute(query).fetchall() for query in queries]
+
+    assert after == before
 
 
 def test_restored_stream_identity_preserves_same_stream_evidence(tmp_path: Path) -> None:
@@ -388,7 +429,6 @@ def test_restored_stream_identity_preserves_same_stream_evidence(tmp_path: Path)
     )
     with _open_source(
         path,
-        token_factory=_token_sequence('range-token'),
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         source.record_successful_query(7.5)
@@ -448,36 +488,6 @@ def test_snapshot_rejects_unknown_persisted_source_condition(tmp_path: Path) -> 
             state.snapshot()
 
 
-def test_source_schema_contains_no_event_body_or_payload_column(tmp_path: Path) -> None:
-    path = tmp_path / 'source.db'
-    with _open_source(path) as state:
-        state.initialize(0, incarnation='incarnation-1')
-    connection = sqlite3.connect(path)
-    try:
-        tables = tuple(
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-            )
-        )
-        columns = tuple(
-            (table, str(row[1]))
-            for table in tables
-            for row in connection.execute(f'PRAGMA table_info({table})')
-        )
-    finally:
-        connection.close()
-
-    forbidden = ('body', 'event_json', 'payload')
-    assert not any(
-        fragment in column.lower() for _table, column in columns for fragment in forbidden
-    )
-    assert {'groups', 'group_state', 'source_meta'} <= set(tables)
-    assert {'group_generation', 'ordering_mode', 'verified_incarnation', 'lifecycle'} <= {
-        column for table, column in columns if table == 'groups'
-    }
-
-
 def test_successful_query_clock_never_moves_backward(
     tmp_path: Path,
 ) -> None:
@@ -501,8 +511,7 @@ def test_unfinished_range_scan_persists_logical_and_cycle_budget(
         path,
         groups={'editorial': 7},
         max_range_query_pages=2,
-        token_factory=_token_sequence('open'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as state:
         state.initialize(100, incarnation='incarnation-1')
         obligation_id = open_source_range(state, 101, 107, successful_clock=1.0).obligation_id
@@ -515,22 +524,22 @@ def test_unfinished_range_scan_persists_logical_and_cycle_budget(
         )
         first_page = state.snapshot().ranges[0]
         assert first_page.scan_next_id == 103
-        assert first_page._scan_pages == 1
+        assert stored_range_details(state, obligation_id).scan_pages == 1
         assert first_page.scan_cycle_pages == 1
-        assert not first_page._degraded
+        assert not stored_range_details(state, obligation_id).degraded
 
     with _open_source(path, max_range_query_pages=2) as state:
         reopened = state.snapshot().ranges[0]
         assert reopened.scan_next_id == 103
-        assert reopened._scan_pages == 1
+        assert stored_range_details(state, obligation_id).scan_pages == 1
         assert reopened.scan_cycle_pages == 1
-        assert not reopened._degraded
+        assert not stored_range_details(state, obligation_id).degraded
 
         resumed = state.begin_range_scan(obligation_id, successful_clock=12.0)
         assert resumed.scan_next_id == 103
-        assert resumed._scan_pages == 1
+        assert stored_range_details(state, obligation_id).scan_pages == 1
         assert resumed.scan_cycle_pages == 1
-        assert not resumed._degraded
+        assert not stored_range_details(state, obligation_id).degraded
         state.record_range_scan_page(
             obligation_id,
             scanned_through=104,
@@ -539,24 +548,24 @@ def test_unfinished_range_scan_persists_logical_and_cycle_budget(
         )
         capped = state.snapshot().ranges[0]
         assert capped.scan_next_id == 105
-        assert capped._scan_pages == 2
+        assert stored_range_details(state, obligation_id).scan_pages == 2
         assert capped.scan_cycle_pages == 2
-        assert capped._degraded
+        assert stored_range_details(state, obligation_id).degraded
         assert state.snapshot().conditions == ('range-query-page-cap',)
 
     with _open_source(path, max_range_query_pages=2) as state:
         reopened = state.snapshot().ranges[0]
         assert reopened.scan_next_id == 105
-        assert reopened._scan_pages == 2
+        assert stored_range_details(state, obligation_id).scan_pages == 2
         assert reopened.scan_cycle_pages == 2
-        assert reopened._degraded
+        assert stored_range_details(state, obligation_id).degraded
         assert state.snapshot().conditions == ('range-query-page-cap',)
 
         next_cycle = state.begin_range_scan(obligation_id, successful_clock=13.0)
         assert next_cycle.scan_next_id == 105
-        assert next_cycle._scan_pages == 2
+        assert stored_range_details(state, obligation_id).scan_pages == 2
         assert next_cycle.scan_cycle_pages == 0
-        assert next_cycle._degraded
+        assert stored_range_details(state, obligation_id).degraded
         assert state.snapshot().conditions == ('range-query-page-cap',)
         closed = state.record_range_scan_page(
             obligation_id,
@@ -567,5 +576,5 @@ def test_unfinished_range_scan_persists_logical_and_cycle_budget(
         assert closed.range_changed
         completed = state.snapshot().ranges[0]
         assert completed.state == 'closed'
-        assert not completed._degraded
+        assert not stored_range_details(state, obligation_id).degraded
         assert state.snapshot().conditions == ()

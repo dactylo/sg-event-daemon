@@ -5,7 +5,6 @@ import re
 import signal
 import subprocess
 import sys
-import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, Protocol, TypeVar
@@ -13,9 +12,6 @@ from unittest import mock
 
 from sg_event_daemon._cli import main
 
-# Hang guard, not a performance assertion. Allow for scheduling on shared CI hosts.
-CHILD_TIMEOUT_SECONDS = 300
-_COLLECT_AFTER_KILL_SECONDS = 10
 _CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
 _ENV = {**os.environ, 'PYTHON_COLORS': '0'}
 _TRANSCRIPT_FIELD_CHARACTERS = 2048
@@ -63,13 +59,6 @@ def _exit_status(error: SystemExit) -> int:
     if code is None:
         return 0
     return code if isinstance(code, int) else 1
-
-
-def _terminate_tree(process: subprocess.Popen[_Output]) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(process.pid, signal.SIGKILL)
-    with contextlib.suppress(OSError):
-        process.kill()
 
 
 def _transcript_field(label: str, value: object) -> str:
@@ -149,37 +138,12 @@ def process_transcript(
     return '\n'.join(lines)
 
 
-def _kill_and_describe(
-    process: subprocess.Popen[_Output],
-    *,
-    cwd: Path | str | None,
-    reason: str,
-) -> str:
-    _terminate_tree(process)
-    try:
-        stdout, stderr = process.communicate(timeout=_COLLECT_AFTER_KILL_SECONDS)
-    except subprocess.TimeoutExpired:
-        stdout = stderr = None
-        reason = f'{reason}; a descendant outside the process group still holds the output pipes'
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=_COLLECT_AFTER_KILL_SECONDS)
-    killed = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-    return process_transcript(killed, cwd=cwd, note=reason)
-
-
-def finish_process(
+def _finish_process(
     process: subprocess.Popen[_Output],
     *,
     stdin: _Output | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
-    cwd: Path | str | None = None,
 ) -> subprocess.CompletedProcess[_Output]:
-    try:
-        stdout, stderr = process.communicate(stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise AssertionError(
-            _kill_and_describe(process, cwd=cwd, reason=f'timed out after {timeout:g} s')
-        ) from None
+    stdout, stderr = process.communicate(stdin)
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
@@ -202,45 +166,10 @@ def run_cli(
         cwd=cwd,
         start_new_session=True,
     )
-    result = finish_process(process, stdin=stdin, cwd=cwd)
+    result = _finish_process(process, stdin=stdin)
     if expect is not None and result.returncode != expect:
         raise AssertionError(f'expected status {expect}\n{process_transcript(result, cwd=cwd)}')
     return result
-
-
-def run_closing_after_first_line(
-    argv: Sequence[str],
-    *,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
-) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.Popen(
-        [sys.executable, '-m', 'sg_event_daemon', *argv],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_ENV,
-        start_new_session=True,
-    )
-    stdout = process.stdout
-    assert stdout is not None
-    descriptor = stdout.fileno()
-
-    def read_first_line() -> None:
-        while True:
-            chunk = os.read(descriptor, 65536)
-            if not chunk or b'\n' in chunk:
-                return
-
-    reader = threading.Thread(target=read_first_line, daemon=True)
-    reader.start()
-    reader.join(timeout)
-    if reader.is_alive():
-        raise AssertionError(
-            _kill_and_describe(process, cwd=None, reason=f'no stdout line within {timeout:g} s')
-        )
-    stdout.close()
-    process.stdout = None  # communicate() must not read the closed pipe on Windows
-    return finish_process(process, timeout=timeout)
 
 
 def run_setup(
@@ -260,7 +189,7 @@ def run_setup(
         cwd=cwd,
         start_new_session=True,
     )
-    result = finish_process(process, stdin=stdin, cwd=cwd)
+    result = _finish_process(process, stdin=stdin)
     if check and result.returncode != 0:
         raise AssertionError(f'setup command failed\n{process_transcript(result, cwd=cwd)}')
     return result
@@ -272,7 +201,6 @@ def run_with_closed_output(
     closed: Literal['stdout', 'stderr'] = 'stdout',
     stdin: bytes | None = None,
     env: Mapping[str, str] | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[bytes]:
     read_fd, write_fd = os.pipe()
     os.close(read_fd)  # every write to the closed stream happens after its reader closed
@@ -287,4 +215,4 @@ def run_with_closed_output(
         )
     finally:
         os.close(write_fd)
-    return finish_process(process, stdin=stdin, timeout=timeout)
+    return _finish_process(process, stdin=stdin)

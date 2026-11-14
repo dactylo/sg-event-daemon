@@ -6,7 +6,7 @@ import traceback
 from contextlib import suppress
 from typing import TYPE_CHECKING, Unpack
 
-from sg_event_daemon._worker import WorkerRuntime
+from sg_event_daemon._worker import _WorkerRuntime
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -43,11 +43,11 @@ class _RuntimeDiagnostics:
                     with destination.open('ab', buffering=0) as stream:
                         self._write(stream.fileno(), text, stacks=stacks)
 
-    def _record_exception(self, error: BaseException) -> None:
+    def record_exception(self, error: BaseException) -> None:
         self._exception = ''.join(traceback.format_exception(error))
         self._emit('runtime initiating exception:\n' + self._exception)
 
-    def _record_exit(self, runtime: WorkerRuntime, code: int) -> None:
+    def record_exit(self, runtime: _WorkerRuntime, code: int) -> None:
         # Avoid runtime/cache accessors: a retained owner may hold their locks.
         try:
             owners = runtime._threads.copy()
@@ -84,11 +84,11 @@ class _RuntimeDiagnostics:
 def install_runtime_diagnostics(
     monkeypatch: pytest.MonkeyPatch, destination: Path, stderr_fd: int
 ) -> None:
-    initialize = WorkerRuntime.__init__
+    initialize = _WorkerRuntime.__init__
     hard_exit = os._exit
 
     def initialize_with_diagnostics(
-        runtime: WorkerRuntime, **options: Unpack[_WorkerRuntimeOptions]
+        runtime: _WorkerRuntime, **options: Unpack[_WorkerRuntimeOptions]
     ) -> None:
         if 'force_exit' in options:
             initialize(runtime, **options)
@@ -97,7 +97,7 @@ def install_runtime_diagnostics(
 
         def force_exit(code: int) -> None:
             try:
-                diagnostics._record_exit(runtime, code)
+                diagnostics.record_exit(runtime, code)
             finally:
                 hard_exit(code)
 
@@ -105,14 +105,14 @@ def install_runtime_diagnostics(
         initialize(runtime, **options)
         vars(runtime)['_test_runtime_diagnostics'] = diagnostics
 
-    monkeypatch.setattr(WorkerRuntime, '__init__', initialize_with_diagnostics)
+    monkeypatch.setattr(_WorkerRuntime, '__init__', initialize_with_diagnostics)
 
 
-def record_runtime_exception(runtime: WorkerRuntime | None, error: BaseException | None) -> None:
+def record_runtime_exception(runtime: _WorkerRuntime | None, error: BaseException | None) -> None:
     if runtime is None or error is None:
         return
     diagnostics = vars(runtime).get('_test_runtime_diagnostics')
     if isinstance(diagnostics, _RuntimeDiagnostics):
         # Diagnostic failures must preserve the initiating test exception.
         with suppress(Exception):
-            diagnostics._record_exception(error)
+            diagnostics.record_exception(error)

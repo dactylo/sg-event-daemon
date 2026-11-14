@@ -11,6 +11,8 @@ from datetime import date, datetime
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
+from ._json import decode_json
+
 EVENT_FIELDS = (
     'id',
     'event_type',
@@ -66,7 +68,11 @@ class Event(Mapping[str, object]):
         return NotImplemented
 
     def __getitem__(self, key: str) -> object:
-        """Return one recursively immutable provider value."""
+        """Return one recursively immutable provider value.
+
+        Raises:
+            KeyError: The event has no field with the requested name.
+        """
         return self._payload[key]
 
     def __iter__(self) -> Iterator[str]:
@@ -271,48 +277,11 @@ def _freeze(value: object) -> object:
     raise _EventEncodingError(f'unsupported event value type: {type(value).__name__}')
 
 
-def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    """Build a JSON object while rejecting duplicate keys."""
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise _EventEncodingError(f'JSON object has duplicate key: {key}')
-        value[key] = item
-    return value
-
-
-def _matches_attributes(attributes: tuple[str, ...] | None, attribute_name: object) -> bool:
-    """Return whether one applicable filter clause matches an attribute."""
-    if attributes is None or '*' in attributes:
-        return True
-    return (
-        isinstance(attribute_name, str) and bool(attribute_name) and attribute_name in attributes
-    )
-
-
-def _reject_json_constant(value: str) -> object:
-    """Reject non-finite JSON number constants."""
-    raise _EventEncodingError(f'JSON number must be finite: {value}')
-
-
 def _load_envelope(frame: bytes) -> dict[str, object]:
     """Load and validate one strict wire envelope."""
     try:
-        text = frame.decode('utf-8', errors='strict')
-    except UnicodeDecodeError as error:
-        raise _EventEncodingError('event frame must be strict UTF-8') from error
-    try:
-        raw = cast(
-            'object',
-            json.loads(
-                text,
-                object_pairs_hook=_json_object,
-                parse_constant=_reject_json_constant,
-            ),
-        )
-    except _EventEncodingError:
-        raise
-    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raw = decode_json(frame)
+    except ValueError as error:
         raise _EventEncodingError(f'invalid event JSON: {error}') from error
     if not isinstance(raw, dict):
         raise _EventEncodingError('event frame has an invalid envelope')
@@ -325,6 +294,15 @@ def _load_envelope(frame: bytes) -> dict[str, object]:
     if isinstance(version, bool) or not isinstance(version, int) or version != _CODEC_VERSION:
         raise _EventEncodingError('event frame has an unsupported version')
     return envelope
+
+
+def _matches_attributes(attributes: tuple[str, ...] | None, attribute_name: object) -> bool:
+    """Return whether one applicable filter clause matches an attribute."""
+    if attributes is None or '*' in attributes:
+        return True
+    return (
+        isinstance(attribute_name, str) and bool(attribute_name) and attribute_name in attributes
+    )
 
 
 def decode_event(frame: bytes) -> Event:

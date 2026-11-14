@@ -260,6 +260,57 @@ def test_group_rows_require_a_known_lifecycle_and_group(database: DatabaseHandle
         )
 
 
+def test_group_schema_initializes_checked_operational_late_id_count(
+    database: DatabaseHandle,
+) -> None:
+    connection = database.connection
+    _seed(connection)
+    assert connection.execute(
+        "SELECT operational_late_id_count FROM group_state WHERE group_name = 'g'"
+    ).fetchone() == (0,)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE group_state SET operational_late_id_count = -1 WHERE group_name = 'g'"
+        )
+
+
+def test_group_schema_keys_operational_tables_by_group_name(database: DatabaseHandle) -> None:
+    connection = database.connection
+    for table in (
+        'groups',
+        'group_state',
+        'callback_marks',
+        'late_ids',
+        'epochs',
+        'join_commits',
+        'audit',
+        'conditional_park_results',
+    ):
+        columns = connection.execute(f'PRAGMA table_info({table})').fetchall()
+        indexes = connection.execute(f'PRAGMA index_list({table})').fetchall()
+        for index in indexes:
+            if index[4]:
+                assert (
+                    connection.execute(f'PRAGMA index_info({index[1]})').fetchone()[2]
+                    == 'group_name'
+                )
+        assert 'group_name' in {column[1] for column in columns}, table
+        if table != 'groups':
+            assert next(column[3] for column in columns if column[1] == 'group_name') == 1
+        primary_key = [
+            column[1] for column in sorted(columns, key=lambda row: row[5]) if column[5]
+        ]
+        if table in {'epochs', 'audit'}:
+            id_column = 'epoch_id' if table == 'epochs' else 'audit_id'
+            assert primary_key == [id_column]
+            assert ['group_name', id_column] in [
+                [row[2] for row in connection.execute(f'PRAGMA index_info({index[1]})')]
+                for index in indexes
+            ]
+        else:
+            assert primary_key[0] == 'group_name', table
+
+
 def test_group_state_rejects_null_group_name(database: DatabaseHandle) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         database.connection.execute(

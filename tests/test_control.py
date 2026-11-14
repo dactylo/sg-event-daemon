@@ -3,12 +3,13 @@ from __future__ import annotations
 import errno
 import json
 import os
+import select
 import socket
 import stat
 import struct
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock
 
@@ -21,16 +22,19 @@ from sg_event_daemon._control import (
     _MAX_MESSAGE_BYTES,
     _PROTOCOL_VERSION,
     ControlClient,
+    ControlOutcomeUnknownError,
     ControlProtocolError,
     ControlRequest,
     ControlServer,
     ControlUnavailableError,
-    _control_socket_path,
+    control_socket_path,
     encode_json_body,
 )
+from sg_event_daemon._logging import SENSITIVE_NAMES
 from sg_event_daemon._platform import PeerIdentity, SecurityError
 from sg_event_daemon._probe import ProbeServer, ProbeSnapshot, SupervisorProgress
 from sg_event_daemon._supervisor import Supervisor
+from tests._stall_policy import StallDetectors, stall_deadline
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -44,7 +48,7 @@ class _FrameSocket:
         self._chunks = iter(chunks)
         self._response_timeout = response_timeout
         self._timeout: float | None = response_timeout
-        self._sent = bytearray()
+        self.sent = bytearray()
 
     def gettimeout(self) -> float | None:
         return self._timeout
@@ -57,7 +61,7 @@ class _FrameSocket:
     def sendall(self, data: bytes) -> None:
         if self._timeout != self._response_timeout:
             raise TimeoutError('response inherited the residual read timeout')
-        self._sent.extend(data)
+        self.sent.extend(data)
 
     def settimeout(self, timeout: float | None) -> None:
         self._timeout = timeout
@@ -75,8 +79,8 @@ class _ScriptedClientSocket:
         self._now = 10.0
         self._recv_count = 0
         self._timeout: float | None = None
-        self._operations: list[tuple[str, float]] = []
-        self._timeouts: list[float | None] = []
+        self.operations: list[tuple[str, float]] = []
+        self.timeouts: list[float | None] = []
 
     def __enter__(self) -> Self:
         return self
@@ -93,7 +97,7 @@ class _ScriptedClientSocket:
         timeout = self._timeout
         if timeout is None or timeout <= 0:
             raise AssertionError(f'{operation} ran without a positive timeout')
-        self._operations.append((operation, timeout))
+        self.operations.append((operation, timeout))
         self._now += next(self._elapsed_by_operation)
 
     def connect(self, _path: str) -> None:
@@ -120,7 +124,17 @@ class _ScriptedClientSocket:
 
     def settimeout(self, timeout: float | None) -> None:
         self._timeout = timeout
-        self._timeouts.append(timeout)
+        self.timeouts.append(timeout)
+
+
+class _TransportSocket(socket.socket):
+    def accept(self) -> tuple[_TransportSocket, object]:
+        peer, address = super().accept()
+        return _TransportSocket(fileno=peer.detach()), address
+
+    def settimeout(self, timeout: float | None) -> None:
+        # Ordinary integration waits have no timer. Zero still tests nonblocking I/O.
+        super().settimeout(0.0 if timeout == 0 else None)
 
 
 def _frozen_probe_supervisor(
@@ -153,7 +167,7 @@ def _frozen_probe_supervisor(
 
     def frozen_probe_mapping() -> Mapping[str, object]:
         handler_entered.set()
-        if not release_handler.wait(2.0):
+        if not release_handler.wait():
             raise TimeoutError('test did not release frozen probe handler')
         return real_probe_mapping()
 
@@ -167,8 +181,8 @@ def _mode(path: Path) -> int:
 
 def _probe_http_response(probe: ProbeServer) -> bytes:
     listener = cast('socket.socket', vars(probe)['_listener'])
-    with socket.create_connection(listener.getsockname(), timeout=1.0) as client:
-        client.settimeout(1.0)
+    with socket.create_connection(listener.getsockname()) as client:
+        client.settimeout(None)
         client.sendall(b'GET /livez HTTP/1.1\r\n\r\n')
         response = bytearray()
         while chunk := client.recv(4_096):
@@ -204,14 +218,52 @@ def _request_probe(
 
 
 def _run_server(server: ControlServer, stop: threading.Event) -> None:
-    while not stop.is_set():
-        server.serve_once(0.1)
+    reader, writer = socket.socketpair()
+
+    def wake() -> None:
+        stop.wait()
+        writer.sendall(b'x')
+
+    watcher = threading.Thread(target=wake)
+    watcher.start()
+    try:
+        listener = server._listener
+        assert listener is not None
+        while not stop.is_set():
+            readable, _writable, _exceptional = select.select((listener, reader), (), ())
+            if reader in readable:
+                return
+            server.serve_once(0.0)
+    finally:
+        stop.set()
+        watcher.join()
+        reader.close()
+        writer.close()
+
+
+def _serve_request(server: ControlServer) -> None:
+    while not server.serve_once(0.0):
+        listener = server._listener
+        assert listener is not None
+        select.select((listener,), (), ())
 
 
 def _standalone_socket_path(tmp_path: Path) -> Path:
-    path = _control_socket_path(tmp_path)
+    path = control_socket_path(tmp_path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
+
+
+@pytest.fixture(autouse=True)
+def _untimed_control_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(control_module, 'time', SimpleNamespace(monotonic=lambda: 10.0))
+    monkeypatch.setattr(
+        control_module,
+        'socket',
+        SimpleNamespace(
+            socket=_TransportSocket, AF_UNIX=socket.AF_UNIX, SOCK_STREAM=socket.SOCK_STREAM
+        ),
+    )
 
 
 @pytest.fixture
@@ -237,7 +289,7 @@ def running_server(tmp_path: Path) -> Iterator[tuple[ControlServer, Path]]:
         finally:
             stop.set()
             if thread.ident is not None:
-                thread.join(2)
+                thread.join()
                 assert not thread.is_alive()
 
 
@@ -246,7 +298,7 @@ def test_client_correlates_response_request_id(tmp_path: Path) -> None:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(os.fspath(path))
     listener.listen()
-    listener.settimeout(1.0)
+    listener.settimeout(None)
 
     def reply_with_wrong_id() -> None:
         try:
@@ -254,8 +306,8 @@ def test_client_correlates_response_request_id(tmp_path: Path) -> None:
         except TimeoutError:
             return
         with peer:
-            peer.settimeout(1.0)
-            control_module._read_frame(peer, deadline_at=time.monotonic() + 1.0)
+            peer.settimeout(None)
+            control_module._read_frame(peer)
             body = json.dumps(
                 {
                     'version': _PROTOCOL_VERSION,
@@ -275,7 +327,7 @@ def test_client_correlates_response_request_id(tmp_path: Path) -> None:
                 ControlClient(path).request('status', request_id='expected-id')
         finally:
             try:
-                response.result(timeout=3.0)
+                response.result()
             finally:
                 listener.close()
                 path.unlink(missing_ok=True)
@@ -334,13 +386,13 @@ def test_client_authenticates_peer_before_sending_request(
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(os.fspath(path))
         listener.listen()
-        listener.settimeout(1.0)
+        listener.settimeout(None)
         try:
             with pytest.raises(SecurityError, match='peer'):
                 ControlClient(path).request('status', {'reason': 'private operator text'})
             peer, _address = listener.accept()
             with peer:
-                peer.settimeout(1.0)
+                peer.settimeout(None)
                 assert peer.recv(1) == b''
             assert path.exists()
         finally:
@@ -403,7 +455,7 @@ def test_client_reports_eof_before_response(tmp_path: Path) -> None:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(os.fspath(path))
     listener.listen()
-    listener.settimeout(1.0)
+    listener.settimeout(None)
 
     def close_without_reply() -> None:
         try:
@@ -411,8 +463,8 @@ def test_client_reports_eof_before_response(tmp_path: Path) -> None:
         except TimeoutError:
             return
         with peer:
-            peer.settimeout(1.0)
-            control_module._read_frame(peer, deadline_at=time.monotonic() + 1.0)
+            peer.settimeout(None)
+            control_module._read_frame(peer)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         response = executor.submit(close_without_reply)
@@ -421,7 +473,7 @@ def test_client_reports_eof_before_response(tmp_path: Path) -> None:
                 ControlClient(path).request('status')
         finally:
             try:
-                response.result(timeout=3.0)
+                response.result()
             finally:
                 listener.close()
                 path.unlink(missing_ok=True)
@@ -436,7 +488,13 @@ def test_client_reports_missing_parent_without_creating_it(tmp_path: Path) -> No
     assert not parent.exists()
 
 
-def test_client_request_shares_one_deadline_across_socket_phases(
+@pytest.mark.parametrize(
+    ('response_timeout', 'expected_response_timeouts'),
+    [(None, (3.0, 2.0)), (600.0, (600.0, 599.0))],
+)
+def test_client_request_budgets_connect_send_and_response(
+    response_timeout: float | None,
+    expected_response_timeouts: tuple[float, float],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -458,7 +516,8 @@ def test_client_request_shares_one_deadline_across_socket_phases(
         Mock(return_value=PeerIdentity(uid=os.geteuid(), gid=os.getegid(), pid=os.getpid())),
     )
 
-    client = ControlClient(tmp_path / 'control.sock', timeout=5.0)
+    _standalone_socket_path(tmp_path)
+    client = ControlClient.for_state_dir(tmp_path, timeout=5.0, response_timeout=response_timeout)
 
     assert (
         client.request(
@@ -468,13 +527,13 @@ def test_client_request_shares_one_deadline_across_socket_phases(
         )
         == {}
     )
-    assert sock._operations == [
+    assert sock.operations == [
         ('connect', 5.0),
         ('sendall', 4.0),
-        ('recv-prefix', 3.0),
-        ('recv-body', 2.0),
+        ('recv-prefix', expected_response_timeouts[0]),
+        ('recv-body', expected_response_timeouts[1]),
     ]
-    assert sock._timeouts == [5.0, 4.0, 3.0, 2.0, 4.0]
+    assert sock.timeouts == [5.0, 4.0, *expected_response_timeouts, 4.0]
 
 
 @pytest.mark.parametrize(
@@ -554,34 +613,29 @@ def test_client_request_timeout_exhausts_after_each_socket_phase(
     assert str(caught.value) == 'control request timed out'
     assert isinstance(caught.value.__cause__, TimeoutError)
     assert str(caught.value.__cause__) == 'control peer exceeded the request deadline'
-    assert sock._operations == expected_operations
-    assert sock._timeouts == expected_timeouts
+    assert sock.operations == expected_operations
+    assert sock.timeouts == expected_timeouts
 
 
-def test_client_times_out_waiting_for_response(tmp_path: Path) -> None:
-    state_dir = tmp_path / 'state'
-    release = threading.Event()
+def test_client_times_out_waiting_for_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sock = _ScriptedClientSocket([], elapsed_by_operation=(0.0, 0.0, 5.0))
+    monkeypatch.setattr(control_module, 'time', SimpleNamespace(monotonic=sock.monotonic))
 
-    def handler(
-        _request: ControlRequest,
-        _identity: PeerIdentity,
-    ) -> Mapping[str, object]:
-        release.wait(1)
-        return {}
+    def socket_factory(*_args: object) -> _ScriptedClientSocket:
+        return sock
 
-    stop = threading.Event()
-    with ControlServer(state_dir, handler) as server:
-        thread = threading.Thread(target=_run_server, args=(server, stop))
-        try:
-            thread.start()
-            with pytest.raises(ControlUnavailableError, match='timed out'):
-                ControlClient.for_state_dir(state_dir, timeout=0.01).request('status')
-        finally:
-            release.set()
-            stop.set()
-            if thread.ident is not None:
-                thread.join(2)
-                assert not thread.is_alive()
+    def authenticate(_sock: object) -> None:
+        pass
+
+    monkeypatch.setattr(control_module.socket, 'socket', socket_factory)
+    monkeypatch.setattr(control_module, '_authenticate_peer', authenticate)
+
+    with pytest.raises(ControlUnavailableError, match='timed out'):
+        ControlClient(tmp_path / 'control.sock').request('status')
+    assert sock.operations == [('connect', 5.0), ('sendall', 5.0), ('recv-prefix', 5.0)]
 
 
 def test_concurrent_status_clients_receive_correlated_results(
@@ -604,11 +658,29 @@ def test_concurrent_status_clients_receive_correlated_results(
     first.start()
     second.start()
     barrier.wait()
-    first.join(2)
-    second.join(2)
+    first.join()
+    second.join()
 
     assert results['first']['arguments'] == {'site': 'first'}
     assert results['second']['arguments'] == {'site': 'second'}
+
+
+def test_control_server_stale_socket_probe_uses_owner_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[float] = []
+    original = control_module.local_socket_path
+
+    def path(
+        state: Path, kind: str, identity: tuple[str, ...], *, timeout_secs: float = 1.0
+    ) -> Path:
+        timeouts.append(timeout_secs)
+        return original(state, kind, identity)
+
+    monkeypatch.setattr(control_module, 'local_socket_path', path)
+    with ControlServer(tmp_path, lambda _request, _peer: {}, socket_probe_timeout_secs=0.0625):
+        pass
+    assert timeouts == [0.0625]
 
 
 def test_control_socket_path_delegates_to_platform_candidate(
@@ -629,7 +701,7 @@ def test_control_socket_path_delegates_to_platform_candidate(
 
     monkeypatch.setattr(control_module, 'local_socket_path_candidate', candidate)
 
-    assert _control_socket_path(state_dir) == sentinel
+    assert control_socket_path(state_dir) == sentinel
     assert observed == [(state_dir, 'control', ('supervisor',))]
     assert not state_dir.exists()
 
@@ -650,7 +722,9 @@ def test_probe_handler_freeze_cannot_refresh_http_liveness(tmp_path: Path) -> No
     def handle(request: ControlRequest, peer: PeerIdentity) -> Mapping[str, object]:
         return handle_request(supervisor, request, peer)
 
-    probe = ProbeServer('127.0.0.1', 0, supervisor.probe_result)
+    probe = ProbeServer(
+        '127.0.0.1', 0, supervisor.probe_result, peer_timeout_secs=stall_deadline('control', 1.0)
+    )
     client_done = threading.Event()
     client_errors: list[ControlUnavailableError] = []
     control_thread: threading.Thread | None = None
@@ -664,10 +738,10 @@ def test_probe_handler_freeze_cannot_refresh_http_liveness(tmp_path: Path) -> No
                     target=_request_probe,
                     args=(tmp_path / 'state', client_done, client_errors),
                 )
-                control_thread = threading.Thread(target=server.serve_once, args=(1.0,))
+                control_thread = threading.Thread(target=_serve_request, args=(server,))
                 client_thread.start()
                 control_thread.start()
-                assert handler_entered.wait(1.0)
+                assert handler_entered.wait()
                 assert progress_events == [0.0]
 
                 now = 0.25
@@ -676,58 +750,45 @@ def test_probe_handler_freeze_cannot_refresh_http_liveness(tmp_path: Path) -> No
                 assert response.startswith(b'HTTP/1.1 503 Service Unavailable\r\n')
                 assert response.endswith(b'unavailable\n')
                 assert progress_events == [0.0]
-                assert client_done.wait(1.0)
-                assert len(client_errors) == 1
-                assert isinstance(client_errors[0], ControlUnavailableError)
-                assert 'timed out' in str(client_errors[0])
+                release_handler.set()
+                client_done.wait()
+                assert not client_errors
             finally:
                 release_handler.set()
                 if client_thread is not None:
-                    client_thread.join(2.0)
+                    client_thread.join()
                     assert not client_thread.is_alive()
                 if control_thread is not None:
-                    control_thread.join(2.0)
+                    control_thread.join()
                     assert not control_thread.is_alive()
     finally:
         probe.close()
-        assert probe.join(timeout=2.0)
+        listener_thread = probe._thread
+        assert listener_thread is not None
+        listener_thread.join()
+        for peer_thread in tuple(probe._peer_threads):
+            peer_thread.join()
+        assert probe.join(timeout=0)
 
 
 def test_read_frame_enforces_one_request_deadline(
     monkeypatch: pytest.MonkeyPatch,
+    stall_detectors: StallDetectors,
 ) -> None:
-    body = b'{"a": 1}'
-    frame = struct.pack('!I', len(body)) + body
-    server_sock, client_sock = socket.socketpair()
-    monkeypatch.setattr(control_module, 'REQUEST_TIMEOUT_SECS', 0.2)
-    read_frame = cast('Callable[[socket.socket], bytes]', vars(control_module)['_read_frame'])
-    server_sock.settimeout(0.2)
-    stop = threading.Event()
+    stall_detectors.enable('control')
+    body = b'{"a":1}'
+    prefix = struct.pack('!I', len(body))
+    sock = _ScriptedClientSocket(
+        [prefix[:1], prefix[1:], body[:1], body[1:]],
+        elapsed_by_operation=(2.0, 2.0, 2.0, 2.0),
+    )
+    monkeypatch.setattr(control_module, 'time', SimpleNamespace(monotonic=sock.monotonic))
 
-    def drip() -> None:
-        try:
-            for byte in frame:
-                client_sock.sendall(bytes([byte]))
-                if stop.wait(0.05):
-                    return
-        except OSError:
-            return
+    with pytest.raises(TimeoutError, match='request deadline'):
+        control_module._read_frame(cast('socket.socket', sock))
 
-    thread = threading.Thread(target=drip, daemon=True)
-    started_at = time.monotonic()
-    thread.start()
-    try:
-        with pytest.raises(TimeoutError):
-            read_frame(server_sock)
-        elapsed = time.monotonic() - started_at
-    finally:
-        stop.set()
-        server_sock.close()
-        client_sock.close()
-        thread.join(1)
-
-    assert not thread.is_alive()
-    assert elapsed < 0.5
+    assert [timeout for _operation, timeout in sock.operations] == [5.0, 3.0, 1.0]
+    assert sock.gettimeout() is None
 
 
 def test_read_frame_preserves_server_relative_timeout(
@@ -744,8 +805,8 @@ def test_read_frame_preserves_server_relative_timeout(
     read_frame = control_module._read_frame
 
     assert read_frame(cast('socket.socket', sock)) == body
-    assert sock._operations == [('recv-prefix', 5.0), ('recv-body', 4.0)]
-    assert sock._timeouts == [2.0, 5.0, 4.0, 2.0]
+    assert sock.operations == [('recv-prefix', 5.0), ('recv-body', 4.0)]
+    assert sock.timeouts == [2.0, 5.0, 4.0, 2.0]
 
 
 def test_read_frame_restores_timeout_after_malformed_length(
@@ -760,7 +821,7 @@ def test_read_frame_restores_timeout_after_malformed_length(
         read_frame(cast('socket.socket', sock), deadline_at=15.0)
     sock.sendall(b'error response')
 
-    assert sock._sent == b'error response'
+    assert sock.sent == b'error response'
 
 
 def test_read_frame_restores_timeout_before_response_send(
@@ -778,12 +839,12 @@ def test_read_frame_restores_timeout_before_response_send(
     assert read_frame(cast('socket.socket', sock), deadline_at=15.0) == body
     sock.sendall(b'response')
 
-    assert sock._sent == b'response'
+    assert sock.sent == b'response'
 
 
 def test_request_accepts_internal_probe() -> None:
     request = ControlRequest(
-        _version=_PROTOCOL_VERSION,
+        version=_PROTOCOL_VERSION,
         request_id='probe-1',
         command='probe',
         arguments={},
@@ -798,7 +859,7 @@ def test_request_accepts_internal_probe() -> None:
     [
         {'event': {'id': 123, 'type': 'EventLogEntry'}},
         {'payload': b'pickle-like-binary'},
-        {'authorization': 'Bearer secret'},
+        *(pytest.param({name: 'secret'}, id=name) for name in sorted(SENSITIVE_NAMES)),
     ],
 )
 def test_requests_reject_event_bodies_pickle_and_secret_fields(
@@ -806,7 +867,7 @@ def test_requests_reject_event_bodies_pickle_and_secret_fields(
 ) -> None:
     with pytest.raises(ControlProtocolError, match='control arguments'):
         ControlRequest(
-            _version=_PROTOCOL_VERSION,
+            version=_PROTOCOL_VERSION,
             request_id='body-free',
             command='status',
             arguments=arguments,
@@ -856,7 +917,7 @@ def test_server_rejects_invalid_frame_lengths(
 ) -> None:
     server, _state_dir = running_server
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(1)
+        client.settimeout(None)
         client.connect(os.fspath(server._path))
         client.sendall(struct.pack('!I', length))
 
@@ -881,13 +942,13 @@ def test_server_rejects_peer_with_different_effective_uid(
         try:
             thread.start()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.settimeout(1.0)
+                client.settimeout(None)
                 client.connect(os.fspath(server._path))
                 assert client.recv(1) == b''
         finally:
             stop.set()
             if thread.ident is not None:
-                thread.join(2)
+                thread.join()
                 assert not thread.is_alive()
 
 
@@ -905,7 +966,7 @@ def test_server_rejects_version_mismatch(
         separators=(',', ':'),
     ).encode()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(1)
+        client.settimeout(None)
         client.connect(os.fspath(server._path))
         client.sendall(struct.pack('!I', len(body)) + body)
 
@@ -940,7 +1001,7 @@ def test_server_rejects_version_mismatch(
         ),
         pytest.param(
             b'{"version":1,"request_id":"finite","command":"status","arguments":{"value":NaN}}',
-            'finite',
+            '',
             id='non-finite-number',
         ),
     ],
@@ -964,7 +1025,7 @@ def test_server_reports_malformed_request_and_serves_next_peer(
         lambda _request, _identity: {'accepted': True},
     ) as server:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as malformed:
-            malformed.settimeout(1)
+            malformed.settimeout(None)
             malformed.connect(os.fspath(server._path))
             malformed.sendall(struct.pack('!I', len(body)) + body)
 
@@ -973,7 +1034,7 @@ def test_server_reports_malformed_request_and_serves_next_peer(
 
         valid_body = b'{"version":1,"request_id":"valid","command":"status","arguments":{}}'
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as valid:
-            valid.settimeout(1)
+            valid.settimeout(None)
             valid.connect(os.fspath(server._path))
             valid.sendall(struct.pack('!I', len(valid_body)) + valid_body)
 
@@ -1008,7 +1069,7 @@ def test_server_reports_maximum_size_malformed_request(tmp_path: Path) -> None:
         def send_request() -> None:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.settimeout(2)
+                    client.settimeout(None)
                     client.connect(os.fspath(server._path))
                     client.sendall(struct.pack('!I', len(body)) + body)
                     responses.append(_read_response(client))
@@ -1017,8 +1078,8 @@ def test_server_reports_maximum_size_malformed_request(tmp_path: Path) -> None:
 
         client = threading.Thread(target=send_request)
         client.start()
-        assert server.serve_once(1.0)
-        client.join(3)
+        _serve_request(server)
+        client.join()
 
     assert not client.is_alive()
     assert errors == []
@@ -1080,8 +1141,8 @@ def test_server_serve_once_advances_foreground_progress_at_request_boundaries(
             target=lambda: ControlClient.for_state_dir(state_dir).request('status')
         )
         client.start()
-        server.serve_once(1.0)
-        client.join(2.0)
+        _serve_request(server)
+        client.join()
 
     assert events == ['progress', 'handler', 'progress', 'progress']
 
@@ -1090,30 +1151,107 @@ def test_server_serve_once_advances_foreground_progress_at_request_boundaries(
     'payload',
     [
         pytest.param(b'', id='silent'),
-        pytest.param(struct.pack('!I', 8) + b'{', id='partial-frame'),
+        pytest.param(struct.pack('!I', 8), id='partial-frame'),
     ],
 )
 def test_server_serve_once_bounds_stalled_peer(
     monkeypatch: pytest.MonkeyPatch,
     payload: bytes,
+    stall_detectors: StallDetectors,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(control_module, 'REQUEST_TIMEOUT_SECS', 0.05)
+    stall_detectors.enable('control')
+    clock = [10.0]
+    monkeypatch.setattr(control_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    original = control_module._read_exact
+    deadlines: list[float] = []
+
+    def expire_read(sock: socket.socket, size: int, deadline_at: float) -> bytes:
+        deadlines.append(deadline_at)
+        assert deadline_at == 15.0
+        if not payload or len(deadlines) > 1:
+            clock[0] = deadline_at
+        return original(sock, size, deadline_at)
+
+    monkeypatch.setattr(control_module, '_read_exact', expire_read)
     with (
         ControlServer(tmp_path / 'state', lambda _request, _identity: {}) as server,
         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client,
     ):
-        client.settimeout(1)
+        client.settimeout(None)
         client.connect(os.fspath(server._path))
         client.sendall(payload)
-        started_at = time.monotonic()
 
         assert server.serve_once(0.0)
 
-        elapsed = time.monotonic() - started_at
         assert client.recv(1) == b''
 
-    assert 0.03 <= elapsed < 1.0
+    assert deadlines == [15.0] * (2 if payload else 1)
+
+
+@pytest.mark.parametrize('mode', ['close', 'silent', 'unaccepted'])
+def test_control_client_reports_unknown_after_send(
+    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [10.0]
+    monkeypatch.setattr(control_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    original = ControlClient._read_response
+
+    def read_response(client: ControlClient, sock: socket.socket, deadline_at: float) -> object:
+        if mode != 'close':
+            clock[0] = deadline_at
+        return original(client, sock, deadline_at)
+
+    monkeypatch.setattr(ControlClient, '_read_response', read_response)
+    path = _standalone_socket_path(tmp_path)
+    release = threading.Event()
+
+    def receive(listener: socket.socket) -> None:
+        if mode == 'unaccepted':
+            return
+        peer, _address = listener.accept()
+        with peer:
+            peer.settimeout(None)
+            control_module._read_frame(peer)
+            if mode == 'silent':
+                release.wait()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(os.fspath(path))
+        listener.listen()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            server = executor.submit(receive, listener)
+            try:
+                with pytest.raises(ControlUnavailableError) as caught:
+                    ControlClient(path, timeout=0.1).request('park')
+                assert isinstance(caught.value, ControlOutcomeUnknownError)
+            finally:
+                release.set()
+                server.result()
+                path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize('refused', [False, True])
+def test_control_client_connect_failure_is_unavailable(tmp_path: Path, refused: bool) -> None:
+    path = _standalone_socket_path(tmp_path)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        if refused:
+            listener.bind(os.fspath(path))
+        try:
+            with pytest.raises(ControlUnavailableError) as caught:
+                ControlClient(path, timeout=0.1).request('park')
+            assert type(caught.value) is ControlUnavailableError
+        finally:
+            path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    'body',
+    [b'{"command": "status", "command": "park"}', b'{"value": NaN}', b'{"value": Infinity}'],
+)
+def test_control_json_rejects_duplicate_keys_and_nonfinite_constants(body: bytes) -> None:
+    with pytest.raises(ControlProtocolError):
+        control_module._decode_json(body)
 
 
 def test_server_serve_once_dispatches_on_calling_thread(tmp_path: Path) -> None:
@@ -1134,23 +1272,35 @@ def test_server_serve_once_dispatches_on_calling_thread(tmp_path: Path) -> None:
             target=lambda: result.append(ControlClient.for_state_dir(state_dir).request('status'))
         )
         client.start()
-        server.serve_once(1.0)
-        client.join(2)
+        _serve_request(server)
+        client.join()
 
     assert result == [{'accepted': True}]
     assert handled_by == [caller]
 
 
-def test_server_serve_once_zero_is_nonblocking_without_a_peer(tmp_path: Path) -> None:
+def test_server_serve_once_zero_is_nonblocking_without_a_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with ControlServer(tmp_path / 'state', lambda _request, _identity: {}) as server:
-        started_at = time.monotonic()
+        timeouts: list[float | None] = []
+        listener = server._listener
+        assert listener is not None
+        original = _TransportSocket.settimeout
 
+        def settimeout(sock: _TransportSocket, timeout: float | None) -> None:
+            if sock is listener:
+                timeouts.append(timeout)
+                if len(timeouts) == 1:
+                    assert timeout == 0.0
+            original(sock, timeout)
+
+        monkeypatch.setattr(_TransportSocket, 'settimeout', settimeout)
         served = server.serve_once(0.0)
 
-        elapsed = time.monotonic() - started_at
-
     assert not served
-    assert elapsed < 1.0
+    assert timeouts[0] == 0.0
 
 
 def test_server_serve_once_zero_services_a_ready_peer(tmp_path: Path) -> None:
@@ -1162,7 +1312,7 @@ def test_server_serve_once_zero_services_a_ready_peer(tmp_path: Path) -> None:
         ) as server,
         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client,
     ):
-        client.settimeout(1)
+        client.settimeout(None)
         client.connect(os.fspath(server._path))
         client.sendall(struct.pack('!I', len(body)) + body)
 
@@ -1185,10 +1335,10 @@ def test_server_unbinds_foreground_progress(tmp_path: Path) -> None:
         )
         client.start()
         try:
-            assert server.serve_once(1.0)
+            _serve_request(server)
         finally:
             server._close()
-            client.join(2.0)
+            client.join()
 
     assert not client.is_alive()
     assert result == [{'accepted': True}]
@@ -1223,7 +1373,7 @@ def test_server_uses_platform_peer_identity(
         finally:
             stop.set()
             if thread.ident is not None:
-                thread.join(2)
+                thread.join()
                 assert not thread.is_alive()
 
     assert result == {'ok': True}

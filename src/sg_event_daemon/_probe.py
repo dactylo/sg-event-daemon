@@ -183,11 +183,7 @@ class ProbeServer:
             try:
                 method, path = _read_request(peer, deadline=deadline)
             except _BadRequestError as error:
-                response = (
-                    _BAD_REQUEST_HEAD
-                    if error._is_head  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-                    else _BAD_REQUEST
-                )
+                response = _BAD_REQUEST_HEAD if error.is_head else _BAD_REQUEST
             except OSError:
                 return
             else:
@@ -322,8 +318,8 @@ class ProbeServer:
         """Start exactly one owned server thread.
 
         Raises:
-            RuntimeError: The listener is closed or its thread was already
-                started.
+            RuntimeError: The listener is closed, its thread was already
+                started, or the operating system cannot start its thread.
         """
         with self._lock:
             if self._closing:
@@ -497,7 +493,7 @@ class _BadRequestError(ValueError):
 
     def __init__(self, *, is_head: bool = False) -> None:
         """Record whether a parseable request line selected `HEAD`."""
-        self._is_head = is_head
+        self.is_head = is_head
 
 
 def _is_head_request(buffer: bytearray) -> bool:

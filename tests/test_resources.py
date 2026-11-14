@@ -53,13 +53,13 @@ def test_close_resources_keeps_first_failure_and_notes_later_failures() -> None:
 
     class Resource:
         def __init__(self, name: str, failure: BaseException | None = None) -> None:
-            self.name = name
-            self.failure = failure
+            self._name = name
+            self._failure = failure
 
         def close(self) -> None:
-            attempts.append(self.name)
-            if self.failure is not None:
-                raise self.failure
+            attempts.append(self._name)
+            if self._failure is not None:
+                raise self._failure
 
     resources = (Resource('database', first), None, Resource('handoff'), Resource('lock', later))
 
@@ -77,11 +77,11 @@ def test_close_resources_keeps_initiating_error_and_notes_every_failure() -> Non
 
     class Resource:
         def __init__(self, name: str) -> None:
-            self.name = name
+            self._name = name
 
         def close(self) -> None:
-            attempts.append(self.name)
-            raise OSError(f'{self.name} close failed')
+            attempts.append(self._name)
+            raise OSError(f'{self._name} close failed')
 
     close_resources((Resource('database'), Resource('lock')), primary_error=initiating)
 

@@ -1,92 +1,74 @@
-"""Classify passive WAL checkpoints and enforce their runtime bounds."""
+"""Classify WAL checkpoints, reuse the WAL, and warn at runtime bounds."""
 
 from __future__ import annotations
 
 import math
-import random
+import os
 import sqlite3
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypeAlias, TypedDict, Unpack
 
-from sg_event_daemon._sqlite import DatabaseError
+from sg_event_daemon._sqlite import (
+    WAL_IN_USE_LIMIT_BYTES,
+    WAL_REUSE_WAIT_SECS,
+    DatabaseError,
+    temporary_busy_timeout,
+    wal_file_bytes,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    import logging
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
-CheckpointOutcome: TypeAlias = Literal[
-    'complete',
-    'reset-observed',
-    'contended',
-    'partial-no-progress',
-    'partial-progress',
+_CheckpointBound: TypeAlias = Literal['incomplete-duration', 'wal-growth']
+_CheckpointOutcome: TypeAlias = Literal[
+    'complete', 'reset-observed', 'contended', 'partial-no-progress', 'partial-progress'
 ]
-CheckpointResult: TypeAlias = tuple[int, int, int]
-CheckpointState: TypeAlias = Literal['idle', 'complete', 'incomplete']
+_CheckpointResult: TypeAlias = tuple[int, int, int]
+_ReuseOutcome: TypeAlias = Literal['reused', 'reuse-busy']
 
-_WAL_IN_USE_LIMIT_BYTES = 256 * 1024 * 1024
 _CHECKPOINT_FAILURE_INTERVALS = 5
-_CLEARING_OUTCOMES: frozenset[CheckpointOutcome] = frozenset({'complete', 'reset-observed'})
+_CLEARING_OUTCOMES: frozenset[_CheckpointOutcome] = frozenset({'complete', 'reset-observed'})
 _RECENT_ATTEMPTS = 8
-_WAL_FRAME_HEADER_BYTES = 24
 
 
 @dataclass(frozen=True)
 class CheckpointAttempt:
-    """Record one classified passive checkpoint attempt.
+    """Record a passive result, subsequent reuse result, and pre-reuse WAL size.
 
-    Attributes:
-        outcome: Classification under the checkpoint policy.
-        result: The `(busy, log, checkpointed)` row of the final try, which is
-            the retry's row when the first try was contended.
-        retried: Whether the first try was contended and retried.
-        finished_at: Monotonic time when the attempt was classified.
+    `finished_at` is the monotonic time after both SQLite calls. `wal_bytes`
+    includes uncommitted spill and is sampled before reuse can truncate it.
     """
 
-    outcome: CheckpointOutcome
-    result: CheckpointResult
-    retried: bool
+    outcome: _CheckpointOutcome
+    result: _CheckpointResult
+    reuse: _ReuseOutcome
+    reuse_result: _CheckpointResult
+    wal_bytes: int
     finished_at: float
 
 
-class CheckpointBoundError(DatabaseError):
-    """Report a runtime bound violation with its classified checkpoint attempt.
-
-    Attributes:
-        attempt: The observed attempt that triggered the bound.
-    """
-
-    def __init__(self, message: str, attempt: CheckpointAttempt) -> None:
-        """Retain the classified attempt alongside the diagnostic message."""
-        super().__init__(message)
-        self.attempt = attempt
-
-
 class _CheckpointerSeams(TypedDict, total=False):
-    """Type optional clock, randomness, result, sleep, and bound replacements for tests."""
+    """Type test replacements for timing, SQLite calls, sync, and growth limits."""
 
     clock: Callable[[], float]
-    random_value: Callable[[], float]
-    run_checkpoint: Callable[[], CheckpointResult]
-    sleep: Callable[[float], None]
+    run_checkpoint: Callable[[], _CheckpointResult]
+    run_reuse: Callable[[], _CheckpointResult]
+    wal_bytes: Callable[[], int]
+    sync_wal: Callable[[], None]
     wal_limit_bytes: int
 
 
 class Checkpointer:
-    """Run one process's passive checkpoints on one database file.
+    """Own checkpoint history and a lazily opened WAL sync descriptor.
 
-    Each `run_once()` call makes one attempt; a contended first try is retried
-    once after a random delay of up to half an interval. Attempts are
-    classified as complete, reset observed, contended, or partial with or
-    without progress.
-    The checkpointer halts by raising `DatabaseError` when no complete or
-    reset-observed attempt has occurred for five intervals, measured from the
-    last such attempt or from construction, or when a non-contended attempt
-    reports more committed WAL frames than `_WAL_IN_USE_LIMIT_BYTES` occupy.
-    That limit is a tripwire on observed committed frames, not a ceiling on the
-    WAL file's size. Use it only from the thread that opened its connection.
+    Use from the connection's owning thread. Each attempt runs PASSIVE then
+    TRUNCATE, without taking daemon locks. Bounds warn on transitions; SQLite
+    failures remain fatal. Call `close()` before closing the database
+    connection.
     """
 
     def __init__(
@@ -95,44 +77,84 @@ class Checkpointer:
         path: Path,
         *,
         interval_secs: float,
+        logger: logging.Logger,
+        log_extra: Mapping[str, str],
         **seams: Unpack[_CheckpointerSeams],
     ) -> None:
-        """Prepare a checkpointer for an open WAL connection.
+        """Configure one file's attempts and warning owner.
 
         Args:
-            connection: Connection dedicated to checkpoints on this file.
-            path: Database path named in halt messages.
-            interval_secs: Scheduled time between attempts; the duration bound
-                and the retry delay derive from it.
+            connection: Dedicated checkpoint connection.
+            path: Database path used for the WAL sample and diagnostics.
+            interval_secs: Finite positive schedule interval; five intervals
+                without a clearing outcome cross the duration bound.
+            logger: Owning source or supervisor logger.
+            log_extra: Owner identity fields attached to transition messages.
             **seams: Optional replacements for tests.
 
         Raises:
-            ValueError: `interval_secs` is not finite and positive, or
-                `wal_limit_bytes` is not positive.
-            DatabaseError: SQLite cannot report the page size.
+            ValueError: The interval or WAL limit is not positive and finite.
         """
         if not math.isfinite(interval_secs) or interval_secs <= 0:
             raise ValueError('checkpoint interval must be finite and positive')
-        wal_limit_bytes = seams.get('wal_limit_bytes', _WAL_IN_USE_LIMIT_BYTES)
-        if wal_limit_bytes <= 0:
+        limit = seams.get('wal_limit_bytes', WAL_IN_USE_LIMIT_BYTES)
+        if limit <= 0:
             raise ValueError('WAL limit must be positive')
         self._connection = connection
         self._path = path
         self._interval_secs = interval_secs
+        self._logger = logger
+        self._log_extra = dict(log_extra)
         self._clock = seams.get('clock', time.monotonic)
-        self._random_value = seams.get('random_value', random.random)
-        self._sleep = seams.get('sleep', time.sleep)
         self._run_checkpoint = seams.get('run_checkpoint', self._passive_checkpoint)
-        self._wal_limit_bytes = wal_limit_bytes
-        self._frame_bytes = _page_size(connection) + _WAL_FRAME_HEADER_BYTES
+        self._run_reuse = seams.get('run_reuse', self._reuse_checkpoint)
+        self._wal_bytes = seams.get('wal_bytes', lambda: wal_file_bytes(path))
+        self._sync_wal = seams.get('sync_wal', self._sync)
+        self._wal_limit_bytes = limit
+        self._wal_fd: int | None = None
         self._cleared_at = self._clock()
         self._previous_log: int | None = None
         self._previous_checkpointed: int | None = None
         self._recent: deque[CheckpointAttempt] = deque(maxlen=_RECENT_ATTEMPTS)
-        self._state: CheckpointState = 'idle'
+        self._crossed: set[_CheckpointBound] = set()
 
-    def _classify(self, result: CheckpointResult) -> CheckpointOutcome:
-        """Classify one final try against this checkpointer's previous sample."""
+    def _bound(
+        self, bound: _CheckpointBound, *, crossed: bool, detail: str, elapsed: float
+    ) -> None:
+        """Log each crossing and clearing once for this bound."""
+        name = 'WAL growth' if bound == 'wal-growth' else 'incomplete duration'
+        if crossed and bound not in self._crossed:
+            self._crossed.add(bound)
+            recent = ', '.join(
+                f'{item.outcome} {item.result} {item.reuse} {item.reuse_result}'
+                for item in self._recent
+            )
+            self._logger.warning(
+                'checkpoint %s bound exceeded for %s: %s; %.1fs since the last '
+                'complete, reset-observed, or reused attempt; recent attempts: %s',
+                name,
+                self._path,
+                detail,
+                elapsed,
+                recent,
+                extra=self._log_extra,
+            )
+        elif not crossed and bound in self._crossed:
+            self._crossed.remove(bound)
+            self._logger.info(
+                'checkpoint %s bound cleared for %s', name, self._path, extra=self._log_extra
+            )
+
+    def _checkpoint(self, mode: Literal['PASSIVE', 'TRUNCATE']) -> _CheckpointResult:
+        """Read one SQLite checkpoint result, preserving database failures."""
+        row = self._connection.execute(f'PRAGMA wal_checkpoint({mode})').fetchone()
+        if row is None:
+            raise DatabaseError('SQLite returned no checkpoint result')
+        busy, log_frames, checkpointed = (int(value) for value in row)
+        return busy, log_frames, checkpointed
+
+    def _classify(self, result: _CheckpointResult) -> _CheckpointOutcome:
+        """Classify the passive call against the previous non-contended sample."""
         busy, log_frames, checkpointed = result
         if busy != 0:
             return 'contended'
@@ -144,93 +166,81 @@ class Checkpointer:
             return 'partial-no-progress'
         return 'partial-progress'
 
-    def _halt(self, bound: str, detail: str) -> CheckpointBoundError:
-        """Build the halt error naming the file, the bound, and the recent attempts."""
-        elapsed = self._clock() - self._cleared_at
-        recent = ', '.join(f'{attempt.outcome} {attempt.result}' for attempt in self._recent)
-        return CheckpointBoundError(
-            f'checkpoint {bound} bound exceeded for {self._path}: {detail}; '
-            f'{elapsed:.3f}s since the last complete or reset-observed attempt; '
-            f'recent attempts: {recent}',
-            self._recent[-1],
-        )
-
-    def _passive_checkpoint(self) -> CheckpointResult:
-        """Run one passive checkpoint on the owned connection."""
+    def _passive_checkpoint(self) -> _CheckpointResult:
+        """Run one passive call without a retry."""
         try:
-            row = self._connection.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
+            return self._checkpoint('PASSIVE')
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
-        if row is None:
-            raise DatabaseError('SQLite returned no passive checkpoint result')
-        busy, log_frames, checkpointed = (int(value) for value in row)
-        return busy, log_frames, checkpointed
 
-    def _record(self, attempt: CheckpointAttempt) -> None:
-        """Update this checkpointer's history and raise when a bound is exceeded."""
-        self._recent.append(attempt)
-        cleared = attempt.outcome in _CLEARING_OUTCOMES
-        self._state = 'complete' if cleared else 'incomplete'
-        if cleared:
-            self._cleared_at = attempt.finished_at
-        _busy, log_frames, checkpointed = attempt.result
-        if attempt.outcome != 'contended':
-            self._previous_log = log_frames
-            self._previous_checkpointed = checkpointed
-            if log_frames * self._frame_bytes > self._wal_limit_bytes:
-                raise self._halt(
-                    'WAL growth',
-                    f'{log_frames} committed frames exceed {self._wal_limit_bytes} bytes',
-                )
-        incomplete_secs = attempt.finished_at - self._cleared_at
-        if incomplete_secs >= _CHECKPOINT_FAILURE_INTERVALS * self._interval_secs:
-            raise self._halt(
-                'incomplete duration',
-                f'{_CHECKPOINT_FAILURE_INTERVALS} intervals of {self._interval_secs}s elapsed',
-            )
+    def _reuse_checkpoint(self) -> _CheckpointResult:
+        """Truncate after waiting at most the reuse budget, restoring the timeout."""
+        try:
+            with temporary_busy_timeout(self._connection, int(WAL_REUSE_WAIT_SECS * 1000)):
+                return self._checkpoint('TRUNCATE')
+        except sqlite3.Error as exc:
+            raise DatabaseError(str(exc)) from exc
 
-    @property
-    def frame_bytes(self) -> int:
-        """Return the bytes one WAL frame occupies: the page size plus its header."""
-        return self._frame_bytes
+    def _sync(self) -> None:
+        """Sync SQLite's WAL writes through one lazily opened file descriptor."""
+        if self._wal_fd is None:
+            try:
+                self._wal_fd = os.open(f'{self._path}-wal', os.O_RDONLY)
+            except FileNotFoundError:
+                return
+        os.fsync(self._wal_fd)
 
-    def run_once(self) -> CheckpointAttempt:
-        """Make one checkpoint attempt and enforce both bounds.
-
-        Returns:
-            The classified attempt.
+    def close(self) -> None:
+        """Close the WAL sync descriptor, leaving the caller's connection open.
 
         Raises:
-            CheckpointBoundError: The classified attempt exceeded the
-                incomplete-duration bound or the WAL growth tripwire.
-            DatabaseError: SQLite failed before an attempt could be classified.
+            OSError: Closing the owned WAL sync descriptor fails.
         """
-        result = self._run_checkpoint()
-        retried = result[0] != 0
-        if retried:
-            self._sleep(self._random_value() * self._interval_secs / 2)
-            result = self._run_checkpoint()
-        attempt = CheckpointAttempt(
-            outcome=self._classify(result),
-            result=result,
-            retried=retried,
-            finished_at=self._clock(),
-        )
-        self._record(attempt)
-        return attempt
+        if self._wal_fd is not None:
+            os.close(self._wal_fd)
+            self._wal_fd = None
 
     @property
-    def state(self) -> CheckpointState:
-        """Return `idle` before the first attempt, then `complete` or `incomplete`."""
-        return self._state
+    def crossed(self) -> frozenset[_CheckpointBound]:
+        """Return the bounds still crossed at the latest completed attempt."""
+        return frozenset(self._crossed)
 
+    def run_once(self) -> CheckpointAttempt:
+        """Run passive and reuse calls, sample growth, sync if needed, and warn.
 
-def _page_size(connection: sqlite3.Connection) -> int:
-    """Return the database page size that sizes each WAL frame."""
-    try:
-        row = connection.execute('PRAGMA page_size').fetchone()
-    except sqlite3.Error as exc:
-        raise DatabaseError(str(exc)) from exc
-    if row is None:
-        raise DatabaseError('SQLite returned no page size')
-    return int(row[0])
+        Returns:
+            Both classified outcomes and the physical WAL size before reuse.
+
+        Raises:
+            DatabaseError: A SQLite checkpoint operation failed.
+            OSError: Inspecting or synchronizing the WAL failed.
+        """
+        result = self._run_checkpoint()
+        outcome = self._classify(result)
+        wal_bytes = self._wal_bytes()
+        growth = wal_bytes > self._wal_limit_bytes
+        reuse_result = self._run_reuse()
+        reuse: _ReuseOutcome = 'reused' if reuse_result[0] == 0 else 'reuse-busy'
+        attempt = CheckpointAttempt(outcome, result, reuse, reuse_result, wal_bytes, self._clock())
+        self._recent.append(attempt)
+        if outcome != 'contended':
+            self._previous_log, self._previous_checkpointed = result[1:]
+        clearing = outcome in _CLEARING_OUTCOMES or reuse == 'reused'
+        if clearing:
+            self._cleared_at = attempt.finished_at
+        else:
+            self._sync_wal()
+        elapsed = attempt.finished_at - self._cleared_at
+        self._bound(
+            'wal-growth',
+            crossed=growth,
+            detail=f'WAL file is {wal_bytes} bytes, over {self._wal_limit_bytes}',
+            elapsed=elapsed,
+        )
+        self._bound(
+            'incomplete-duration',
+            crossed=elapsed >= _CHECKPOINT_FAILURE_INTERVALS * self._interval_secs,
+            detail=f'5 intervals of {self._interval_secs:.1f}s elapsed',
+            elapsed=elapsed,
+        )
+        return attempt

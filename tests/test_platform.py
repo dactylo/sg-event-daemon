@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
-import select
+import resource
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import pytest
 
@@ -53,13 +53,8 @@ def _nested_state_dir(root: Path, suffix: str) -> Path:
 
 
 def _read_pipe_notice(fd: int, expected: bytes) -> None:
-    deadline = time.monotonic() + 5.0
     received = bytearray()
     while len(received) < len(expected):
-        remaining = deadline - time.monotonic()
-        assert remaining > 0, f'child did not send {expected!r} within 5 s'
-        readable, _writable, _exceptional = select.select((fd,), (), (), remaining)
-        assert readable, f'child did not send {expected!r} within 5 s'
         chunk = os.read(fd, len(expected) - len(received))
         assert chunk, f'child closed pipe before sending {expected!r}'
         received.extend(chunk)
@@ -261,7 +256,7 @@ os._exit(9)
 
         assert process.stdin is not None
         process.stdin.close()
-        assert process.wait(timeout=5) == 9
+        assert process.wait() == 9
         with acquire_lock(path):
             pass
     finally:
@@ -269,7 +264,7 @@ os._exit(9)
             process.stdin.close()
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=5)
+        process.wait()
         if process.stdout is not None:
             process.stdout.close()
 
@@ -392,6 +387,19 @@ def test_local_socket_path_does_not_unlink_live_listener(short_state_dir: Path) 
         path.unlink()
 
 
+def test_local_socket_path_propagates_its_timeout(
+    short_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[float] = []
+
+    def check(_path: Path, *, timeout_secs: float) -> None:
+        timeouts.append(timeout_secs)
+
+    monkeypatch.setattr(platform_adapter, 'remove_stale_socket', check)
+    local_socket_path(short_state_dir, 'event', ('source',), timeout_secs=0.0625)
+    assert timeouts == [0.0625]
+
+
 def test_local_socket_path_rejects_insecure_existing_path(short_state_dir: Path) -> None:
     state_dir = ensure_secure_state_dir(short_state_dir)
     path = state_dir / 'control.sock'
@@ -466,6 +474,20 @@ def test_local_socket_path_uses_state_directory_when_it_fits(short_state_dir: Pa
     assert local_socket_path(state_dir, 'control', ('supervisor',)) == (state_dir / 'control.sock')
 
 
+def test_open_file_limit_keeps_soft_when_both_attempts_are_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(_kind: int, _values: tuple[int, int]) -> None:
+        raise OSError('kernel cap')
+
+    def get_limit(_kind: int) -> tuple[int, int]:
+        return 256, 65536
+
+    monkeypatch.setattr(resource, 'getrlimit', get_limit)
+    monkeypatch.setattr(resource, 'setrlimit', refuse)
+    assert platform_adapter.raise_open_file_limit() == (256, 65536)
+
+
 def test_peer_identity_uses_kernel_credentials() -> None:
     first, second = socket.socketpair()
     try:
@@ -524,7 +546,7 @@ raise SystemExit(9)
         sentinel_write = -1
 
         _read_pipe_notice(control_read, b'R')
-        assert reap_child(process, timeout=5.0) == 0
+        assert process.wait() == 0
         assert os.read(sentinel_read, 1) == b''
     finally:
         os.close(control_read)
@@ -535,7 +557,7 @@ raise SystemExit(9)
             os.close(sentinel_write)
         if process is not None and reap_child(process) is None:
             terminate_child(process, force=True)
-            reap_child(process, timeout=5.0)
+            process.wait()
 
 
 def test_process_helpers_terminate_and_reap_a_running_child() -> None:
@@ -543,7 +565,7 @@ def test_process_helpers_terminate_and_reap_a_running_child() -> None:
         [
             sys.executable,
             '-c',
-            'import time; time.sleep(30)',
+            'import threading; threading.Event().wait()',
         ]
     )
     try:
@@ -551,13 +573,25 @@ def test_process_helpers_terminate_and_reap_a_running_child() -> None:
 
         terminate_child(process)
 
-        return_code = reap_child(process, timeout=5.0)
+        return_code = process.wait()
         assert return_code is not None
         assert return_code != 0
     finally:
         if reap_child(process) is None:
             terminate_child(process, force=True)
-            reap_child(process, timeout=5.0)
+            process.wait()
+
+
+@pytest.mark.parametrize('finished', [False, True])
+def test_reap_child_forwards_its_budget_and_reports_completion(finished: bool) -> None:
+    process = Mock(spec=subprocess.Popen)
+    if finished:
+        process.wait.return_value = 7
+    else:
+        process.wait.side_effect = subprocess.TimeoutExpired('scripted-child', 5.0)
+
+    assert reap_child(process, timeout=5.0) == (7 if finished else None)
+    process.wait.assert_called_once_with(timeout=5.0)
 
 
 def test_secure_open_without_create_rejects_missing_file(tmp_path: Path) -> None:
@@ -679,6 +713,93 @@ def test_socket_path_limits_count_encoded_bytes(
     assert platform_adapter.local_socket_path_candidate(longer, 'control', ()).parent.parent == (
         short_state_dir
     )
+
+
+@pytest.mark.parametrize(
+    ('soft', 'hard', 'expected'),
+    [
+        (256, 4096, 4096),
+        (256, resource.RLIM_INFINITY, 65536),
+        (70000, resource.RLIM_INFINITY, 70000),
+        (resource.RLIM_INFINITY, resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+    ],
+)
+def test_open_file_limit_rises_to_target_and_never_lowers(
+    monkeypatch: pytest.MonkeyPatch, soft: int, hard: int, expected: int
+) -> None:
+    limits = [soft, hard]
+    calls: list[tuple[int, int]] = []
+
+    def set_limit(_kind: int, values: tuple[int, int]) -> None:
+        calls.append(values)
+        limits[:] = values
+
+    def get_limit(_kind: int) -> tuple[int, int]:
+        return limits[0], limits[1]
+
+    monkeypatch.setattr(resource, 'getrlimit', get_limit)
+    monkeypatch.setattr(resource, 'setrlimit', set_limit)
+    assert platform_adapter.raise_open_file_limit() == (expected, hard)
+    assert calls == ([] if expected == soft else [(expected, hard)])
+
+
+@pytest.mark.parametrize('error_type', [ValueError, OSError])
+@pytest.mark.parametrize('soft', [256, 20000])
+def test_open_file_limit_falls_back_when_the_kernel_refuses(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], soft: int
+) -> None:
+    limits = [soft, resource.RLIM_INFINITY]
+    calls: list[tuple[int, int]] = []
+
+    def set_limit(_kind: int, values: tuple[int, int]) -> None:
+        calls.append(values)
+        if values[0] == 65536:
+            raise error_type('kernel cap')
+        limits[:] = values
+
+    def get_limit(_kind: int) -> tuple[int, int]:
+        return limits[0], limits[1]
+
+    monkeypatch.setattr(resource, 'getrlimit', get_limit)
+    monkeypatch.setattr(resource, 'setrlimit', set_limit)
+    assert platform_adapter.raise_open_file_limit() == (max(soft, 10240), resource.RLIM_INFINITY)
+    assert calls == [(65536, resource.RLIM_INFINITY)] + (
+        [(10240, resource.RLIM_INFINITY)] if soft < 10240 else []
+    )
+
+
+def test_stale_socket_check_treats_a_timeout_as_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    timeouts: list[float | None] = []
+
+    def timed_out(sock: socket.socket, _address: object) -> None:
+        timeouts.append(sock.gettimeout())
+        raise TimeoutError('listener backlog full')
+
+    monkeypatch.setattr(socket.socket, 'connect', timed_out)
+    assert platform_adapter._socket_is_live(tmp_path / 'listener', timeout_secs=0.0625)
+    assert timeouts == [0.0625]
+
+
+def test_stale_socket_removal_propagates_its_timeout(
+    short_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = short_state_dir / 'existing.sock'
+    timeouts: list[float] = []
+
+    def live(_path: Path, *, timeout_secs: float) -> bool:
+        timeouts.append(timeout_secs)
+        return True
+
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(str(path))
+        path.chmod(0o600)
+        monkeypatch.setattr(platform_adapter, '_socket_is_live', live)
+        with pytest.raises(SecurityError, match='live'):
+            platform_adapter.remove_stale_socket(path, timeout_secs=0.0625)
+        assert path.exists()
+    assert timeouts == [0.0625]
 
 
 def test_try_flock_exclusive_conflicts_across_open_file_descriptions(tmp_path: Path) -> None:

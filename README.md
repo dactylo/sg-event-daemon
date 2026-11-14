@@ -19,13 +19,13 @@ good fit for existing plugins and simple deployments. It loads its plugins direc
 changed plugin files, daemonizes itself, and can send logs to files and email. sg-event-daemon
 makes different tradeoffs:
 
-| Need                  | sg-event-daemon behavior                                                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Recover after a crash | Records its position, the event in progress, and each completed callback in SQLite. Event contents are refetched from SG, not stored. |
-| Isolate workloads     | Polls each event source once for any number of plugin groups. Each group delivers serially and fails independently.                   |
-| Control ordering      | Offers low-latency `eager` delivery, or `strict` delivery in increasing event ID order at the cost of a holdback delay.               |
-| Operate failures      | Provides status and health probes, callback deadlines, worker restart limits, and audited recovery commands.                          |
-| Write modern plugins  | Runs synchronous callbacks, and native asynchronous callbacks with the `sg-python-api-async` extra.                                   |
+| Need                  | sg-event-daemon behavior                                                                                                                   |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Recover after a crash | Records its position, the event in progress, and each completed callback in SQLite. Event contents are refetched from SG, not stored.      |
+| Isolate workloads     | Polls each event source once for any number of plugin groups. Each group delivers serially and fails independently.                        |
+| Control ordering      | Offers low-latency `eager` delivery, or `strict` delivery in increasing event ID order after its configured hold and any lower gap closes. |
+| Operate failures      | Provides status and health probes, callback deadlines, worker restart limits, and audited recovery commands.                               |
+| Write modern plugins  | Runs synchronous callbacks, and native asynchronous callbacks with the `sg-python-api-async` extra.                                        |
 
 Weigh these limits before you adopt it:
 
@@ -134,12 +134,10 @@ sg-event-daemon validate-config --config /etc/sg-event-daemon/daemon.toml
 sg-event-daemon supervise --config /etc/sg-event-daemon/daemon.toml
 ```
 
-Validation imports the plugin without contacting SG. It warns that importing plugin code can have
-side effects, then prints `{"provider":"shotgun-api3","sites":["studio"],"validated":true}`.
-Invalid configuration, including a missing plugin file, makes either command print `error:` and
-exit with status 2. Invalid plugin registration makes `validate-config` exit with status 2. During
-`supervise`, a plugin import or registration failure stops its worker; the supervisor restarts that
-worker until its breaker opens.
+Validation checks the configuration and plugin registration without contacting SG, then prints
+`{"provider":"shotgun-api3","sites":["studio"],"validated":true}`. See
+[validation and startup](docs/operations.md#validate-and-start) for plugin requirements and
+[exit codes](docs/operations.md#exit-codes) for errors.
 
 The supervisor runs until you stop it with Ctrl-C or SIGTERM, which shuts down its workers and
 exits with status 0. The new group starts at the latest visible event rather than processing
@@ -155,9 +153,8 @@ sg-event-daemon status --config /etc/sg-event-daemon/daemon.toml
 ```
 
 The command prints one line of JSON. `primary_state` summarizes overall health, for example `idle`
-while the group waits for events, and `liveness` and `readiness` report the health checks. If no
-supervisor is running for that state directory, the command prints one line that starts with
-`error:` and exits with status 3.
+while the group waits for events, and `liveness` and `readiness` report the health checks. See
+[status and health](docs/operations.md#check-status-and-health) to interpret the result.
 
 This example only logs events. A plugin that writes to SG should use separate callback credentials
 with the permissions it needs; see

@@ -6,6 +6,7 @@ import uuid
 from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
 from . import _source_store as store
+from ._group_store import GROUP_HALT_BASE_SQL
 from ._group_types import (
     GroupSnapshot,
     ReplayRequiredNotice,
@@ -14,7 +15,31 @@ from ._source_schema import BUMP_INDEX_REVISION, BUMP_RANGE_REVISION
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Callable, Collection, Container
+    from collections.abc import Callable, Container
+
+
+_COLLAPSE_CANDIDATES_SQL = ''.join(
+    part
+    for part in (
+        """
+    SELECT group_name, group_generation
+    FROM groups JOIN group_state USING (group_name)
+    WHERE active = 1 AND EXISTS (
+        SELECT 1 FROM range_groups
+        WHERE range_groups.group_name = groups.group_name
+          AND range_groups.group_generation = groups.group_generation
+          AND obligation_state = 'pending'
+    ) AND (
+    """,
+        GROUP_HALT_BASE_SQL,
+        """
+        -- A replay marker already excludes this group from new pending ranges.
+        -- An authorized retry exempts only the required-event condition.
+        OR (required_event_id IS NOT NULL AND retry_event_id IS NULL)
+    )
+    """,
+    )
+)
 
 
 class _AdoptionOptions(TypedDict):
@@ -25,6 +50,13 @@ class _AdoptionOptions(TypedDict):
     stream_fingerprint: str
     reason: str
     retired_counts: tuple[int, int, int]
+
+
+class _CollapseOptions(TypedDict):
+    """Type the replay floor and marker token for a whole-group collapse."""
+
+    low_id: int
+    token: str
 
 
 class _MarkerOptions(TypedDict):
@@ -169,20 +201,21 @@ def _upsert_marker(
 def _collapse_group(
     connection: sqlite3.Connection,
     settings: store.SourceSettings,
-    mutation: store.RangeMutation,
     group: str,
     generation: int,
+    **options: Unpack[_CollapseOptions],
 ) -> None:
     """Replace one group's pending memberships with an atomically published replay halt."""
     retained = _lowest_group_replay_id(connection, group, generation)
-    low = mutation.low_id if retained is None else min(mutation.low_id, retained)
+    low_id = options['low_id']
+    low = low_id if retained is None else min(low_id, retained)
     _upsert_marker(
         connection,
         settings,
         group=group,
         generation=generation,
         from_event_id=low,
-        new_token=lambda: f'collapse-{mutation.obligation_id}-{generation}',
+        new_token=lambda: options['token'],
     )
     connection.execute(
         """DELETE FROM late_ids WHERE group_name = ? AND obligation_id IN (
@@ -220,6 +253,9 @@ def adoption_count(connection: sqlite3.Connection) -> int:
 
     Returns:
         Number of immutable adoption audit rows.
+
+    Raises:
+        sqlite3.Error: SQLite cannot count the adoption audit rows.
     """
     return int(connection.execute('SELECT COUNT(*) FROM stream_adoptions').fetchone()[0])
 
@@ -232,6 +268,9 @@ def adoption_counts(connection: sqlite3.Connection) -> tuple[int, int, int]:
 
     Returns:
         Range, source late-id, and marker counts.
+
+    Raises:
+        sqlite3.Error: SQLite cannot count the retained stream evidence.
     """
     queries = (
         'SELECT COUNT(*) FROM discovery_ranges',
@@ -242,6 +281,34 @@ def adoption_counts(connection: sqlite3.Connection) -> tuple[int, int, int]:
         'tuple[int, int, int]',
         tuple(int(connection.execute(query).fetchone()[0]) for query in queries),
     )
+
+
+def collapse_operator_groups(
+    connection: sqlite3.Connection,
+    settings: store.SourceSettings,
+    low_id: int,
+) -> int:
+    """Replace operator-blocked pending memberships with replay markers.
+
+    Args:
+        connection: Source admission transaction connection; this work must
+            precede the candidate gap's rollback savepoint.
+        settings: Source identity and capacity policies.
+        low_id: First ID in the gap whose admission needs retained capacity.
+
+    Returns:
+        Number of active current-generation groups collapsed. Authorized event
+        retries exempt only the required-event condition.
+
+    Raises:
+        sqlite3.Error: SQLite cannot inspect or collapse the blocked groups.
+    """
+    candidates = connection.execute(_COLLAPSE_CANDIDATES_SQL).fetchall()
+    for group, generation in candidates:
+        _collapse_group(
+            connection, settings, group, generation, low_id=low_id, token=uuid.uuid4().hex
+        )
+    return len(candidates)
 
 
 def existing_adoption(
@@ -256,6 +323,9 @@ def existing_adoption(
 
     Returns:
         Command fingerprint, stream fingerprint, and reason, or `None`.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the adoption audit.
     """
     row = connection.execute(
         """
@@ -290,6 +360,7 @@ def has_terminal_disposition(
 
     Raises:
         SourceIdentityError: The audited identity conflicts or is incomplete.
+        sqlite3.Error: SQLite cannot read the disposition audit.
     """
     row = connection.execute(
         """
@@ -306,13 +377,9 @@ def has_terminal_disposition(
         command_fingerprint,
         terminal_result,
     ):
-        raise store.SourceIdentityError(
-            'terminal disposition identity conflicts', code='terminal-disposition-id-reused'
-        )
+        raise store.SourceIdentityError('terminal disposition identity conflicts')
     if row[1] is None:
-        raise store.SourceIdentityError(
-            'terminal disposition identity is incomplete', code='terminal-disposition-incomplete'
-        )
+        raise store.SourceIdentityError('terminal disposition identity is incomplete')
     return True
 
 
@@ -326,6 +393,9 @@ def insert_adoption(
         connection: Facade-owned FULL transaction connection.
         options: Stable command and stream identities, reason, and exact
             retired evidence counts.
+
+    Raises:
+        sqlite3.Error: SQLite cannot insert the adoption audit record.
     """
     connection.execute(
         """
@@ -346,14 +416,21 @@ def insert_adoption(
 
 
 def orphan(connection: sqlite3.Connection, current: GroupSnapshot) -> ReplayRequiredNotice:
-    """Collapse one generation's memberships and retire it within a lifecycle transaction."""
+    """Collapse one generation's memberships and retire it within a lifecycle transaction.
+
+    Returns:
+        The retained replay marker, reusing an existing marker id when present.
+        Its inclusive replay floor is the earliest pending range, replay floor,
+        or in-flight event; with no such evidence it is the source frontier
+        plus one.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read or retire the generation's evidence.
+    """
     low = _lowest_group_replay_id(connection, current.group, current.group_generation)
-    if current.replay_required_from is not None:
-        low = (
-            min(low, current.replay_required_from)
-            if low is not None
-            else current.replay_required_from
-        )
+    for replay_id in (current.replay_required_from, current.in_flight_event_id):
+        if replay_id is not None:
+            low = replay_id if low is None else min(low, replay_id)
     if low is None:
         low = int(store.meta(connection)[3]) + 1
     previous = _marker_for(
@@ -396,6 +473,9 @@ def pending_adoption(
     Returns:
         Command fingerprint, prior incarnation, prior stream fingerprint,
         target stream fingerprint, and reason, or `None`.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the adoption reservation.
     """
     row = connection.execute(
         """
@@ -430,6 +510,9 @@ def pending_adoption_for_halt(
 
     Returns:
         Adoption id and reason, or `None`.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the adoption reservation.
     """
     row = connection.execute(
         """
@@ -456,6 +539,9 @@ def pending_count(connection: sqlite3.Connection, *, open_only: bool = False) ->
     Args:
         connection: Facade-owned connection.
         open_only: Charge only open memberships to aggregate source capacity.
+
+    Raises:
+        sqlite3.Error: SQLite cannot count memberships or replay markers.
     """
     rows = connection.execute(
         """SELECT COUNT(*) FROM range_groups JOIN discovery_ranges USING (obligation_id)
@@ -466,48 +552,6 @@ def pending_count(connection: sqlite3.Connection, *, open_only: bool = False) ->
     return int(rows) + int(markers)
 
 
-def check_range_capacity(
-    connection: sqlite3.Connection,
-    settings: store.SourceSettings,
-    eligible_groups: Collection[tuple[str, int]],
-) -> set[tuple[str, int]]:
-    """Check projected retained rows before admitting an incoming range.
-
-    Args:
-        connection: Facade-owned live transaction connection.
-        settings: Source identity and aggregate capacity settings.
-        eligible_groups: Group generations requiring the incoming range.
-
-    Returns:
-        Group identities already covered by replay markers.
-
-    Raises:
-        SourceCapacityError: Projected retained rows exceed the aggregate
-            capacity.
-    """
-    marker_covered: set[tuple[str, int]] = set()
-    projected = pending_count(connection, open_only=True)
-    for group, generation in eligible_groups:
-        if _marker_for(connection, settings.site, settings.source, group, generation) is None:
-            pending, open_pending = connection.execute(
-                """SELECT COUNT(*), COALESCE(SUM(range_state = 'open'), 0)
-                FROM range_groups JOIN discovery_ranges USING (obligation_id)
-                WHERE group_name = ? AND group_generation = ?
-                AND obligation_state = 'pending'""",
-                (group, generation),
-            ).fetchone()
-            projected += 1
-            if pending >= settings.max_group_obligations:
-                projected -= open_pending
-        else:
-            marker_covered.add((group, generation))
-    if projected > settings.max_pending_group_obligations:
-        raise store.SourceCapacityError(
-            'obligation-capacity-exhausted', code='obligation-capacity-exhausted'
-        )
-    return marker_covered
-
-
 def replace_range_revision(
     connection: sqlite3.Connection,
     settings: store.SourceSettings,
@@ -516,18 +560,22 @@ def replace_range_revision(
 ) -> None:
     """Bind every active group in the range's own transaction.
 
+    A group at `max_group_obligations` has its pending memberships collapsed
+    into a whole-group replay marker, halting it until replay.
+
     Args:
         connection: Facade-owned live transaction connection.
         settings: Source identity and capacity policies.
-        mutation: Newly staged range revision and prior eligibility points.
+        mutation: Newly staged range revision.
         marker_covered: Group generations already requiring replay.
+
+    Raises:
+        sqlite3.Error: SQLite cannot replace memberships or publish the range
+            revision.
     """
     connection.execute(
         'DELETE FROM range_groups WHERE obligation_id = ?', (mutation.obligation_id,)
     )
-    eligibility: dict[tuple[str, int], float] = {}
-    for group, generation, point in mutation.existing_eligibility:
-        eligibility[group, generation] = max(eligibility.get((group, generation), 0.0), point)
     for group, generation, floor, holdback in connection.execute(
         """
         SELECT group_name, group_generation, delivery_floor, holdback_secs FROM
@@ -547,7 +595,14 @@ def replace_range_revision(
             (group, generation),
         ).fetchone()[0]
         if pending and count >= settings.max_group_obligations:
-            _collapse_group(connection, settings, mutation, group, generation)
+            _collapse_group(
+                connection,
+                settings,
+                group,
+                generation,
+                low_id=mutation.low_id,
+                token=f'collapse-{mutation.obligation_id}-{generation}',
+            )
             pending = False
         connection.execute(
             'INSERT INTO range_groups VALUES (?, ?, ?, ?, ?, ?)',
@@ -556,10 +611,7 @@ def replace_range_revision(
                 group,
                 generation,
                 floor,
-                max(
-                    mutation.opened_successful_at + holdback,
-                    eligibility.get((group, generation), 0.0),
-                ),
+                mutation.opened_successful_at + holdback,
                 'pending' if pending else 'satisfied-by-floor',
             ),
         )
@@ -578,6 +630,9 @@ def replay_markers(
 
     Returns:
         Exact markers in deterministic group order.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the replay markers.
     """
     rows = connection.execute(
         """
@@ -599,6 +654,9 @@ def reserve_adoption(
     Args:
         connection: Facade-owned FULL transaction connection.
         options: Fresh identity, halted-stream binding, target, and reason.
+
+    Raises:
+        sqlite3.Error: SQLite cannot insert the adoption reservation.
     """
     connection.execute(
         """
@@ -627,6 +685,9 @@ def retire_adoption_reservation(
     Args:
         connection: Facade-owned FULL transaction connection.
         adoption_id: Completed stable adoption identity.
+
+    Raises:
+        sqlite3.Error: SQLite cannot retire the adoption reservation.
     """
     connection.execute(
         'DELETE FROM pending_adoptions WHERE adoption_id = ?',
@@ -641,6 +702,10 @@ def retire_stream_evidence(
 
     Args:
         connection: Facade-owned FULL transaction connection.
+
+    Raises:
+        sqlite3.Error: SQLite cannot retire stream evidence or publish the
+            changed revisions.
     """
     statements = (
         'DELETE FROM replay_markers',

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from sg_event_daemon._worker import WorkerKind, WorkerRuntime, WorkerSpec
+from sg_event_daemon._worker import WorkerSpec, _ComponentHealthCache, _WorkerKind, _WorkerRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -14,15 +14,16 @@ if TYPE_CHECKING:
 def test_explicit_force_exit_is_preserved() -> None:
     exits: list[int] = []
     callback: Callable[[int], None] = exits.append
-    runtime = WorkerRuntime(
-        spec=WorkerSpec('worker', 'site', WorkerKind._SITE, 'site', (), ()),
+    runtime = _WorkerRuntime(
+        spec=WorkerSpec('worker', 'site', _WorkerKind.SITE, 'site', (), ()),
+        health_cache=_ComponentHealthCache(site='site', group_sources={}),
         spawn_instance='explicit-exit',
         source_factory=lambda _name, _slots, _host: pytest.fail('no source requested'),
         lane_factory=lambda _name, _slots, _host: pytest.fail('no lane requested'),
         health_sink=lambda _health: None,
-        health_interval_secs=0.01,
+        health_interval_secs=2.0,
         checkpoint_interval_secs=1.0,
-        shutdown_deadline_secs=1.0,
+        shutdown_deadline_secs=10.0,
         max_concurrent_catchup_readers=1,
         force_exit=callback,
     )
@@ -42,38 +43,41 @@ def test_hard_exit_preserves_evidence_outside_pytest_capture(
     pytester.makepyfile(
         test_exit=f"""
 import threading
-from sg_event_daemon._worker import WorkerKind, WorkerRuntime, WorkerSpec
+from sg_event_daemon._worker import _ComponentHealthCache, _WorkerKind, _WorkerRuntime, WorkerSpec
 from tests._runtime_diagnostics import install_runtime_diagnostics
-from tests.test_worker import _release_failed_source_runtime
+from tests._runtime_diagnostics import record_runtime_exception
+from tests.test_worker import release_failed_source_runtime
 
 class BlockedSource:
     def __init__(self):
         self.entered = threading.Event()
 
-    def _run(self):
+    def run(self):
         self.entered.set()
         threading.Event().wait()
 
-    def _request_stop(self, *, shutdown_deadline_at=None):
+    def request_stop(self, *, shutdown_deadline_at=None):
         pass
 
-    def _close(self):
+    def close(self):
         pass
 
 def test_exit(monkeypatch, tmp_path, _runtime_stderr_fd):
     if {broken_destination!r}:
         install_runtime_diagnostics(monkeypatch, tmp_path, _runtime_stderr_fd)
     source = BlockedSource()
-    runtime = WorkerRuntime(
-        spec=WorkerSpec("worker", "site", WorkerKind._SITE, "site", ("events",), ()),
+    runtime = _WorkerRuntime(
+        spec=WorkerSpec("worker", "site", _WorkerKind.SITE, "site", ("events",), ()),
+        health_cache=_ComponentHealthCache(site="site", group_sources={{}}),
         spawn_instance="diagnostic-spawn",
         source_factory=lambda _name, _slots, _host: source,
         lane_factory=lambda _name, _slots, _host: source,
         health_sink=lambda _health: None,
-        health_interval_secs=0.01,
+        health_interval_secs=2.0,
         checkpoint_interval_secs=1.0,
-        shutdown_deadline_secs=0.03,
+        shutdown_deadline_secs=10.0,
         max_concurrent_catchup_readers=1,
+        clock=lambda: 100.0,
     )
     actual_exit = runtime._force_exit
     def exit_while_locks_are_held(code):
@@ -82,18 +86,23 @@ def test_exit(monkeypatch, tmp_path, _runtime_stderr_fd):
         actual_exit(code)
     runtime._force_exit = exit_while_locks_are_held
     runtime.start()
-    assert source.entered.wait(2)
+    assert source.entered.wait()
     print("CAPTURED-OUTPUT-MUST-NOT-SURVIVE", flush=True)
     runtime._fatal_reason = "diagnostic fatal reason"
     try:
         raise AssertionError("initiating assertion before shutdown")
     except AssertionError as error:
         error.add_note("initiating exception note")
-        _release_failed_source_runtime(runtime, (None, None), None, None)
+        record_runtime_exception(runtime, error)
+        runtime.request_stop("test")
+        runtime._threads["operator-executor"].join()
+        runtime._shutdown_deadline_at = runtime._clock() - 1.0
+        runtime._monitor_wake.set()
+        release_failed_source_runtime(runtime, (None, None), None, None)
 """
     )
     base = pytester.path / 'runtime-temp'
-    result = pytester.runpytest_subprocess('--basetemp', str(base), timeout=15)
+    result = pytester.runpytest_subprocess('--basetemp', str(base))
     assert result.ret == 1
     stderr = result.stderr.str()
     evidence = [stderr]
@@ -112,7 +121,7 @@ def test_exit(monkeypatch, tmp_path, _runtime_stderr_fd):
             'initiating assertion before shutdown',
             'initiating exception note',
             'test_exit.py',
-            'in _run',
+            'in run',
             'in _monitor',
         ):
             assert expected in record

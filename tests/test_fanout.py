@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import threading
+from contextlib import nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 
@@ -12,17 +14,18 @@ from sg_event_daemon._events import Event, _EventEncodingError, decode_event, en
 from sg_event_daemon._fanout import (
     EncodedEvent,
     EncoderHaltedError,
-    EncoderWorker,
     EventDelivery,
+    EventEncoder,
     EventFanout,
     FanoutStatus,
     GroupChannel,
-    StrictCapacityControl,
     StrictOrderingControl,
     _FrameTooLargeError,
 )
 from sg_event_daemon._group_types import LiveJoinIdentity
 from sg_event_daemon._ipc import _encode_fanout_message
+from sg_event_daemon._strict import StrictBuffer
+from tests.test_strict import attach_strict_group
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -77,30 +80,17 @@ def test_channel_close_detaches_only_that_group() -> None:
 
 def test_encoder_counts_complete_event_frame_at_exact_minimum_limit() -> None:
     payload_bytes = 100
-    with EncoderWorker(
-        max_event_bytes=payload_bytes,
-        max_ipc_frame_bytes=199,
-        event_encoder=lambda _event: b'x' * payload_bytes,
+    with nullcontext(
+        EventEncoder(
+            max_event_bytes=payload_bytes,
+            max_ipc_frame_bytes=199,
+            event_encoder=lambda _event: b'x' * payload_bytes,
+        )
     ) as worker:
         encoded = worker.encode(_event())
 
     assert len(encoded.event_frame) == payload_bytes
     assert encoded.byte_count == 203
-
-
-def test_encoder_detects_worker_death() -> None:
-    def die(_event: Event) -> bytes:
-        raise SystemExit(9)
-
-    with EncoderWorker(
-        max_event_bytes=100,
-        max_ipc_frame_bytes=100_000,
-        event_encoder=die,
-    ) as worker:
-        with pytest.raises(EncoderHaltedError, match='encoder-died') as raised:
-            worker.encode(_event())
-        assert raised.value.code == 'encoder-died'
-        assert not worker._thread.is_alive()
 
 
 @pytest.mark.parametrize(
@@ -116,10 +106,12 @@ def test_encoder_propagates_encoding_exceptions_as_terminal_halts(
     def fail(_event: Event) -> bytes:
         raise factory()
 
-    with EncoderWorker(
-        max_event_bytes=100,
-        max_ipc_frame_bytes=100_000,
-        event_encoder=fail,
+    with nullcontext(
+        EventEncoder(
+            max_event_bytes=100,
+            max_ipc_frame_bytes=100_000,
+            event_encoder=fail,
+        )
     ) as worker:
         with pytest.raises(EncoderHaltedError, match='encoder-failed') as raised:
             worker.encode(_event())
@@ -131,72 +123,38 @@ def test_encoder_propagates_encoding_exceptions_as_terminal_halts(
 
 def test_encoder_rejects_event_and_complete_frame_oversize_before_return() -> None:
     with (
-        EncoderWorker(
-            max_event_bytes=9,
-            max_ipc_frame_bytes=1_000,
-            event_encoder=lambda _event: b'x' * 10,
+        nullcontext(
+            EventEncoder(
+                max_event_bytes=9,
+                max_ipc_frame_bytes=1_000,
+                event_encoder=lambda _event: b'x' * 10,
+            )
         ) as worker,
         pytest.raises(EncoderHaltedError, match='event-too-large') as raised,
     ):
         worker.encode(_event())
 
     assert raised.value.code == 'event-too-large'
+    assert 'event 1' in str(raised.value)
+    assert 'max_event_bytes' in str(raised.value)
 
     with (
-        EncoderWorker(
-            max_event_bytes=10,
-            max_ipc_frame_bytes=108,
-            event_encoder=lambda _event: b'x' * 10,
+        nullcontext(
+            EventEncoder(
+                max_event_bytes=10,
+                max_ipc_frame_bytes=108,
+                event_encoder=lambda _event: b'x' * 10,
+            )
         ) as worker,
         pytest.raises(_FrameTooLargeError, match='frame-too-large') as raised,
     ):
         worker.encode(_event())
     assert raised.value.code == 'frame-too-large'
+    assert 'event 1' in str(raised.value)
+    assert 'max_ipc_frame_bytes' in str(raised.value)
 
 
-def test_encoder_shutdown_interrupts_a_waiting_request() -> None:
-    started = threading.Event()
-    release = threading.Event()
-    outcome: list[BaseException | EncodedEvent] = []
-
-    def block(_event: Event) -> bytes:
-        started.set()
-        release.wait()
-        return b'event'
-
-    worker = EncoderWorker(
-        max_event_bytes=100,
-        max_ipc_frame_bytes=100_000,
-        event_encoder=block,
-    )
-
-    def encode() -> None:
-        try:
-            outcome.append(worker.encode(_event()))
-        except BaseException as exc:
-            if not isinstance(exc, Exception):
-                raise
-            outcome.append(exc)
-
-    caller = threading.Thread(target=encode)
-    caller.start()
-    try:
-        assert started.wait(timeout=1)
-        worker.close()
-        caller.join(timeout=1)
-    finally:
-        release.set()
-        worker.close()
-        caller.join(timeout=1)
-
-    assert not caller.is_alive()
-    assert len(outcome) == 1
-    assert isinstance(outcome[0], EncoderHaltedError)
-    assert 'shutdown' in str(outcome[0])
-    assert outcome[0].code == 'encoder-shutdown'
-
-
-def test_encoder_uses_real_dedicated_thread_and_one_event_handoff() -> None:
+def test_encoder_runs_inline_under_the_source_watchdog() -> None:
     encoding_threads: list[int] = []
 
     def encode(event: Event) -> bytes:
@@ -204,22 +162,20 @@ def test_encoder_uses_real_dedicated_thread_and_one_event_handoff() -> None:
         return encode_event(event)
 
     caller_thread = threading.get_ident()
-    with EncoderWorker(
-        max_event_bytes=10_000,
-        max_ipc_frame_bytes=100_000,
-        event_encoder=encode,
+    with nullcontext(
+        EventEncoder(
+            max_event_bytes=10_000,
+            max_ipc_frame_bytes=100_000,
+            event_encoder=encode,
+        )
     ) as worker:
-        internals = vars(worker)
-        assert internals['_requests'].maxsize == 1
-        assert internals['_results'].maxsize == 1
-        assert internals['_thread'].daemon
         first = worker.encode(_event(1))
         second = worker.encode(_event(2))
 
     assert first.event_id == 1
     assert second.event_id == 2
     assert len(set(encoding_threads)) == 1
-    assert encoding_threads[0] != caller_thread
+    assert encoding_threads[0] == caller_thread
     assert decode_event(first.event_frame) == _event(1)
 
 
@@ -227,7 +183,7 @@ def test_event_frame_encoded_event_count_matches_wire_bytes() -> None:
     encoded = EncodedEvent.from_event_frame(21, b'event')
     frame = _encode_fanout_message(EventDelivery(encoded))
 
-    assert encoded.byte_count == frame._wire_bytes
+    assert encoded.byte_count == frame.wire_bytes
 
 
 def test_event_frame_header_and_complete_size_match_wire_encoding() -> None:
@@ -235,14 +191,14 @@ def test_event_frame_header_and_complete_size_match_wire_encoding() -> None:
     encoded = EncodedEvent.from_event_frame(21, b'event')
     frame = _encode_fanout_message(EventDelivery(encoded))
 
-    assert encode_event_header('event', metadata) == frame._header
+    assert encode_event_header('event', metadata) == frame.header
     assert (
         event_frame_bytes(
             'event',
             metadata,
             payload_byte_count=len(encoded.event_frame),
         )
-        == frame._wire_bytes
+        == frame.wire_bytes
     )
 
 
@@ -379,31 +335,33 @@ def test_slow_group_detaches_without_delaying_healthy_group() -> None:
     assert healthy.drain() == tuple(EventDelivery(event) for event in events)
 
 
-def test_strict_capacity_and_ordering_maximum_identities_match_ipc_bytes() -> None:
-    maximum = 2**63 - 1
-    identity = LiveJoinIdentity(
-        site='s' * 64,
-        source='o' * 64,
-        group='g' * 64,
-        join_kind='strict',
-        source_generation='f' * 32,
-        group_generation=maximum,
-        boundary=maximum,
-        attempt_token='a' * 32,
+@pytest.mark.parametrize('ordering', ['eager', 'strict'])
+def test_source_logs_local_channel_detaches_once(
+    ordering: Literal['eager', 'strict'],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    channel = GroupChannel(group='local', ordering=ordering, max_events=1, max_bytes=1_000_000)
+    fanout = EventFanout()
+    fanout.attach(channel)
+    events = tuple(
+        EncodedEvent.from_event_frame(identifier, encode_event(_event(identifier)))
+        for identifier in (1, 2)
     )
-    controls = (
-        StrictCapacityControl(identity=identity, abort_limit=maximum),
-        StrictOrderingControl(
-            identity=identity,
-            event_id=maximum,
-            last_delivered_id=maximum,
-            delivery_floor=maximum,
-            action='halt',
-        ),
-    )
-
-    for control in controls:
-        assert control.byte_count == len(b''.join(_encode_fanout_message(control)._parts))
+    caplog.set_level(logging.INFO, logger='sg_event_daemon')
+    if ordering == 'strict':
+        strict = StrictBuffer(max_events=1, max_bytes=1_000_000)
+        attach_strict_group(
+            strict, 'local', 1, channel=channel, holdback_secs=300, delivery_floor=0
+        )
+        strict.observe_many(events, successful_time=0)
+        reason = 'strict-buffer-capacity'
+    else:
+        fanout.publish_events(events)
+        reason = 'queue-count-exhausted'
+    assert not channel.status.attached
+    fanout.detach('local', reason='later-close')
+    channel.close()
+    assert caplog.messages == [f'detached group local from its live channel: {reason}']
 
 
 def test_strict_group_never_receives_direct_event_frame() -> None:
@@ -419,6 +377,35 @@ def test_strict_group_never_receives_direct_event_frame() -> None:
     fanout.publish_events((_encoded(20),))
 
     assert strict.drain() == ()
+
+
+def test_strict_ordering_maximum_identities_match_ipc_bytes() -> None:
+    maximum = 2**63 - 1
+    identity = LiveJoinIdentity(
+        site='s' * 64,
+        source='o' * 64,
+        group='g' * 64,
+        join_kind='strict',
+        source_generation='f' * 32,
+        group_generation=maximum,
+        boundary=maximum,
+        attempt_token='a' * 32,
+    )
+    controls = (
+        StrictOrderingControl(
+            identity=identity, event_id=1, last_delivered_id=2, delivery_floor=0, action='halt'
+        ),
+        StrictOrderingControl(
+            identity=identity,
+            event_id=maximum,
+            last_delivered_id=maximum,
+            delivery_floor=maximum,
+            action='halt',
+        ),
+    )
+
+    for control in controls:
+        assert control.byte_count == len(b''.join(_encode_fanout_message(control).parts))
 
 
 def test_strict_paced_offer_reports_full_without_detaching_channel() -> None:

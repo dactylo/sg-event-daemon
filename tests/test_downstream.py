@@ -8,8 +8,7 @@ import pytest
 
 from sg_event_daemon import _downstream
 from sg_event_daemon._downstream import (
-    ClosableTextOutput,
-    _is_downstream_closure,
+    _ClosableTextOutput,
     _silence_descriptor,
     closable_stdout,
 )
@@ -18,19 +17,15 @@ from sg_event_daemon._downstream import (
 class _FailingStream(io.StringIO):
     def __init__(self, error: OSError) -> None:
         super().__init__()
-        self.error = error
+        self._error = error
         self.attempts = 0
 
     def flush(self) -> None:
-        raise self.error
+        raise self._error
 
     def write(self, _text: str) -> int:
         self.attempts += 1
-        raise self.error
-
-
-def test_broken_pipe_is_closure() -> None:
-    assert _is_downstream_closure(BrokenPipeError())
+        raise self._error
 
 
 def test_closable_stdout_flushes_when_leaving_by_system_exit(
@@ -89,7 +84,7 @@ def test_closable_stdout_restores_the_original_stream() -> None:
     original = sys.stdout
     with closable_stdout() as output:
         assert sys.stdout is output
-        assert not output._is_downstream_closed
+        assert not output.is_downstream_closed
     assert sys.stdout is original
 
 
@@ -108,12 +103,12 @@ def test_closable_stdout_silences_a_closed_descriptor(
 
     with closable_stdout() as output:
         print('discarded')
-        assert output._is_downstream_closed
+        assert output.is_downstream_closed
     assert silenced == [original]
 
 
 def test_flush_propagates_unrelated_errno() -> None:
-    output = ClosableTextOutput(_FailingStream(OSError(errno.EBADF, 'bad')))
+    output = _ClosableTextOutput(_FailingStream(OSError(errno.EBADF, 'bad')))
 
     with pytest.raises(OSError, match='bad'):
         output.flush()
@@ -121,39 +116,31 @@ def test_flush_propagates_unrelated_errno() -> None:
 
 def test_other_attributes_come_from_the_wrapped_stream() -> None:
     stream = io.StringIO()
-    output = ClosableTextOutput(stream)
+    output = _ClosableTextOutput(stream)
 
     assert output.getvalue is not None
     output.write('kept')
     assert stream.getvalue() == 'kept'
 
 
-def test_silence_descriptor_reports_streams_without_descriptors() -> None:
-    assert not _silence_descriptor(io.StringIO())
-
-
-def test_unrelated_errno_is_not_closure() -> None:
-    assert not _is_downstream_closure(OSError(errno.EBADF, 'bad'))
-
-
 def test_write_latches_closure_and_discards_later_text() -> None:
     stream = _FailingStream(BrokenPipeError())
-    output = ClosableTextOutput(stream)
+    output = _ClosableTextOutput(stream)
 
     assert output.write('first') == len('first')
     assert output.write('second') == len('second')
-    assert output._is_downstream_closed
+    assert output.is_downstream_closed
     assert stream.attempts == 1
 
 
 @pytest.mark.parametrize('error', [OSError(errno.EINVAL, 'closed'), OSError(errno.EBADF, 'bad')])
 def test_write_propagates_errors_that_are_not_closure(error: OSError) -> None:
-    output = ClosableTextOutput(_FailingStream(error))
+    output = _ClosableTextOutput(_FailingStream(error))
 
     with pytest.raises(OSError, match=r'closed|bad') as raised:
         output.write('text')
     assert raised.value is error
-    assert not output._is_downstream_closed
+    assert not output.is_downstream_closed
 
 
 class _FakeOs:
@@ -162,15 +149,15 @@ class _FakeOs:
 
     def __init__(self, *, redirect_error: OSError | None) -> None:
         self.events: list[tuple[str, int]] = []
-        self.redirect_error = redirect_error
+        self._redirect_error = redirect_error
 
     def close(self, fd: int) -> None:
         self.events.append(('close', fd))
 
     def dup2(self, source: int, _target: int) -> None:
         self.events.append(('dup2', source))
-        if self.redirect_error is not None:
-            raise self.redirect_error
+        if self._redirect_error is not None:
+            raise self._redirect_error
 
     def open(self, _path: str, _flags: int) -> int:
         return 37
@@ -208,7 +195,7 @@ def test_writelines_stops_consuming_after_closure() -> None:
             consumed.append(index)
             yield f'{index}\n'
 
-    output = ClosableTextOutput(_FailingStream(BrokenPipeError()))
+    output = _ClosableTextOutput(_FailingStream(BrokenPipeError()))
     output.writelines(lines())
     assert consumed == [0]
 

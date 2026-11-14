@@ -6,19 +6,15 @@ offline testing. To run a first plugin, start with the
 [README quick start](../README.md#quick-start); the [operations guide](operations.md) covers
 deployment and recovery.
 
-| If you want to...                                     | Start here                                                          |
-| ----------------------------------------------------- | ------------------------------------------------------------------- |
-| See how shotgunEvents concepts map                    | [What changes](#what-changes)                                       |
-| Port a complete plugin                                | [Before and after](#before-and-after)                               |
-| Move script keys and other secrets out of plugin code | [Credentials and secrets](#credentials-and-secrets)                 |
-| Know what `register` and setup may do                 | [Registration and setup](#registration-and-setup)                   |
-| Use the callback context                              | [Callback context](#callback-context)                               |
-| Make callbacks safe to run more than once             | [Callbacks must tolerate repeats](#callbacks-must-tolerate-repeats) |
-| Choose which events a callback receives               | [Event filters](#event-filters)                                     |
-| Decide which plugins share a group                    | [Groups, ordering, and failures](#groups-ordering-and-failures)     |
-| Write async callbacks                                 | [Sync and async](#sync-and-async)                                   |
-| Run several plugins in one process                    | [Shared workers](#shared-workers)                                   |
-| Test a plugin without a daemon or SG site             | [Test plugins offline](#test-plugins-offline)                       |
+| If you want to...                   | Start here                                                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Port a shotgunEvents plugin         | [What changes](#what-changes), then [Before and after](#before-and-after).                                         |
+| Move secrets out of code            | [Credentials and secrets](#credentials-and-secrets).                                                               |
+| Initialize a plugin                 | [Registration and setup](#registration-and-setup).                                                                 |
+| Test without a daemon or SG site    | [Test plugins offline](#test-plugins-offline).                                                                     |
+| Look up context fields or filters   | [Callback context](#callback-context) and [Event filters](#event-filters).                                         |
+| Choose grouping or execution mode   | [Groups](#groups-ordering-and-failures), [Sync and async](#sync-and-async), and [Shared workers](#shared-workers). |
+| Inspect harness settings or results | [Harness reference](#harness-reference).                                                                           |
 
 ## What changes
 
@@ -96,12 +92,8 @@ config = { project_id = 123 }
 The closure replaces the shotgunEvents `args` argument. `registrar.config` is a deeply frozen copy
 of the plugin's `config` table, which must be JSON-compatible and must not contain secrets.
 
-Keep plugin and callback ids stable. For an event in progress, the daemon records which callbacks
-still need to run, identified by plugin id, callback id, order, event filter, configuration, secret
-references, and credential. If any of these change while an event is in progress, for example after
-a callback fails, the group stops with `shape-mismatch` until you restore the previous registration
-or an operator runs [`restart-event`](operations.md#retry-skip-or-restart-the-current-event).
-Changing a callback's code alone does not change its registration.
+Keep plugin and callback IDs stable. If registration changes while an event is in progress, the
+group can stop with `shape-mismatch`; see [registration identity](#registration-identity).
 
 ## Credentials and secrets
 
@@ -183,119 +175,14 @@ Setup runs when a worker starts the group, before its first callback, and again 
 retries a failed setup, so make it idempotent. A setup failure stops the group in the same way as a
 callback failure.
 
-## Callback context
+### Registration identity
 
-Setup receives a context with these fields:
-
-- `sg`: the plugin's SG handle, created with its callback credential. The daemon owns the handle;
-  do not close it.
-- `logger`: a logger named for the plugin, which writes to the daemon's standard output.
-- `config`: the plugin's immutable configuration.
-- `secrets`: the plugin's redacted secret values.
-- `site`, `source`, `group`, and `plugin_id`: where the plugin runs.
-- `shutdown_requested`: whether the daemon has asked the worker to stop.
-- `heartbeat()`: extends the current deadline during legitimate long work.
-
-Callbacks receive the same fields and these:
-
-- `event`: the immutable event.
-- `callback_id`: the id of the running callback.
-- `delivery_attempt`: the attempt number, starting at 1, recorded durably across restarts.
-- `is_operator_replay`: true while an operator replay is catching up, until the group rejoins live
-  delivery. Later live deliveries in the same generation see false.
-
-Before each callback, the daemon applies the event's `session_uuid` to `context.sg`, so SG can show
-the callback's changes in the browser session that produced the event. shotgunEvents does this only
-when its `use_session_uuid` option is on.
-
-Each setup or callback call must finish within the group's `callback_deadline_secs` (120 seconds by
-default). Call `context.heartbeat()` during legitimate long work to extend the deadline. When one
-callback overruns its deadline, the supervisor parks that group and replaces the worker without
-counting the restart toward its breaker. The event stays in progress; the interrupted callback runs
-again after an operator unparks the group. Other overruns take the ordinary worker restart path.
-
-A callback must also finish or join every thread or task it starts before it returns. The daemon
-records the callback as complete when it returns and cannot track work that escapes. Background
-work that still uses the event can lose ordering, bypass retry, and outlive shutdown.
-
-### Callbacks must tolerate repeats
-
-Delivery is at least once. A callback can run again when the process dies after a side effect but
-before the daemon records completion, when an operator replays events from an earlier ID, or after
-an operator `retry`, which increases `delivery_attempt`. Make each callback idempotent, or use a
-remote idempotency key when a side effect cannot safely repeat.
-
-## Event filters
-
-`events` maps event types to the attribute names a callback wants:
-
-```python
-registrar.add_callback(
-    id='shot-status-only',
-    callback=callback,
-    events={
-        'Shotgun_Shot_Change': ('sg_status_list',),
-        'Shotgun_Shot_New': None,
-    },
-)
-```
-
-Map an event type to `None` to match all of its attributes, or to a list or tuple of attribute
-names. The key `'*'` matches every event type, and `'*'` among attribute names matches every
-attribute. An empty attribute list matches nothing. An empty `events` mapping, like omitting
-`events`, receives every event.
-
-## Groups, ordering, and failures
-
-Within a group, callbacks run one event at a time, in configured plugin order and then declaration
-order. All plugins in a group form one serial ordering and failure domain. A failed callback stops
-later callbacks and later events for the whole group, while other groups continue. Place callbacks
-that depend on each other's order in one group, and split independent work into separate groups so
-that one failure does not stop unrelated plugins.
-
-Recovery also applies to the whole group. `replay --from-event-id ID` makes `ID` the first event
-delivered again to every plugin in the group, and it returns only the events SG exposes at replay
-time. It is at-least-once recovery, not an exact reconstruction of history. See
-[recovery](operations.md#recover-a-group-or-source) for the operator commands.
-
-## Sync and async
-
-A group has one execution mode, set by `execution`. A `sync` group accepts only ordinary setup and
-callback functions. An `async` group accepts only native async setup and callback functions:
-
-```python
-async def setup(context):
-    await context.sg.find('Project', [], ['id'], limit=1)
-
-
-async def callback(context):
-    await context.sg.find('Shot', [['id', 'is', context.event['entity']['id']]], ['id'])
-
-
-def register(registrar):
-    registrar.set_setup(setup)
-    registrar.add_callback(id='async-shot', callback=callback)
-```
-
-Async groups require the `sg-python-api-async` installation extra, with
-`sg_api_provider = "sg-python-api"` in the configuration. The daemon owns one persistent event loop
-per group, so do not call `asyncio.run()` inside an async callback.
-
-## Shared workers
-
-Plugins whose groups share a worker share one process. They must not:
-
-- install or replace process signal handlers;
-- reconfigure root logging or add shared rotating handlers;
-- monkey-patch process-wide modules;
-- mutate provider globals; or
-- assume they own the process or event loop.
-
-Use the context logger, and let the service manager own standard output and standard error. Give a
-plugin that cannot follow these rules its own process by setting `worker = "dedicated"` on its
-group. To share a process among chosen groups instead, define a named worker at
-`[sites.<site>.workers.<name>]` and set `worker = "<name>"` on each of those groups. Sharing a
-process changes fault isolation and resource use, not delivery semantics.
+Keep plugin and callback IDs stable. For an event in progress, the daemon records which callbacks
+still need to run, identified by plugin id, callback id, order, event filter, configuration, secret
+references, and credential. If any of these change while an event is in progress, for example after
+a callback fails, the group stops with `shape-mismatch` until you restore the previous registration
+or an operator runs [`restart-event`](operations.md#retry-skip-or-restart-the-current-event).
+Changing a callback's code alone does not change its registration.
 
 ## Test plugins offline
 
@@ -352,21 +239,220 @@ assert handle.updates == [('Shot', 123, {'sg_seen_by_daemon': True})]
 assert handle.closed
 ```
 
-`drive_sync_plugin` runs setup, then each matching callback, and returns a `DriveResult`. Its `ok`
-property is true when setup and every callback succeeded. `setup_failure` holds a `FailureReport`
-when setup fails; `callbacks` is a tuple of `CallbackResult` records for matching callbacks that
-ran, stopping at the first failure. Each callback result has `event_id`, `plugin_id`,
-`callback_id`, the one-based `delivery_attempt`, and a `failure` report or `None`. A failure report
-has a stable `code`, redacted `detail`, and `site`, `group`, `plugin_id`, and `callback_id`
-identity fields. Its `detail` includes the code and identity, not just the underlying exception
-text. Harness-reachable codes include `secret-missing`, `event-invalid`, `setup-failed`, and
-`callback-failed`.
+The assertions check that setup and callbacks succeeded, the expected SG update was made, and the
+harness closed the handle. `drive_sync_plugin` stops at the first failure and returns the result;
+see [harness results](#harness-results) to inspect failures.
 
-For an async plugin, load it with `execution='async'` and await `drive_async_plugin` with the same
-arguments. `HarnessSettings` accepts `site`, `source`, and `group` for the context identity,
-`config` for non-secret settings, and `secrets`, a mapping from secret names to environment
-variable names. `load_plugin` returns a `LoadedPlugin` with `plugin_id`, `execution`, `site`,
-`source`, `group`, registered callback IDs in `callbacks`, and frozen `config`.
+For an async plugin, call `load_plugin(..., execution='async')` and await `drive_async_plugin` with
+the same arguments. Supply an async `close` method on its test handle; `set_session_uuid` stays
+synchronous. See [harness rules](#harness-rules) for input and cleanup requirements.
+
+## Callback context
+
+Setup and callbacks receive these fields:
+
+| Field or method                        | Meaning                                                                               |
+| -------------------------------------- | ------------------------------------------------------------------------------------- |
+| `sg`                                   | Plugin SG handle, using its callback credential. The daemon owns it; do not close it. |
+| `logger`                               | Plugin logger, writing to the daemon's standard output.                               |
+| `config`                               | Immutable plugin configuration.                                                       |
+| `secrets`                              | Redacted secret values; use `reveal()` deliberately.                                  |
+| `site`, `source`, `group`, `plugin_id` | Identity of where the plugin runs.                                                    |
+| `shutdown_requested`                   | Whether the daemon has asked the worker to stop.                                      |
+| `heartbeat()`                          | Extends the current deadline during legitimate long work.                             |
+| `heartbeat_callback`                   | Host-supplied callable used by `heartbeat()`.                                         |
+| `shutdown_check`                       | Host-supplied callable used by `shutdown_requested`.                                  |
+
+Callbacks also receive:
+
+| Field                | Meaning                                                                            |
+| -------------------- | ---------------------------------------------------------------------------------- |
+| `event`              | Immutable event.                                                                   |
+| `callback_id`        | ID of the running callback.                                                        |
+| `delivery_attempt`   | Attempt number, starting at 1 and recorded durably across restarts.                |
+| `is_operator_replay` | True during operator replay catch-up; false after the group rejoins live delivery. |
+
+Before each callback, the daemon applies the event's `session_uuid` to `context.sg`, so SG can show
+the callback's changes in the browser session that produced the event. shotgunEvents does this only
+when its `use_session_uuid` option is on.
+
+### Deadlines and background work
+
+Each setup or callback call must finish within the group's `callback_deadline_secs` (120 seconds by
+default). Call `context.heartbeat()` during legitimate long work to extend the deadline. When one
+callback overruns its deadline, the supervisor parks that group and replaces the worker without
+counting the restart toward its breaker. The event stays in progress; the interrupted callback runs
+again after an operator unparks the group. Other overruns take the ordinary
+[worker restart path](operations.md#choose-workers).
+
+A callback must also finish or join every thread or task it starts before it returns. The daemon
+records the callback as complete when it returns and cannot track work that escapes. Background
+work that still uses the event can lose ordering, bypass retry, and outlive shutdown.
+
+A callback that calls `sys.exit()` fails like any other exception: its group stops with
+`callback-failed`. Fix the callback, then
+[retry, skip, or restart the current event](operations.md#retry-skip-or-restart-the-current-event).
+
+### Callbacks must tolerate repeats
+
+Delivery is at least once. A callback can run again when the process dies after a side effect but
+before the daemon records completion, when an operator replays events from an earlier ID, or after
+an operator `retry`, which increases `delivery_attempt`. Make each callback idempotent, or use a
+remote idempotency key when a side effect cannot safely repeat.
+
+## Event filters
+
+`events` maps event types to the attribute names a callback wants:
+
+```python
+registrar.add_callback(
+    id='shot-status-only',
+    callback=callback,
+    events={
+        'Shotgun_Shot_Change': ('sg_status_list',),
+        'Shotgun_Shot_New': None,
+    },
+)
+```
+
+| Filter                                           | Matches                              |
+| ------------------------------------------------ | ------------------------------------ |
+| Omitted `events`, or an empty mapping            | Every event.                         |
+| An event type mapped to `None`                   | Every attribute of that event type.  |
+| An event type mapped to a list or tuple of names | Those attributes of that event type. |
+| `'*'` as an event-type key                       | Every event type.                    |
+| `'*'` in the attribute names                     | Every attribute.                     |
+| An empty attribute list                          | Nothing for that event type.         |
+
+## Groups, ordering, and failures
+
+Within a group, callbacks run one event at a time, in configured plugin order and then declaration
+order. All plugins in a group form one serial ordering and failure domain. A failed callback stops
+later callbacks and later events for the whole group, while other groups continue. Place callbacks
+that depend on each other's order in one group, and split independent work into separate groups so
+that one failure does not stop unrelated plugins.
+
+SG can make an event visible after events with higher IDs. shotgunEvents waits up to 5 minutes for
+such an event, runs it when it appears, and then runs again the events after it that it had already
+handled. The daemon runs a late event once. In an eager group, the default, it runs soon after the
+source finds it, after any higher IDs already delivered. The source checks open gaps on every poll;
+its [late-event window](operations.md#set-the-late-event-window) limits the wait for IDs that never
+appear. A callback that applies a late event's value can overwrite a newer one. Read the entity's
+current state from SG when that matters, or use a
+[strict group](operations.md#choose-eager-or-strict-ordering).
+
+Recovery also applies to the whole group. `replay --from-event-id ID` makes `ID` the first event
+delivered again to every plugin in the group, and it returns only the events SG exposes at replay
+time. It is at-least-once recovery, not an exact reconstruction of history. See
+[recovery](operations.md#recover-a-group-or-source) for the operator commands.
+
+## Sync and async
+
+A group has one execution mode, set by `execution`. Registration is synchronous in both modes.
+
+| Mode    | Setup and callbacks     | Installation extra                | `sg_api_provider`             |
+| ------- | ----------------------- | --------------------------------- | ----------------------------- |
+| `sync`  | Ordinary functions.     | `shotgun-api3` or `sg-python-api` | The selected provider's name. |
+| `async` | Native async functions. | `sg-python-api-async`             | `"sg-python-api"`             |
+
+For an async group:
+
+```python
+async def setup(context):
+    await context.sg.find('Project', [], ['id'], limit=1)
+
+
+async def callback(context):
+    await context.sg.find('Shot', [['id', 'is', context.event['entity']['id']]], ['id'])
+
+
+def register(registrar):
+    registrar.set_setup(setup)
+    registrar.add_callback(id='async-shot', callback=callback)
+```
+
+Install one provider only. The daemon owns one persistent event loop per async group, so do not
+call `asyncio.run()` inside an async callback.
+
+## Shared workers
+
+Plugins whose groups share a worker share one process. They must not:
+
+- install or replace process signal handlers;
+- reconfigure root logging or add shared rotating handlers;
+- monkey-patch process-wide modules;
+- mutate provider globals; or
+- assume they own the process or event loop.
+
+Use the context logger, and let the service manager own standard output and standard error. Give a
+plugin that cannot follow these rules its own process by setting `worker = "dedicated"` on its
+group. To share a process among chosen groups instead, define a named worker at
+`[sites.<site>.workers.<name>]` and set `worker = "<name>"` on each of those groups. Sharing a
+process changes fault isolation and resource use, not delivery semantics.
+
+## Harness reference
+
+Import the harness API from `sg_event_daemon.testing`. It runs one plugin with synthetic events,
+without a daemon, database, or SG connection.
+
+### Harness settings and loaded plugins
+
+Pass a `HarnessSettings` instance to `load_plugin`:
+
+| Setting                   | Purpose                                                  |
+| ------------------------- | -------------------------------------------------------- |
+| `site`, `source`, `group` | Context identity.                                        |
+| `config`                  | Non-secret, JSON-compatible settings.                    |
+| `secrets`                 | Mapping from secret names to environment variable names. |
+
+`load_plugin` returns a `LoadedPlugin`:
+
+| Field                                  | Meaning                                        |
+| -------------------------------------- | ---------------------------------------------- |
+| `plugin_id`, `site`, `source`, `group` | Plugin and context identity.                   |
+| `execution`                            | `sync` or `async`.                             |
+| `callbacks`                            | Registered callback IDs in declaration order.  |
+| `config`                               | Frozen plugin configuration.                   |
+| `module`                               | Imported plugin module.                        |
+| `site_config`, `group_config`          | Validated configuration used by the host.      |
+| `plugin_spec`                          | Registered plugin configuration and callbacks. |
+
+`build_host(provider)` creates an unstarted host using the supplied provider. The caller owns its
+lifecycle; the `drive_sync_plugin` and `drive_async_plugin` helpers manage that lifecycle for the
+common testing workflow.
+
+### Harness results
+
+`drive_sync_plugin` and `drive_async_plugin` run setup, then matching callbacks. Both accept these
+optional arguments:
+
+| Argument             | Meaning                                                                      |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `sg`                 | Test handle for plugin SG requests; the default rejects requests.            |
+| `delivery_attempt`   | One-based attempt number, default 1; non-positive values raise `ValueError`. |
+| `is_operator_replay` | Whether the synthetic delivery is an operator replay; defaults to `False`.   |
+
+They return a `DriveResult`:
+
+| Field or property | Meaning                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------- |
+| `ok`              | True when setup and every callback succeeded.                                                     |
+| `setup_failure`   | `FailureReport` when setup fails; otherwise `None`.                                               |
+| `callbacks`       | Tuple of `CallbackResult` records for matching callbacks that ran, stopping at the first failure. |
+
+Each `CallbackResult` describes one invocation:
+
+| Field                                  | Meaning                                       |
+| -------------------------------------- | --------------------------------------------- |
+| `event_id`, `plugin_id`, `callback_id` | Event and callback identity.                  |
+| `delivery_attempt`                     | One-based attempt number.                     |
+| `failure`                              | `FailureReport` on failure; otherwise `None`. |
+
+| `FailureReport` field                       | Meaning                                                                                                              |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `code`                                      | Stable failure code. Harness codes include `secret-missing`, `event-invalid`, `setup-failed`, and `callback-failed`. |
+| `detail`                                    | Redacted detail including the code and identity, not just the underlying exception.                                  |
+| `site`, `group`, `plugin_id`, `callback_id` | Identity of the failure.                                                                                             |
 
 ### Harness rules
 

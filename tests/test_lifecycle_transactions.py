@@ -753,7 +753,6 @@ def test_lifecycle_kill_at_commit_preserves_exact_old_or_new_state(
         capture_output=True,
         text=True,
         check=False,
-        timeout=20,
     )
     assert result.returncode == -signal.SIGKILL, result.stderr
     assert oracle.exists()
@@ -807,7 +806,7 @@ def test_lifecycle_kill_at_commit_preserves_exact_old_or_new_state(
 
 @pytest.mark.parametrize(
     'operation',
-    ['history', 'floor', 'strict-floor', 'strict-outcome', 'strict-ordering', 'strict-capacity'],
+    ['history', 'strict-outcome', 'strict-ordering'],
 )
 def test_only_lifecycle_transactions_use_the_full_connection(
     tmp_path: Path,
@@ -836,17 +835,13 @@ def test_only_lifecycle_transactions_use_the_full_connection(
                 boundary=100,
                 attempt_token=current_join,
             )
-            if operation in {'strict-ordering', 'strict-capacity'}:
+            if operation == 'strict-ordering':
                 state.advance_irrelevant(100, expected_revision=state.snapshot().revision)
                 state.commit_live_join(identity, expected_revision=state.snapshot().revision)
             writes.connections.clear()
             revision = state.snapshot().revision
             if operation == 'history':
                 state.mark_history_truncated(45, expected_revision=revision)
-            elif operation == 'floor':
-                state.record_delivery_floor_skip(40, expected_revision=revision)
-            elif operation == 'strict-floor':
-                state.record_strict_floor_skip(40, expected_revision=revision)
             elif operation == 'strict-outcome':
                 state.record_strict_join_outcome(
                     attempt_token=capacity_join,
@@ -854,14 +849,10 @@ def test_only_lifecycle_transactions_use_the_full_connection(
                     abort_limit=3,
                     expected_revision=revision,
                 )
-            elif operation == 'strict-ordering':
+            else:
                 state.record_strict_ordering_decision(
                     StrictOrderingControl(identity, 99, 100, 41, 'halt'),
                     expected_revision=revision,
-                )
-            else:
-                state.mark_strict_capacity_exhausted(
-                    identity, abort_limit=3, expected_revision=revision
                 )
             assert len(writes.connections) == 1
             assert writes.connections[0].execute('PRAGMA synchronous').fetchone() == (1,)
@@ -880,9 +871,10 @@ def test_source_initialization_is_full_but_restart_is_configured(tmp_path: Path)
             stream_fingerprint=STREAM,
             source_generation=SOURCE_GENERATION,
         ) as source:
+            source.stamp_generation()
             if create:
                 source.initialize(100, incarnation='incarnation-1')
             assert [
                 connection.execute('PRAGMA synchronous').fetchone()[0]
                 for connection in writes.connections
-            ] == ([2, 2, 2] if create else [1])
+            ] == ([2, 1, 2] if create else [1])

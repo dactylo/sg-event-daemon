@@ -23,6 +23,10 @@ _WriteTransaction: TypeAlias = (
 )
 
 BUSY_TIMEOUT_SECS = 5.0
+WAL_IN_USE_LIMIT_BYTES = 256 * 1024 * 1024
+WAL_REUSE_WAIT_SECS = 0.1
+WAL_TRIGGER_BYTES = WAL_IN_USE_LIMIT_BYTES // 16
+WAL_TRIGGER_CHECK_SECS = 0.1
 _MAX_BUSY_TIMEOUT_MILLIS = 2_147_483_647
 _MIN_SQLITE_VERSION = (3, 51, 3)
 _SYNCHRONOUS_LEVELS = frozenset({'FULL', 'NORMAL'})
@@ -94,6 +98,7 @@ class _OpenSettings:
     busy_timeout_secs: float
     create: bool
     write_transaction: _WriteTransaction | None
+    initialize: Callable[[sqlite3.Connection], None] | None
     synchronous: str
 
 
@@ -136,6 +141,7 @@ def _open_settings(
     busy_timeout_secs: float,
     create: bool,
     write_transaction: _WriteTransaction | None,
+    initialize: Callable[[sqlite3.Connection], None] | None,
 ) -> _OpenSettings:
     """Validate opening policy and derive SQLite connection settings."""
     if synchronous not in _SYNCHRONOUS_LEVELS:
@@ -146,6 +152,7 @@ def _open_settings(
         create=create,
         synchronous=synchronous,
         write_transaction=write_transaction,
+        initialize=initialize,
     )
 
 
@@ -179,14 +186,6 @@ def _validate_schema(schema: Schema) -> None:
         raise _SchemaVersionError('schema version must be positive')
 
 
-def _validate_sqlite_version() -> None:
-    """Reject SQLite libraries predating the required WAL corruption fix."""
-    if sqlite3.sqlite_version_info < _MIN_SQLITE_VERSION:
-        required = '.'.join(str(part) for part in _MIN_SQLITE_VERSION)
-        actual = sqlite3.sqlite_version
-        raise DatabaseError(f'SQLite {required} or newer is required; runtime provides {actual}')
-
-
 def database_family_size(path: Path) -> int:
     """Return the current bytes used by one SQLite file family.
 
@@ -195,6 +194,9 @@ def database_family_size(path: Path) -> int:
 
     Returns:
         Sum of the main file and existing WAL and SHM sidecars.
+
+    Raises:
+        OSError: An existing database-family file cannot be inspected.
     """
     total = 0
     for candidate in (path, Path(f'{path}-wal'), Path(f'{path}-shm')):
@@ -244,10 +246,11 @@ def _initialize_database(
     identity: str,
     schema: Schema,
     write_transaction: _WriteTransaction | None,
+    initialize: Callable[[sqlite3.Connection], None] | None,
 ) -> None:
     """Create metadata and the first schema in one transaction."""
-    initialize = transaction if write_transaction is None else write_transaction
-    with initialize(connection):
+    begin = transaction if write_transaction is None else write_transaction
+    with begin(connection):
         connection.execute(
             'CREATE TABLE _daemon_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
         )
@@ -258,6 +261,8 @@ def _initialize_database(
         for statement in schema.statements:
             connection.execute(statement)
         connection.execute(f'PRAGMA user_version={schema.version}')
+        if initialize is not None:
+            initialize(connection)
 
 
 def _initialize_or_validate(
@@ -278,32 +283,35 @@ def _initialize_or_validate(
     if current_version == 0 and not has_metadata:
         if not settings.create:
             raise DatabaseError(f'database is not initialized: {path}')
-        _initialize_database(connection, identity, schema, settings.write_transaction)
+        _initialize_database(
+            connection, identity, schema, settings.write_transaction, settings.initialize
+        )
         return
     if not settings.create and (current_version == 0 or not has_metadata):
         raise DatabaseError(f'database is not initialized: {path}')
     if not has_metadata:
-        raise _SchemaVersionError('database is missing identity metadata')
+        raise _SchemaVersionError(f'{path}: database is missing identity metadata')
     stored_row = connection.execute(
         "SELECT value FROM _daemon_metadata WHERE key = 'identity'"
     ).fetchone()
     if stored_row is None:
         if not settings.create:
             raise DatabaseError(f'database is not initialized: {path}')
-        raise _SchemaVersionError('database is missing identity metadata')
+        raise _SchemaVersionError(f'{path}: database is missing identity metadata')
     stored_identity = str(stored_row[0])
     if stored_identity != identity:
         raise DatabaseError(
-            f'database identity mismatch: stored {stored_identity!r}, requested {identity!r}'
+            f'{path}: database identity mismatch: stored {stored_identity!r}, '
+            f'requested {identity!r}'
         )
     if current_version > schema.version:
         raise _SchemaVersionError(
-            f'database has newer schema version {current_version}; '
+            f'{path}: database has newer schema version {current_version}; '
             f'this release supports {schema.version}'
         )
     if current_version != schema.version:
         raise _SchemaVersionError(
-            f'database has unsupported schema version {current_version}; '
+            f'{path}: database has unsupported schema version {current_version}; '
             f'this release supports {schema.version}'
         )
 
@@ -323,6 +331,18 @@ def _configure_open_connection(
         _initialize_or_validate(connection, identity, schema, settings=settings, path=path)
 
 
+def validate_sqlite_version() -> None:
+    """Reject SQLite libraries predating the required WAL corruption fix.
+
+    Raises:
+        DatabaseError: The runtime SQLite version is older than 3.51.3.
+    """
+    if sqlite3.sqlite_version_info < _MIN_SQLITE_VERSION:
+        required = '.'.join(str(part) for part in _MIN_SQLITE_VERSION)
+        actual = sqlite3.sqlite_version
+        raise DatabaseError(f'SQLite {required} or newer is required; runtime provides {actual}')
+
+
 def open_database(  # noqa: PLR0913
     path: Path,
     identity: str,
@@ -332,6 +352,7 @@ def open_database(  # noqa: PLR0913
     busy_timeout_secs: float = BUSY_TIMEOUT_SECS,
     create: bool = True,
     write_transaction: _WriteTransaction | None = None,
+    initialize: Callable[[sqlite3.Connection], None] | None = None,
 ) -> DatabaseHandle:
     """Open and configure one secure daemon SQLite database.
 
@@ -344,6 +365,9 @@ def open_database(  # noqa: PLR0913
         create: Whether to initialize a missing database.
         write_transaction: Optional initialization transaction factory; `None`
             resolves the supervisor transaction helper at call time.
+        initialize: Optional creation-only callback run after the schema,
+            inside its transaction. Existing databases never invoke this
+            callback.
 
     Returns:
         An owned configured database handle.
@@ -354,13 +378,14 @@ def open_database(  # noqa: PLR0913
         DatabaseError: If policy, opening, initialization, or validation fails,
             including when the schema version is unsupported.
     """
-    _validate_sqlite_version()
+    validate_sqlite_version()
     _validate_schema(schema)
     settings = _open_settings(
         synchronous,
         busy_timeout_secs=busy_timeout_secs,
         create=create,
         write_transaction=write_transaction,
+        initialize=initialize,
     )
     try:
         fd, created = secure_open_regular_file(path, create=settings.create)
@@ -384,7 +409,7 @@ def open_database(  # noqa: PLR0913
             connection.close()
         if settings.create and created:
             _cleanup_new_database(path)
-        raise DatabaseError(str(exc)) from exc
+        raise DatabaseError(f'{path}: {exc}') from exc
     except BaseException:
         if connection is not None:
             connection.close()
@@ -392,3 +417,70 @@ def open_database(  # noqa: PLR0913
             _cleanup_new_database(path)
         raise
     return DatabaseHandle(connection=connection, path=path)
+
+
+@contextmanager
+def temporary_busy_timeout(connection: sqlite3.Connection, timeout_millis: int) -> Generator[None]:
+    """Restore a connection's busy timeout after a bounded SQLite operation.
+
+    A restore failure is attached to an active failure, preserving its primary
+    cause. With no active failure, the restore failure becomes `DatabaseError`.
+
+    Args:
+        connection: Connection whose local policy is temporarily changed.
+        timeout_millis: Temporary SQLite wait in milliseconds.
+
+    Raises:
+        DatabaseError: Reading, setting, or restoring the timeout failed.
+    """
+    try:
+        (previous,) = connection.execute('PRAGMA busy_timeout').fetchone()
+        connection.execute(f'PRAGMA busy_timeout={timeout_millis}')
+    except sqlite3.Error as error:
+        raise DatabaseError(str(error)) from error
+    failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            connection.execute(f'PRAGMA busy_timeout={previous}')
+        except sqlite3.Error as error:
+            if failure is None:
+                raise DatabaseError(str(error)) from error
+            failure.add_note(f'busy_timeout restore failure: {error!r}')
+
+
+def wal_file_bytes(database_path: Path) -> int:
+    """Return the physical WAL size in bytes, or zero when no WAL file exists.
+
+    Raises:
+        OSError: The WAL cannot be inspected for a reason other than absence.
+    """
+    try:
+        return os.lstat(f'{database_path}-wal').st_size
+    except FileNotFoundError:
+        return 0
+
+
+def truncate_wal_over_bound(connection: sqlite3.Connection, database_path: Path) -> bool:
+    """Try one bounded truncation before an owner's first write to a large WAL.
+
+    Returns:
+        Whether TRUNCATE ran. A busy result still returns True; writers then
+        obey the ordinary growth pause until scheduled reuse succeeds.
+
+    Raises:
+        DatabaseError: SQLite failed to run the checkpoint or restore policy.
+        OSError: The WAL size cannot be inspected.
+    """
+    if wal_file_bytes(database_path) <= WAL_IN_USE_LIMIT_BYTES:
+        return False
+    try:
+        with temporary_busy_timeout(connection, int(WAL_REUSE_WAIT_SECS * 1000)):
+            connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+    except sqlite3.Error as error:
+        raise DatabaseError(str(error)) from error
+    return True

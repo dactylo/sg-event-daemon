@@ -1,0 +1,4826 @@
+{
+  "eager/success": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 0,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/stale_revision": {
+    "outcome": {
+      "error": "RevisionConflictError",
+      "message": "expected group revision 1"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/missing_inflight": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "no event is in flight"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          null,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/failure": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback completion is blocked by recovery evidence"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          "callback-failed",
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/required_event": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback completion is blocked by recovery evidence"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          42,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/shape_mismatch": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback completion is blocked by recovery evidence"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/malformed_manifest": {
+    "outcome": {
+      "error": "ValueError",
+      "message": "invalid callback manifest JSON"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "invalid",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/missing_mark": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback was not invoked and pending"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/uninvoked_mark": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback was not invoked and pending"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          0
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/terminal_mark": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback was not invoked and pending"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "done",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/nonfinal_callback": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 41,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": 42,
+        "in_flight_obligation_id": null,
+        "manifest": {
+          "callbacks": [
+            {
+              "ordinal": 0,
+              "plugin_id": "publish",
+              "callback_id": "publish",
+              "execution": "sync",
+              "filter_digest": "filter-0",
+              "config_digest": "config-0",
+              "secret_refs": [
+                [
+                  "token",
+                  "PUBLISH_TOKEN"
+                ]
+              ],
+              "credential_name": "publisher",
+              "credential_fingerprint": "publisher:publish-script"
+            }
+          ]
+        },
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [
+          [
+            0,
+            "publish",
+            "publish",
+            "done",
+            1
+          ],
+          [
+            1,
+            "publish",
+            "next",
+            "pending",
+            0
+          ]
+        ],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 0,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "done",
+          1
+        ],
+        [
+          "editorial",
+          42,
+          1,
+          "publish",
+          "next",
+          "pending",
+          0
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/strict_fence": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 1,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "fence",
+          41,
+          51,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          41,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "fence",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          3,
+          3
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/late_pending": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 1,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "own",
+          42,
+          52,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          42,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [
+        [
+          "editorial",
+          "own",
+          42,
+          "done",
+          null
+        ]
+      ],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "own",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          3,
+          3
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/late_done": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 1,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "own",
+          42,
+          52,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          42,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [
+        [
+          "editorial",
+          "own",
+          42,
+          "done",
+          null
+        ]
+      ],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "own",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          3,
+          3
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/late_other_fence": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 2,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "earlier",
+          1,
+          11,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          "own",
+          42,
+          52,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          42,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [
+        [
+          "editorial",
+          "own",
+          42,
+          "done",
+          null
+        ]
+      ],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "earlier",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ],
+        [
+          "own",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          5,
+          5
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "eager/parked": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "parked",
+        "conditions": [
+          "parked"
+        ],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "eager",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": true,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 0,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "23e08af5f784893b2ff513dd8646bd6bd28341295e12fa2d446665ddb75f2f5a",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"eager\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          1,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "eager",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          0.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/success": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "strict",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 0,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/stale_revision": {
+    "outcome": {
+      "error": "RevisionConflictError",
+      "message": "expected group revision 1"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/missing_inflight": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "no event is in flight"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          null,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/failure": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback completion is blocked by recovery evidence"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          "callback-failed",
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/required_event": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback completion is blocked by recovery evidence"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          42,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/shape_mismatch": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback completion is blocked by recovery evidence"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/malformed_manifest": {
+    "outcome": {
+      "error": "ValueError",
+      "message": "invalid callback manifest JSON"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "invalid",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/missing_mark": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback was not invoked and pending"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/uninvoked_mark": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback was not invoked and pending"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          0
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/terminal_mark": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "callback was not invoked and pending"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "done",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/nonfinal_callback": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 41,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "strict",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": 42,
+        "in_flight_obligation_id": null,
+        "manifest": {
+          "callbacks": [
+            {
+              "ordinal": 0,
+              "plugin_id": "publish",
+              "callback_id": "publish",
+              "execution": "sync",
+              "filter_digest": "filter-0",
+              "config_digest": "config-0",
+              "secret_refs": [
+                [
+                  "token",
+                  "PUBLISH_TOKEN"
+                ]
+              ],
+              "credential_name": "publisher",
+              "credential_fingerprint": "publisher:publish-script"
+            }
+          ]
+        },
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [
+          [
+            0,
+            "publish",
+            "publish",
+            "done",
+            1
+          ],
+          [
+            1,
+            "publish",
+            "next",
+            "pending",
+            0
+          ]
+        ],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 0,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "done",
+          1
+        ],
+        [
+          "editorial",
+          42,
+          1,
+          "publish",
+          "next",
+          "pending",
+          0
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/strict_fence": {
+    "outcome": {
+      "error": "StrictObligationBlockedError",
+      "message": "strict delivery is blocked by an unresolved obligation"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "fence",
+          41,
+          51,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          41,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          null,
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "fence",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          3,
+          3
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/late_pending": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "strict",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 1,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "own",
+          42,
+          52,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          42,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [
+        [
+          "editorial",
+          "own",
+          42,
+          "done",
+          null
+        ]
+      ],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "own",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          3,
+          3
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/late_done": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "running",
+        "conditions": [],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "strict",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": false,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 1,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "own",
+          42,
+          52,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          42,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [
+        [
+          "editorial",
+          "own",
+          42,
+          "done",
+          null
+        ]
+      ],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "own",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          3,
+          3
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/late_other_fence": {
+    "outcome": {
+      "error": "InvalidTransitionError",
+      "message": "strict delivery is blocked by an earlier obligation"
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [
+        [
+          "editorial",
+          42,
+          0,
+          "publish",
+          "publish",
+          "pending",
+          1
+        ]
+      ],
+      "conditional_park_results": [],
+      "discovery_ranges": [
+        [
+          "earlier",
+          1,
+          11,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          "own",
+          42,
+          52,
+          0.0,
+          300.0,
+          1,
+          0,
+          "open",
+          null,
+          42,
+          0,
+          0,
+          0
+        ]
+      ],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          2,
+          41,
+          41,
+          42,
+          "own",
+          "{\"callbacks\":[{\"callback_id\":\"publish\",\"config_digest\":\"config-0\",\"credential_fingerprint\":\"publisher:publish-script\",\"credential_name\":\"publisher\",\"execution\":\"sync\",\"filter_digest\":\"filter-0\",\"ordinal\":0,\"plugin_id\":\"publish\",\"secret_refs\":[[\"token\",\"PUBLISH_TOKEN\"]]}]}",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          1,
+          41
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [
+        [
+          "editorial",
+          "own",
+          42,
+          "pending",
+          null
+        ]
+      ],
+      "pending_adoptions": [],
+      "range_groups": [
+        [
+          "earlier",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ],
+        [
+          "own",
+          "editorial",
+          7,
+          41,
+          30.0,
+          "pending"
+        ]
+      ],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          5,
+          5
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  },
+  "strict/parked": {
+    "outcome": {
+      "snapshot": {
+        "site": "studio",
+        "source": "events",
+        "group": "editorial",
+        "group_generation": 7,
+        "revision": 3,
+        "status": "parked",
+        "conditions": [
+          "parked"
+        ],
+        "cursor": 42,
+        "delivery_floor": 41,
+        "verified_incarnation": "incarnation-1",
+        "ordering": "strict",
+        "stream_fingerprint": "stream-v1",
+        "source_generation": "source-spawn-1",
+        "in_flight_event_id": null,
+        "in_flight_obligation_id": null,
+        "manifest": null,
+        "required_event_id": null,
+        "retry_event_id": null,
+        "callback_marks": [],
+        "failure_code": null,
+        "failure_text": null,
+        "failure_byte_count": null,
+        "failure_digest": null,
+        "failure_ordinal": null,
+        "parked": true,
+        "is_operator_replay": false,
+        "replay_required_from": null,
+        "history_truncated_floor": null,
+        "ordering_anomaly_id": null,
+        "strict_capacity_abort_streak": 0,
+        "strict_capacity_attempt_token": null,
+        "reader_clock_checkpoint": 0.0,
+        "latest_join_boundary": null,
+        "obligation_count": 0,
+        "late_id_count": 0,
+        "epochs": []
+      }
+    },
+    "tables": {
+      "_daemon_metadata": [
+        [
+          "identity",
+          "source:studio:events"
+        ]
+      ],
+      "audit": [
+        [
+          1,
+          "studio",
+          "editorial",
+          null,
+          null,
+          null,
+          "bootstrap",
+          1.0,
+          -1,
+          0,
+          "initialize group",
+          null,
+          1000,
+          "test-user",
+          1,
+          "7",
+          "3f67d4b05a1d17d4fe8df256f94eb6cf66f660372e028c91997041b5bc599ca5",
+          "applied",
+          "{\"callback_marks\":[],\"conditions\":[],\"cursor\":41,\"delivery_floor\":41,\"epochs\":[],\"failure_byte_count\":null,\"failure_code\":null,\"failure_digest\":null,\"failure_ordinal\":null,\"failure_text\":null,\"group\":\"editorial\",\"group_generation\":7,\"history_truncated_floor\":null,\"in_flight_event_id\":null,\"in_flight_obligation_id\":null,\"is_operator_replay\":false,\"late_id_count\":0,\"latest_join_boundary\":null,\"manifest\":null,\"obligation_count\":0,\"ordering\":\"strict\",\"ordering_anomaly_id\":null,\"parked\":false,\"reader_clock_checkpoint\":0.0,\"replay_required_from\":null,\"required_event_id\":null,\"retry_event_id\":null,\"revision\":0,\"site\":\"studio\",\"source\":\"events\",\"source_generation\":\"source-spawn-1\",\"status\":\"running\",\"stream_fingerprint\":\"stream-v1\",\"strict_capacity_abort_streak\":0,\"strict_capacity_attempt_token\":null,\"verified_incarnation\":\"incarnation-1\"}"
+        ]
+      ],
+      "callback_marks": [],
+      "conditional_park_results": [],
+      "discovery_ranges": [],
+      "disposition_audit": [],
+      "epochs": [],
+      "group_state": [
+        [
+          "editorial",
+          3,
+          42,
+          41,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          1,
+          0,
+          null,
+          null,
+          null,
+          0,
+          null,
+          null,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0,
+          null,
+          null,
+          0,
+          42
+        ]
+      ],
+      "groups": [
+        [
+          "editorial",
+          7,
+          "strict",
+          "https://studio.example.invalid",
+          "incarnation-1",
+          2.0,
+          1,
+          "active"
+        ]
+      ],
+      "join_commits": [],
+      "late_ids": [],
+      "pending_adoptions": [],
+      "range_groups": [],
+      "replay_markers": [],
+      "source_late_ids": [],
+      "source_meta": [
+        [
+          1,
+          "studio",
+          "events",
+          "stream-v1",
+          "incarnation-1",
+          "source-spawn-1",
+          1,
+          41,
+          0.0,
+          null,
+          1,
+          1
+        ]
+      ],
+      "sqlite_sequence": [
+        [
+          "audit",
+          1
+        ]
+      ],
+      "stream_adoptions": []
+    }
+  }
+}

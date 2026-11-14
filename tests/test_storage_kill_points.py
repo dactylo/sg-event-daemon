@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import select
 import signal
 import sqlite3
 import subprocess
@@ -67,11 +66,11 @@ class _GroupOracle:
 
 @dataclass
 class _Oracle:
-    frontier: int = 100
+    _frontier: int = 100
     opened: bool = False
-    closed: bool = False
+    _closed: bool = False
     retired: bool = False
-    discovered: bool = False
+    _discovered: bool = False
     observed: set[int] = field(default_factory=set[int])
     groups: dict[str, _GroupOracle] = field(
         default_factory=lambda: {
@@ -102,7 +101,7 @@ class _Oracle:
             assert action in {'replay', 'reset'}
             lane.disposition = action
             lane.generation += 1
-            lane.cursor = lane.floor = 100 if action == 'replay' else self.frontier
+            lane.cursor = lane.floor = 100 if action == 'replay' else self._frontier
             lane.late = None
             # An explicit disposition discharges the prior generation's work.
             lane.terminal.update(self.observed)
@@ -113,16 +112,16 @@ class _Oracle:
             self._lane(action, group)
         elif action == 'open':
             self.opened = True
-            self.frontier = 104
+            self._frontier = 104
             self.observed.add(104)
         elif action == 'publish':
-            self.frontier = 106
+            self._frontier = 106
             self.observed.update((105, 106))
         elif action == 'discover':
-            self.discovered = True
+            self._discovered = True
             self.observed.add(102)
         elif action == 'close':
-            self.closed = True
+            self._closed = True
         else:
             assert action == 'retire'
             self.retired = True
@@ -130,7 +129,7 @@ class _Oracle:
     def projection(self) -> dict[str, object]:
         retained = self.opened and not self.retired
         return {
-            'frontier': self.frontier,
+            'frontier': self._frontier,
             'groups': [
                 (
                     name,
@@ -145,7 +144,7 @@ class _Oracle:
                 )
                 for name, lane in self.groups.items()
             ],
-            'ranges': [('range-101-103', 101, 103, 'closed' if self.closed else 'open')]
+            'ranges': [('range-101-103', 101, 103, 'closed' if self._closed else 'open')]
             if retained
             else [],
             'bindings': [
@@ -164,7 +163,7 @@ class _Oracle:
             ]
             if retained
             else [],
-            'source_late': [('range-101-103', 102)] if retained and self.discovered else [],
+            'source_late': [('range-101-103', 102)] if retained and self._discovered else [],
             'late': [
                 (name, 'range-101-103', 102, lane.late)
                 for name, lane in self.groups.items()
@@ -202,8 +201,6 @@ def _assert_unresolved(connection: sqlite3.Connection, oracle: _Oracle) -> None:
 
 def _notice(process: subprocess.Popen[str]) -> str:
     assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], 15)
-    assert readable, 'child protocol timed out'
     result = process.stdout.readline().strip()
     if not result:
         assert process.stderr is not None
@@ -212,10 +209,14 @@ def _notice(process: subprocess.Popen[str]) -> str:
 
 
 @contextmanager
-def _child(path: Path, *, poller_only: bool = False) -> Generator[subprocess.Popen[str]]:
+def _child(
+    path: Path, *, poller_only: bool = False, callback: bool = False
+) -> Generator[subprocess.Popen[str]]:
     arguments = [sys.executable, '-m', 'tests._kill_point_child', str(path)]
     if poller_only:
         arguments.append('poller')
+    if callback:
+        arguments.append('callback')
     with subprocess.Popen(
         arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     ) as process:
@@ -225,7 +226,7 @@ def _child(path: Path, *, poller_only: bool = False) -> Generator[subprocess.Pop
         finally:
             if process.poll() is None:
                 process.kill()
-            process.wait(timeout=15)
+            process.wait()
 
 
 def _oracle_from_journal(path: Path, *, include_inflight: bool) -> _Oracle:
@@ -311,7 +312,7 @@ def test_lifecycle_index_change_cannot_leave_stale_range_bindings(
                     ).fetchone()[0]
                 if order == 'range-first':
                     process.kill()
-                    assert process.wait(timeout=15) == -signal.SIGKILL
+                    assert process.wait() == -signal.SIGKILL
                 disposition(group, command, from_event_id=100)
                 with closing(sqlite3.connect(path)) as inspection:
                     assert (
@@ -330,7 +331,7 @@ def test_lifecycle_index_change_cannot_leave_stale_range_bindings(
                             'SELECT COUNT(*) FROM discovery_ranges'
                         ).fetchone() == (0,)
                     process.kill()
-                    assert process.wait(timeout=15) == -signal.SIGKILL
+                    assert process.wait() == -signal.SIGKILL
         with open_source(path, write_context_for(path)) as source:
             if order == 'lifecycle-first':
                 source.commit_observations((104,), successful_clock=0)
@@ -372,7 +373,7 @@ def test_process_death_preserves_group_work_and_resumes_to_quiescence(
             assert _notice(process) == 'ack'
             _record(journal, 'ack', operation)
         process.kill()
-        assert process.wait(timeout=15) == -signal.SIGKILL
+        assert process.wait() == -signal.SIGKILL
     before = _oracle_from_journal(journal, include_inflight=False)
     after = _oracle_from_journal(journal, include_inflight=True)
     with closing(sqlite3.connect(path)) as connection:
@@ -398,3 +399,37 @@ def test_process_death_preserves_group_work_and_resumes_to_quiescence(
         for group in _GROUPS:
             assert final.terminal(group) == final.observed
         assert connection.execute('PRAGMA integrity_check').fetchone() == ('ok',)
+
+
+@pytest.mark.parametrize('point', ['before', 'callback', 'done'])
+def test_process_death_around_the_pre_invocation_commit(tmp_path: Path, point: str) -> None:
+    path = tmp_path / 'events.db'
+    with _child(path, callback=True) as process:
+        _send(process, ('deliver-callback', ''), point)
+        if point == 'before':
+            assert _notice(process) == 'kill:before'
+        else:
+            assert _notice(process) == 'callback:1'
+            if point == 'done':
+                assert _notice(process) == 'done'
+        process.kill()
+        process.wait()
+    with closing(sqlite3.connect(path)) as connection:
+        cursor, inflight = connection.execute(
+            "SELECT cursor, in_flight_event_id FROM group_state WHERE group_name = 'serial'"
+        ).fetchone()
+        marks = connection.execute('SELECT delivery_attempt FROM callback_marks').fetchall()
+    assert (cursor, inflight, marks) == {
+        'before': (10, None, []),
+        'callback': (10, 11, [(1,)]),
+        'done': (11, None, []),
+    }[point]
+    with _child(path, callback=True) as process:
+        _send(process, ('resume-callback', ''))
+        if point != 'done':
+            assert _notice(process) == ('callback:2' if point == 'callback' else 'callback:1')
+        assert _notice(process) == 'done'
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT cursor, in_flight_event_id FROM group_state WHERE group_name = 'serial'"
+        ).fetchone() == (11, None)

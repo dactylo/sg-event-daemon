@@ -10,7 +10,7 @@ from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, Protocol, assert_type, cast, overload
 
-from ._config import SecretValue
+from ._config import GroupConfig, PluginConfig, SecretValue, SourceConfig
 
 if TYPE_CHECKING:
     from typing import IO
@@ -127,12 +127,18 @@ def _collect_children(
             result.update(_collect_strings(item, sensitive=sensitive, seen=seen))
         return result
     if is_dataclass(value) and not isinstance(value, type):
+        children: list[tuple[object, object]] = []
+        for field in fields(value):
+            if field.name.startswith('_'):
+                continue
+            if (
+                isinstance(value, SourceConfig | PluginConfig) and field.name == 'credentials'
+            ) or (isinstance(value, GroupConfig) and field.name == 'callback_credentials'):
+                continue
+            item = getattr(value, field.name)
+            children.append((field.name, item))
         return _collect_named_children(
-            (
-                (field.name, getattr(value, field.name))
-                for field in fields(value)
-                if not field.name.startswith('_')
-            ),
+            children,
             sensitive=False,
             seen=seen,
         )

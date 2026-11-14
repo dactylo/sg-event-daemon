@@ -1,7 +1,5 @@
 """Closed local operator control protocol."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import errno
@@ -18,6 +16,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeAlias, cast
 
+from ._json import decode_json
 from ._logging import SENSITIVE_NAMES
 from ._platform import (
     FILE_MODE,
@@ -34,7 +33,7 @@ if TYPE_CHECKING:
     from types import TracebackType
     from typing import Self
 
-_ALLOWED_COMMANDS = frozenset(
+OPERATOR_COMMANDS = frozenset(
     {
         'acknowledge-ordering-anomaly',
         'adopt-source-stream',
@@ -51,10 +50,27 @@ _ALLOWED_COMMANDS = frozenset(
     }
 )
 
-_MAX_MESSAGE_BYTES = 1_048_576
-_CONTROL_IDENTITY = ('supervisor',)
-_PROTOCOL_VERSION = 1
+GROUP_BUSY_CODE = 'group-busy'
+GROUP_DISPOSITION_ARGUMENTS = MappingProxyType(
+    {
+        'replay': frozenset(
+            {'acknowledge_truncation', 'from_event_id', 'group', 'reason', 'site'}
+        ),
+        'reset-group-to-latest': frozenset({'group', 'reason', 'site'}),
+    }
+)
+SOURCE_ADOPTION_ARGUMENTS = frozenset({'reason', 'site', 'source'})
+SOURCE_ADOPTION_EXECUTION_ARGUMENTS = frozenset(
+    {'adoption_id', 'command_fingerprint', 'groups_parked', 'reason', 'site', 'source'}
+)
+SOURCE_BUSY_CODE = 'source-busy'
+SOURCE_DATABASE_BUSY_CODE = 'source-database-busy'
+SOURCE_OPERATOR_COMMANDS = frozenset({'adopt-source-stream', 'preflight-source-adoption'})
+SUPERVISOR_DATABASE_BUSY_CODE = 'supervisor-database-busy'
+
+OPERATOR_WAIT_CAP_SECS = 600.0
 REQUEST_TIMEOUT_SECS = 5.0
+_CONTROL_IDENTITY = ('supervisor',)
 _EVENT_BODY_KEYS = frozenset(
     {
         'event',
@@ -64,6 +80,8 @@ _EVENT_BODY_KEYS = frozenset(
     }
 )
 _LENGTH_BYTES = 4
+_MAX_MESSAGE_BYTES = 1_048_576
+_PROTOCOL_VERSION = 1
 _UNIX_STREAM_DISCONNECT_ERRNOS = frozenset(
     {
         errno.ECONNABORTED,
@@ -88,21 +106,39 @@ class ControlClient:
         path: Path,
         *,
         timeout: float = REQUEST_TIMEOUT_SECS,
+        response_timeout: float | None = None,
     ) -> None:
         """Configure one bounded client.
 
         Args:
             path: Existing supervisor control socket.
-            timeout: Complete connect and response deadline in positive
-                seconds.
+            timeout: Total request deadline in positive seconds when
+                response_timeout is absent; otherwise the connect/send
+                deadline.
+            response_timeout: Optional positive response budget in seconds,
+                starting after the request is sent.
 
         Raises:
             ValueError: The timeout is not positive.
         """
         if timeout <= 0:
             raise ValueError('control timeout must be positive')
+        if response_timeout is not None and response_timeout <= 0:
+            raise ValueError('control response timeout must be positive')
         self._timeout = timeout
+        self._response_timeout = response_timeout
         self._path = path
+
+    def _read_response(self, sock: socket.socket, deadline_at: float) -> _ControlResponse:
+        """Read the response using its budget and preserve post-send uncertainty."""
+        if self._response_timeout is not None:
+            deadline_at = time.monotonic() + self._response_timeout
+        try:
+            return _decode_response(_read_frame(sock, deadline_at=deadline_at))
+        except TimeoutError as error:
+            raise ControlOutcomeUnknownError('control request timed out') from error
+        except ControlUnavailableError as error:
+            raise ControlOutcomeUnknownError(str(error)) from error
 
     @classmethod
     def for_state_dir(
@@ -110,21 +146,30 @@ class ControlClient:
         state_dir: Path,
         *,
         timeout: float = REQUEST_TIMEOUT_SECS,
+        response_timeout: float | None = None,
     ) -> Self:
         """Build a client for one configured state directory.
 
         Args:
             state_dir: Minimal control-plane state directory.
-            timeout: Complete connect and response deadline in positive
-                seconds.
+            timeout: Total request deadline in positive seconds when
+                response_timeout is absent; otherwise the connect/send
+                deadline.
+            response_timeout: Optional positive response budget in seconds,
+                starting after the request is sent.
 
         Returns:
             Client using the ordinary or hashed supervisor path.
 
         Raises:
             ValueError: The timeout is not positive.
+            SecurityError: No private runtime root provides a usable socket
+                path.
+            OSError: Resolving the state path for a fallback socket fails.
         """
-        return cls(_control_socket_path(state_dir), timeout=timeout)
+        return cls(
+            control_socket_path(state_dir), timeout=timeout, response_timeout=response_timeout
+        )
 
     def request(
         self,
@@ -146,13 +191,14 @@ class ControlClient:
         Raises:
             ControlCommandError: If the running supervisor rejects the command.
             ControlProtocolError: If either envelope violates the protocol.
-            ControlUnavailableError: If the socket is absent, closes, or times
-                out.
+            ControlOutcomeUnknownError: If the response times out or the peer
+                closes after the request was sent.
+            ControlUnavailableError: If connecting or sending fails.
             SecurityError: If the socket parent is unsafe or the kernel peer
                 credentials do not identify the effective user.
         """
         request = ControlRequest(
-            _version=_PROTOCOL_VERSION,
+            version=_PROTOCOL_VERSION,
             request_id=uuid.uuid4().hex if request_id is None else request_id,
             command=command,
             arguments={} if arguments is None else arguments,
@@ -174,7 +220,7 @@ class ControlClient:
                             'control peer closed before response'
                         ) from error
                     raise
-                response = _decode_response(_read_frame(sock, deadline_at=deadline_at))
+                response = self._read_response(sock, deadline_at)
         except ControlProtocolError:
             raise
         except ControlUnavailableError:
@@ -182,18 +228,35 @@ class ControlClient:
         except TimeoutError as error:
             raise ControlUnavailableError('control request timed out') from error
         except OSError as error:
-            raise ControlUnavailableError(f'control IPC is unavailable: {error}') from error
-        if response._request_id != request.request_id:
+            raise ControlUnavailableError(
+                f'control IPC is unavailable at {self._path}: {error}; '
+                'is the supervisor running with this --config?'
+            ) from error
+        if response.request_id != request.request_id:
             raise ControlProtocolError('control response request id does not match request')
-        if not response._ok:
-            raise ControlCommandError(response._error or 'control command failed')
-        if response._result is None:
+        if not response.ok:
+            raise ControlCommandError(
+                response.error or 'control command failed',
+                result=response.result,
+            )
+        if response.result is None:
             raise ControlProtocolError('successful control response has no result')
-        return MappingProxyType(dict(response._result))
+        return MappingProxyType(dict(response.result))
 
 
 class ControlCommandError(RuntimeError):
-    """Report a command that the running supervisor rejected."""
+    """Report a rejected command with optional machine-readable result details.
+
+    Attributes:
+        result: Failure details preserved through the existing response
+            envelope, or `None` when the handler supplied only an error
+            message.
+    """
+
+    def __init__(self, message: str, *, result: Mapping[str, object] | None = None) -> None:
+        """Retain the rejection message and any structured failure details."""
+        super().__init__(message)
+        self.result = result
 
 
 class ControlProtocolError(ValueError):
@@ -204,7 +267,7 @@ class ControlProtocolError(ValueError):
 class ControlRequest:
     """Contain one closed body-free operator request."""
 
-    _version: int
+    version: int
     request_id: str
     command: str
     arguments: Mapping[str, object]
@@ -218,11 +281,11 @@ class ControlRequest:
                 arguments contain non-string keys, prohibited event-body or
                 secret fields, non-finite numbers, or unsupported JSON values.
         """
-        if type(self._version) is not int:
+        if type(self.version) is not int:
             raise ControlProtocolError('control protocol version must be an integer')
         if not self.request_id:
             raise ControlProtocolError('control request id must not be empty')
-        if self.command not in _ALLOWED_COMMANDS:
+        if self.command not in OPERATOR_COMMANDS:
             raise ControlProtocolError(f'unsupported control command {self.command!r}')
         arguments = _validate_mapping(self.arguments, context='control arguments')
         object.__setattr__(self, 'arguments', MappingProxyType(arguments))
@@ -232,15 +295,19 @@ class ControlUnavailableError(ConnectionError):
     """Report unavailable, timed-out, or closed local control IPC."""
 
 
+class ControlOutcomeUnknownError(ControlUnavailableError):
+    """Report a sent command whose response did not establish its outcome."""
+
+
 @dataclass(frozen=True)
 class _ControlResponse:
     """Contain one correlated supervisor response."""
 
-    _version: int
-    _request_id: str
-    _ok: bool
-    _result: Mapping[str, object] | None
-    _error: str | None
+    version: int
+    request_id: str
+    ok: bool
+    result: Mapping[str, object] | None
+    error: str | None
 
 
 class ControlServer:
@@ -255,6 +322,8 @@ class ControlServer:
         self,
         state_dir: Path,
         handler: _ControlHandler,
+        *,
+        socket_probe_timeout_secs: float = 1.0,
     ) -> None:
         """Configure one unopened control endpoint.
 
@@ -262,18 +331,31 @@ class ControlServer:
             state_dir: Secure daemon state directory.
             handler: Foreground command dispatcher receiving trusted peer
                 identity.
+            socket_probe_timeout_secs: Owning shutdown slice for stale-listener
+                probes.
+
+        Raises:
+            SecurityError: No private runtime root provides a usable socket
+                path.
+            OSError: Resolving the state path for a fallback socket fails.
         """
+        self._socket_probe_timeout_secs = socket_probe_timeout_secs
         self._foreground_progress: Callable[[], None] | None = None
         self._handler = handler
         self._listener: socket.socket | None = None
         self._state_dir = state_dir
-        self._path = _control_socket_path(state_dir)
+        self._path = control_socket_path(state_dir)
 
     def __enter__(self) -> Self:
         """Open and return the server.
 
         Returns:
             This server while it owns the socket path.
+
+        Raises:
+            SecurityError: The state directory or socket path fails safety
+                checks.
+            OSError: Preparing or opening the control endpoint fails.
         """
         self._open()
         return self
@@ -284,7 +366,13 @@ class ControlServer:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the endpoint when leaving a context."""
+        """Close the endpoint when leaving a context.
+
+        Raises:
+            SecurityError: The socket path no longer names a socket owned by
+                the daemon user.
+            OSError: Closing, inspecting, or removing the endpoint fails.
+        """
         self._close()
 
     def _close(self) -> None:
@@ -312,28 +400,33 @@ class ControlServer:
             result = self._handler(request, identity)
         except Exception as error:  # noqa: BLE001
             return _ControlResponse(
-                _version=_PROTOCOL_VERSION,
-                _request_id=request.request_id,
-                _ok=False,
-                _result=None,
-                _error=str(error),
+                version=_PROTOCOL_VERSION,
+                request_id=request.request_id,
+                ok=False,
+                result=error.result if isinstance(error, ControlCommandError) else None,
+                error=str(error),
             )
         finally:
             if foreground_progress is not None:
                 foreground_progress()
         return _ControlResponse(
-            _version=_PROTOCOL_VERSION,
-            _request_id=request.request_id,
-            _ok=True,
-            _result=result,
-            _error=None,
+            version=_PROTOCOL_VERSION,
+            request_id=request.request_id,
+            ok=True,
+            result=result,
+            error=None,
         )
 
     def _open(self) -> None:
         """Bind and listen on the secure mode-0600 control path."""
         if self._listener is not None:
             return
-        path = local_socket_path(self._state_dir, 'control', _CONTROL_IDENTITY)
+        path = local_socket_path(
+            self._state_dir,
+            'control',
+            _CONTROL_IDENTITY,
+            timeout_secs=self._socket_probe_timeout_secs,
+        )
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             prior_umask = os.umask(0o177)
@@ -374,22 +467,22 @@ class ControlServer:
                     foreground_progress()
             except (ControlProtocolError, RecursionError, ValueError) as error:
                 response = _ControlResponse(
-                    _version=_PROTOCOL_VERSION,
-                    _request_id=request_id,
-                    _ok=False,
-                    _result=None,
-                    _error=str(error),
+                    version=_PROTOCOL_VERSION,
+                    request_id=request_id,
+                    ok=False,
+                    result=None,
+                    error=str(error),
                 )
                 try:
                     frame = _encode_response(response)
                 except ControlProtocolError:
                     frame = _encode_response(
                         _ControlResponse(
-                            _version=_PROTOCOL_VERSION,
-                            _request_id='',
-                            _ok=False,
-                            _result=None,
-                            _error='control request is malformed',
+                            version=_PROTOCOL_VERSION,
+                            request_id='',
+                            ok=False,
+                            result=None,
+                            error='control request is malformed',
                         )
                     )
             else:
@@ -421,6 +514,7 @@ class ControlServer:
         Raises:
             ValueError: The timeout is not finite and nonnegative.
             RuntimeError: The server is not open.
+            OSError: Configuring the listener or accepting a connection fails.
         """
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError('control wait timeout must be finite and nonnegative')
@@ -452,16 +546,11 @@ def _authenticate_peer(sock: socket.socket) -> None:
         raise SecurityError('control peer has the wrong owner')
 
 
-def _control_socket_path(state_dir: Path) -> Path:
-    """Return the deterministic control socket path without mutating it."""
-    return local_socket_path_candidate(state_dir, 'control', _CONTROL_IDENTITY)
-
-
 def _decode_json(body: bytes) -> dict[str, object]:
     """Decode one JSON object without executable serialization."""
     try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = decode_json(body)
+    except ValueError as error:
         raise ControlProtocolError('control message is not valid JSON') from error
     if not isinstance(value, dict):
         raise ControlProtocolError('control message must be a JSON object')
@@ -487,7 +576,7 @@ def _decode_request(body: bytes) -> ControlRequest:
     if not isinstance(arguments, dict):
         raise ControlProtocolError('control request arguments must be an object')
     return ControlRequest(
-        _version=version,
+        version=version,
         request_id=request_id,
         command=command,
         arguments=cast('dict[str, object]', arguments),
@@ -517,11 +606,11 @@ def _decode_response(body: bytes) -> _ControlResponse:
     if ok == (error is not None):
         raise ControlProtocolError('control response outcome is inconsistent')
     return _ControlResponse(
-        _version=version,
-        _request_id=request_id,
-        _ok=ok,
-        _result=None if result is None else cast('dict[str, object]', result),
-        _error=error,
+        version=version,
+        request_id=request_id,
+        ok=ok,
+        result=None if result is None else cast('dict[str, object]', result),
+        error=error,
     )
 
 
@@ -606,9 +695,19 @@ def _validate_value(value: object, *, context: str) -> _JsonValue:
 def _validated_request(body: bytes) -> ControlRequest:
     """Decode one request and require the local protocol version."""
     request = _decode_request(body)
-    if request._version != _PROTOCOL_VERSION:
-        raise ControlProtocolError(f'unsupported control protocol version {request._version}')
+    if request.version != _PROTOCOL_VERSION:
+        raise ControlProtocolError(f'unsupported control protocol version {request.version}')
     return request
+
+
+def control_socket_path(state_dir: Path) -> Path:
+    """Return the deterministic control socket path without mutating it.
+
+    Raises:
+        SecurityError: No private runtime root provides a usable socket path.
+        OSError: Resolving the state path for a fallback socket fails.
+    """
+    return local_socket_path_candidate(state_dir, 'control', _CONTROL_IDENTITY)
 
 
 def encode_json_body(value: Mapping[str, object]) -> bytes:
@@ -655,7 +754,7 @@ def _encode_request(request: ControlRequest) -> bytes:
     """Encode one validated request."""
     return _encode_frame(
         {
-            'version': request._version,
+            'version': request.version,
             'request_id': request.request_id,
             'command': request.command,
             'arguments': dict(request.arguments),
@@ -667,10 +766,18 @@ def _encode_response(response: _ControlResponse) -> bytes:
     """Encode one validated response."""
     return _encode_frame(
         {
-            'version': response._version,
-            'request_id': response._request_id,
-            'ok': response._ok,
-            'result': None if response._result is None else dict(response._result),
-            'error': response._error,
+            'version': response.version,
+            'request_id': response.request_id,
+            'ok': response.ok,
+            'result': None if response.result is None else dict(response.result),
+            'error': response.error,
         }
+    )
+
+
+def unknown_outcome_message(command: str, why: str) -> str:
+    """Describe an uncertain command outcome and its status recovery step."""
+    return (
+        f'{command} did not finish: {why}. '
+        'It may still complete; run status to see the current state.'
     )

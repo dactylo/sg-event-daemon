@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -22,24 +23,25 @@ from sg_event_daemon.testing import (
     drive_sync_plugin,
     load_plugin,
 )
-from tests._live_mode import _LiveOptions
+from tests._live_mode import LiveOptions
+from tests._stall_policy import STALL_DEADLINE_SECS
 from tests.live._daemon import (
-    _LiveCase,
-    _LiveReport,
-    _ProbeRecord,
-    _read_probe_records,
-    _SanitizedLiveError,
-    _SupervisorProcess,
+    LiveCase,
+    LiveReport,
+    ProbeRecord,
+    SanitizedLiveError,
+    SupervisorProcess,
     assert_group_cursors,
     assert_group_deliveries,
     build_child_environment,
+    read_probe_records,
     validate_child_import,
     wait_for_group_event_set,
     wait_for_group_records,
     write_daemon_config,
     write_report,
 )
-from tests.live._site import LiveSite, _Credential, _LiveEvent, _LiveSettings
+from tests.live._site import Credential, LiveEvent, LiveSettings, LiveSite
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -71,11 +73,11 @@ def _event(
     }
 
 
-def _live_event(event_id: int, phase_value: str) -> _LiveEvent:
-    return _LiveEvent(
-        _id=event_id,
-        _phase_value=phase_value,
-        _value=Event(_event(event_id, phase_value=phase_value)),
+def _live_event(event_id: int, phase_value: str) -> LiveEvent:
+    return LiveEvent(
+        id=event_id,
+        phase_value=phase_value,
+        value=Event(_event(event_id, phase_value=phase_value)),
     )
 
 
@@ -88,38 +90,38 @@ def _paths(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _settings(*, mode: Literal['sync', 'sync+async'] = 'sync') -> _LiveSettings:
-    options = _LiveOptions(
-        _provider='sg-python-api',
-        _mode=mode,
-        _load_events=1_000,
-        _report_dir=None,
-        _run_live=True,
-        _run_live_load=False,
+def _settings(*, mode: Literal['sync', 'sync+async'] = 'sync') -> LiveSettings:
+    options = LiveOptions(
+        provider='sg-python-api',
+        mode=mode,
+        load_events=1_000,
+        report_dir=None,
+        run_live=True,
+        run_live_load=False,
     )
-    return _LiveSettings(
-        _site='https://example.invalid/path?private=discarded',
-        _project='Live Acceptance "Quoted"',
-        _source=_Credential(_script_name='source "reader"', _api_key='source-key'),
-        _producer=_Credential(_script_name='producer', _api_key='producer-key'),
-        _cleanup=_Credential(_script_name='cleanup', _api_key='cleanup-key'),
-        _options=options,
+    return LiveSettings(
+        site='https://example.invalid/path?private=discarded',
+        project='Live Acceptance "Quoted"',
+        source=Credential(script_name='source "reader"', api_key='source-key'),
+        producer=Credential(script_name='producer', api_key='producer-key'),
+        cleanup=Credential(script_name='cleanup', api_key='cleanup-key'),
+        options=options,
     )
 
 
-def _live_case(tmp_path: Path, process: _SupervisorProcess) -> _LiveCase:
-    baseline = _LiveEvent(_id=100, _phase_value='baseline', _value=Event(_event(100)))
-    return _LiveCase(
-        _settings=_settings(mode='sync+async'),
-        _site=cast('LiveSite', object()),
-        _process=process,
-        _config_path=tmp_path / 'config.toml',
-        _baseline_event=baseline,
-        _output_paths={
+def _live_case(tmp_path: Path, process: SupervisorProcess) -> LiveCase:
+    baseline = LiveEvent(id=100, phase_value='baseline', value=Event(_event(100)))
+    return LiveCase(
+        settings=_settings(mode='sync+async'),
+        site=cast('LiveSite', object()),
+        process=process,
+        config_path=tmp_path / 'config.toml',
+        baseline_event=baseline,
+        output_paths={
             'async': tmp_path / 'async.jsonl',
             'sync': tmp_path / 'sync.jsonl',
         },
-        _report=_LiveReport(
+        report=LiveReport(
             site_hostname='example.invalid',
             project_name='Live Acceptance',
             provider='sg-python-api',
@@ -156,6 +158,52 @@ def _status(
     }
 
 
+def _script_graceful_reap_expiry(
+    process: SupervisorProcess,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    group_signals: list[tuple[int, int]] | None = None,
+    require_direct_kill: bool = False,
+) -> list[str]:
+    phases: list[str] = []
+    direct_kills: list[int] = []
+    if require_direct_kill:
+        child = process.process
+        assert child is not None
+        original_kill = child.kill
+
+        def kill() -> None:
+            direct_kills.append(child.pid)
+            original_kill()
+
+        monkeypatch.setattr(child, 'kill', kill)
+
+    def reap(child: subprocess.Popen[bytes]) -> bool:
+        if not phases:
+            assert child.poll() is None
+            phases.append('graceful-expired')
+            return False
+        assert phases == ['graceful-expired']
+        if group_signals is not None:
+            assert group_signals == [(child.pid, signal.SIGKILL)]
+        if require_direct_kill:
+            assert direct_kills == [child.pid]
+        child.wait()
+        phases.append('forced-reaped')
+        return True
+
+    monkeypatch.setattr(process, '_reap_with_timeout', reap)
+    return phases
+
+
+def _wait_child_ready_log(process: SupervisorProcess) -> None:
+    while 'ready' not in process.log_paths[0].read_text(encoding='utf-8'):
+        child = process.process
+        assert child is not None
+        assert child.poll() is None, 'child exited before ready'
+        time.sleep(0.01)
+
+
 def _write_probe_rows(path: Path, group: str, rows: list[tuple[int, str]]) -> None:
     payloads = [
         {
@@ -178,12 +226,12 @@ def _write_probe_rows(path: Path, group: str, rows: list[tuple[int, str]]) -> No
 
 
 @pytest.fixture
-def settings() -> _LiveSettings:
+def settings() -> LiveSettings:
     return _settings()
 
 
 def test_child_environment_imports_checkout_from_unrelated_directory(
-    settings: _LiveSettings,
+    settings: LiveSettings,
     tmp_path: Path,
 ) -> None:
     source_root = (Path(__file__).resolve().parents[2] / 'src').resolve()
@@ -207,7 +255,7 @@ def test_child_environment_imports_checkout_from_unrelated_directory(
 
 def test_child_import_reports_subprocess_failure(
     monkeypatch: pytest.MonkeyPatch,
-    settings: _LiveSettings,
+    settings: LiveSettings,
     tmp_path: Path,
 ) -> None:
     environment = build_child_environment(settings, {}, tmp_path / 'src')
@@ -265,6 +313,41 @@ def test_daemon_config_round_trips_both_modes(
         }
         assert group.callback_credentials == 'source'
         assert group.ordering == 'eager'
+
+
+def test_delivery_wait_reads_only_new_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / 'probe.jsonl'
+    _write_probe_rows(path, 'sync', [(101, 'first'), (102, 'second')])
+    first, second = path.read_text().splitlines(keepends=True)
+    second = second.rstrip('\n')
+    path.write_text(first)
+    case = cast(
+        'daemon_module.LiveCase', SimpleNamespace(output_paths={'sync': path}, probe_readers={})
+    )
+    parsed: list[str] = []
+    original = daemon_module.json.loads
+
+    def loads(line: str) -> object:
+        parsed.append(line)
+        return original(line)
+
+    monkeypatch.setattr(daemon_module.json, 'loads', loads)
+    assert len(daemon_module.read_all_groups(case)['sync']) == 1
+    assert len(daemon_module.read_all_groups(case)['sync']) == 1
+    assert len(parsed) == 1
+    with path.open('a') as stream:
+        stream.write(second)
+    assert len(daemon_module.read_all_groups(case)['sync']) == 1
+    with path.open('a') as stream:
+        stream.write('\n')
+    assert [row.event_id for row in daemon_module.read_all_groups(case)['sync']] == [101, 102]
+    assert len(parsed) == 2
+    with path.open('a') as stream:
+        stream.write('bad JSON\n')
+    with pytest.raises(ValueError, match='row 3 is invalid JSON'):
+        daemon_module.read_all_groups(case)
 
 
 @pytest.mark.parametrize(
@@ -382,26 +465,26 @@ def test_live_acceptance_consumes_detailed_status(
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), '')
 
     monkeypatch.setattr(daemon_module.subprocess, 'run', _run)
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
         timeout_secs=0.2,
     )
-    monkeypatch.setattr(process, '_process', SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(process, 'process', SimpleNamespace(poll=lambda: None))
 
     if consumer == 'readiness':
-        status = process._wait_ready()
+        status = process.wait_ready()
     else:
         live_case = _live_case(tmp_path, process)
-        live_case._output_paths = {'sync': tmp_path / 'sync.jsonl'}
-        _write_probe_rows(live_case._output_paths['sync'], 'sync', [(101, 'one')])
+        live_case.output_paths = {'sync': tmp_path / 'sync.jsonl'}
+        _write_probe_rows(live_case.output_paths['sync'], 'sync', [(101, 'one')])
         assert_group_deliveries(
             live_case,
             (_live_event(101, 'one'),),
             excluded_ids=(100,),
         )
-        status = live_case._report.status_summary
+        status = live_case.report.status_summary
 
     assert_group_cursors(status, expected_groups=('sync',), expected_floor=101)
 
@@ -419,12 +502,12 @@ def test_live_stop_reports_log_close_failure_during_test_error(
             self.closed = True
             raise close_error
 
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml', directory=tmp_path, environment={}, timeout_secs=1.0
     )
-    vars(process)['_process'] = object()
-    vars(process)['_pgid'] = 123
-    vars(process)['_stdout'] = Handle()
+    vars(process)['process'] = object()
+    vars(process)['pgid'] = 123
+    vars(process)['stdout'] = Handle()
 
     def terminate(*_args: object, **_kwargs: object) -> tuple[BaseException, ...]:
         return ()
@@ -432,7 +515,7 @@ def test_live_stop_reports_log_close_failure_during_test_error(
     def fail() -> None:
         raise RuntimeError('test failed')
 
-    monkeypatch.setattr(_SupervisorProcess, '_terminate_and_reap', terminate)
+    monkeypatch.setattr(SupervisorProcess, 'terminate_and_reap', terminate)
 
     ambient_error: RuntimeError | None = None
     caught_error: OSError | None = None
@@ -440,7 +523,7 @@ def test_live_stop_reports_log_close_failure_during_test_error(
         fail()
     except RuntimeError as test_error:
         with pytest.raises(OSError, match='log close failed') as raised:
-            process._stop()
+            process.stop()
         ambient_error = test_error
         caught_error = raised.value
 
@@ -448,7 +531,7 @@ def test_live_stop_reports_log_close_failure_during_test_error(
     assert caught_error is not None
     assert not hasattr(ambient_error, '__notes__')
     assert caught_error is close_error
-    assert vars(process)['_pgid'] is None
+    assert vars(process)['pgid'] is None
 
 
 def test_nonzero_status_has_bounded_log_tails(
@@ -463,7 +546,7 @@ def test_nonzero_status_has_bounded_log_tails(
         return subprocess.CompletedProcess(command, 2, text, text)
 
     monkeypatch.setattr(daemon_module.subprocess, 'run', _run)
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
@@ -471,7 +554,7 @@ def test_nonzero_status_has_bounded_log_tails(
     )
 
     with pytest.raises(RuntimeError) as caught:
-        process._status(check='readiness')
+        process.status(check='readiness')
 
     assert len(str(caught.value)) < 20_000
 
@@ -481,7 +564,7 @@ def test_ordered_probe_timeout_retains_bounded_sanitized_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     credential_value = 'source-key'
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={'SG_EVENT_TEST_SOURCE_KEY': credential_value},
         directory=tmp_path,
@@ -496,13 +579,13 @@ def test_ordered_probe_timeout_retains_bounded_sanitized_diagnostics(
         return subprocess.CompletedProcess(command, 1, json.dumps(status), '')
 
     monkeypatch.setattr(daemon_module.subprocess, 'run', _run)
-    process._status(check='readiness')
-    process._log_paths[0].write_text('o' * 100_000 + credential_value, encoding='utf-8')
-    process._log_paths[1].write_text('e' * 100_000 + credential_value, encoding='utf-8')
+    process.status(check='readiness')
+    process.log_paths[0].write_text('o' * 100_000 + credential_value, encoding='utf-8')
+    process.log_paths[1].write_text('e' * 100_000 + credential_value, encoding='utf-8')
     live_case = _live_case(tmp_path, process)
-    _write_probe_rows(live_case._output_paths['sync'], 'sync', [(101, 'one')])
+    _write_probe_rows(live_case.output_paths['sync'], 'sync', [(101, 'one')])
     expected = (_live_event(101, 'one'), _live_event(102, 'two'))
-    monkeypatch.setattr(daemon_module, '_LIVE_TIMEOUT_SECS', 0.0)
+    monkeypatch.setattr(daemon_module, 'LIVE_TIMEOUT_SECS', 0.0)
 
     with pytest.raises(AssertionError, match='ordered events') as caught:
         wait_for_group_records(live_case, expected_events=expected)
@@ -554,8 +637,8 @@ def test_probe_plugins_write_only_matching_rows_with_shared_schema(
         ).ok
         assert asyncio.run(drive_async_plugin(loaded, second)).ok
 
-    assert _read_probe_records(output, expected_group=execution) == (
-        _ProbeRecord(
+    assert read_probe_records(output, expected_group=execution) == (
+        ProbeRecord(
             event_id=103,
             event_type='Shotgun_Shot_Change',
             attribute_name='description',
@@ -566,7 +649,7 @@ def test_probe_plugins_write_only_matching_rows_with_shared_schema(
             group=execution,
             phase_value='phase-one',
         ),
-        _ProbeRecord(
+        ProbeRecord(
             event_id=104,
             event_type='Shotgun_Shot_Change',
             attribute_name='description',
@@ -602,7 +685,7 @@ def test_probe_reader_rejects_invalid_rows(tmp_path: Path, row: dict[str, object
     output.write_text(json.dumps(row) + '\n', encoding='utf-8')
 
     with pytest.raises(ValueError, match='probe'):
-        _read_probe_records(output, expected_group='sync')
+        read_probe_records(output, expected_group='sync')
 
 
 def test_process_close_logs_attempts_both_handles_and_resets_fields(tmp_path: Path) -> None:
@@ -613,35 +696,35 @@ def test_process_close_logs_attempts_both_handles_and_resets_fields(tmp_path: Pa
         closed = False
 
         def __init__(self, name: str) -> None:
-            self.name = name
+            self._name = name
 
         def close(self) -> None:
-            attempts.append(self.name)
-            if self.name == 'stdout':
+            attempts.append(self._name)
+            if self._name == 'stdout':
                 raise failure
 
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml', directory=tmp_path, environment={}, timeout_secs=1.0
     )
-    vars(process)['_stdout'] = Handle('stdout')
-    vars(process)['_stderr'] = Handle('stderr')
+    vars(process)['stdout'] = Handle('stdout')
+    vars(process)['stderr'] = Handle('stderr')
     with pytest.raises(OSError, match='fail') as caught:
-        process._close_logs()
+        process.close_logs()
     assert caught.value is failure
     assert attempts == ['stdout', 'stderr']
-    assert vars(process)['_stdout'] is None
-    assert vars(process)['_stderr'] is None
+    assert vars(process)['stdout'] is None
+    assert vars(process)['stderr'] is None
 
 
 def test_process_stop_preserves_termination_error_when_log_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml', directory=tmp_path, environment={}, timeout_secs=1.0
     )
-    vars(process)['_process'] = object()
-    vars(process)['_pgid'] = 123
+    vars(process)['process'] = object()
+    vars(process)['pgid'] = 123
     initiating = RuntimeError('termination failed')
 
     def terminate(*_args: object, **_kwargs: object) -> None:
@@ -650,17 +733,17 @@ def test_process_stop_preserves_termination_error_when_log_cleanup_fails(
     def close_logs(*_args: object) -> None:
         raise OSError('log cleanup failed')
 
-    monkeypatch.setattr(_SupervisorProcess, '_terminate_and_reap', terminate)
-    monkeypatch.setattr(_SupervisorProcess, '_close_logs', close_logs)
+    monkeypatch.setattr(SupervisorProcess, 'terminate_and_reap', terminate)
+    monkeypatch.setattr(SupervisorProcess, 'close_logs', close_logs)
     with pytest.raises(RuntimeError, match='termination failed') as caught:
-        process._stop()
+        process.stop()
     assert caught.value is initiating
-    assert vars(process)['_pgid'] is None
+    assert vars(process)['pgid'] is None
     assert any('log cleanup failed' in note for note in initiating.__notes__)
 
 
 def test_report_is_sanitized_optional_and_timestamped(tmp_path: Path) -> None:
-    report = _LiveReport(
+    report = LiveReport(
         site_hostname='example.invalid',
         project_name='Live Acceptance',
         provider='sg-python-api',
@@ -673,7 +756,7 @@ def test_report_is_sanitized_optional_and_timestamped(tmp_path: Path) -> None:
     )
     secrets = ('source-key', 'producer-key', 'cleanup-key')
     error = RuntimeError('trace' * 4_000 + ' source-key producer-key cleanup-key')
-    failure = _SanitizedLiveError('provider', error, secrets)
+    failure = SanitizedLiveError('provider', error, secrets)
     terminal = StringIO()
 
     path = write_report(report, tmp_path, failures=(failure,), terminal=terminal)
@@ -685,20 +768,20 @@ def test_report_is_sanitized_optional_and_timestamped(tmp_path: Path) -> None:
     summary = terminal.getvalue()
     for secret in secrets:
         assert secret not in str(failure)
-        assert secret not in failure._traceback_text
+        assert secret not in failure.traceback_text
         assert secret not in rendered
         assert secret not in summary
     assert str(failure).count('<redacted>') >= len(secrets)
-    assert failure._traceback_text.count('<redacted>') >= len(secrets)
-    assert failure._original is error
-    assert len(failure._traceback_text) < 8_000
+    assert failure.traceback_text.count('<redacted>') >= len(secrets)
+    assert failure.original is error
+    assert len(failure.traceback_text) < 8_000
     assert 'sync+async' in summary
     assert 'expected=2' in summary
     assert write_report(report, None, terminal=StringIO()) is None
 
 
 def test_report_schema_excludes_raw_responses_and_daemon_logs(tmp_path: Path) -> None:
-    report = _LiveReport(
+    report = LiveReport(
         site_hostname='example.invalid',
         project_name='Live Acceptance',
         provider='shotgun-api3',
@@ -716,45 +799,55 @@ def test_report_schema_excludes_raw_responses_and_daemon_logs(tmp_path: Path) ->
     assert 'stderr' not in payload
 
 
-def test_supervisor_kills_only_stuck_child_group(tmp_path: Path) -> None:
+def test_supervisor_kills_only_stuck_child_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     command_source = (
-        'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
-        "print('ready', flush=True); time.sleep(60)"
+        'import signal,threading; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        "print('ready', flush=True); threading.Event().wait()"
     )
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
-        timeout_secs=0.05,
-        _command=(
+        timeout_secs=STALL_DEADLINE_SECS,
+        command=(
             sys.executable,
             '-c',
             command_source,
         ),
     )
-    process._start()
-    child = cast('subprocess.Popen[bytes]', vars(process)['_process'])
+    process.start()
+    child = cast('subprocess.Popen[bytes]', vars(process)['process'])
     try:
-        deadline = time.monotonic() + 2
-        while 'ready' not in process._log_paths[0].read_text(encoding='utf-8'):
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-        pid = process._pid
+        _wait_child_ready_log(process)
+        group_signals: list[tuple[int, int]] = []
+        phases = _script_graceful_reap_expiry(process, monkeypatch, group_signals=group_signals)
+        pid = process.pid
+        original_killpg = os.killpg
 
-        failures = process._stop()
+        def killpg(pgid: int, signum: int) -> None:
+            group_signals.append((pgid, signum))
+            original_killpg(pgid, signum)
+
+        monkeypatch.setattr(daemon_module.os, 'killpg', killpg)
+
+        failures = process.stop()
     finally:
         unreaped = child.poll() is None
         if unreaped:
             child.kill()
-            child.wait(timeout=5)
+            child.wait()
 
     assert not unreaped
     assert pid is not None
     assert pid > 1
+    assert group_signals == [(pid, signal.SIGKILL)]
+    assert phases == ['graceful-expired', 'forced-reaped']
     assert len(failures) == 1
-    assert isinstance(failures[0], _SanitizedLiveError)
-    assert failures[0]._category == 'shutdown'
-    assert process._stop() == failures
+    assert isinstance(failures[0], SanitizedLiveError)
+    assert failures[0].category == 'shutdown'
+    assert process.stop() == failures
 
 
 def test_supervisor_reaps_child_when_validated_group_kill_races(
@@ -762,39 +855,38 @@ def test_supervisor_reaps_child_when_validated_group_kill_races(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     command_source = (
-        'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
-        "print('ready', flush=True); time.sleep(60)"
+        'import signal,threading; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        "print('ready', flush=True); threading.Event().wait()"
     )
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
-        timeout_secs=0.05,
-        _command=(sys.executable, '-c', command_source),
+        timeout_secs=STALL_DEADLINE_SECS,
+        command=(sys.executable, '-c', command_source),
     )
-    process._start()
-    child = cast('subprocess.Popen[bytes]', vars(process)['_process'])
+    process.start()
+    child = cast('subprocess.Popen[bytes]', vars(process)['process'])
     try:
-        deadline = time.monotonic() + 2
-        while 'ready' not in process._log_paths[0].read_text(encoding='utf-8'):
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
+        _wait_child_ready_log(process)
+        phases = _script_graceful_reap_expiry(process, monkeypatch, require_direct_kill=True)
         race = ProcessLookupError('test-owned group disappeared')
 
         def _killpg(_pgid: int, _signal: int) -> None:
             raise race
 
         monkeypatch.setattr(daemon_module.os, 'killpg', _killpg)
-        failures = process._stop()
+        failures = process.stop()
     finally:
         unreaped = child.poll() is None
         if unreaped:
             child.kill()
-            child.wait(timeout=5)
+            child.wait()
 
     assert not unreaped
+    assert phases == ['graceful-expired', 'forced-reaped']
     assert any(
-        isinstance(failure, _SanitizedLiveError) and failure._original is race
+        isinstance(failure, SanitizedLiveError) and failure.original is race
         for failure in failures
     )
 
@@ -804,23 +896,23 @@ def test_supervisor_reaps_sigterm_ignoring_child_when_group_is_unsafe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     command_source = (
-        'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
-        "print('ready', flush=True); time.sleep(60)"
+        'import signal,threading; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        "print('ready', flush=True); threading.Event().wait()"
     )
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
-        timeout_secs=0.05,
-        _command=(sys.executable, '-c', command_source),
+        timeout_secs=STALL_DEADLINE_SECS,
+        command=(sys.executable, '-c', command_source),
     )
     group_signals: list[int] = []
+    phases: list[str] = []
 
     def _getpgid(_pid: int) -> int:
-        deadline = time.monotonic() + 2
-        while 'ready' not in process._log_paths[0].read_text(encoding='utf-8'):
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
+        nonlocal phases
+        _wait_child_ready_log(process)
+        phases = _script_graceful_reap_expiry(process, monkeypatch, require_direct_kill=True)
         return 0
 
     def _killpg(pgid: int, _signal: int) -> None:
@@ -832,17 +924,18 @@ def test_supervisor_reaps_sigterm_ignoring_child_when_group_is_unsafe(
     child: subprocess.Popen[bytes] | None = None
     try:
         with pytest.raises(RuntimeError, match='unsafe process group'):
-            process._start()
+            process.start()
     finally:
-        child = cast('subprocess.Popen[bytes] | None', vars(process)['_process'])
+        child = cast('subprocess.Popen[bytes] | None', vars(process)['process'])
         if child is not None and child.poll() is None:
             unreaped = True
             child.kill()
-            child.wait(timeout=5)
+            child.wait()
         else:
             unreaped = False
     assert not unreaped
     assert group_signals == []
+    assert phases == ['graceful-expired', 'forced-reaped']
 
 
 def test_supervisor_reaps_unresolved_process_without_group_signal(
@@ -859,35 +952,35 @@ def test_supervisor_reaps_unresolved_process_without_group_signal(
 
     monkeypatch.setattr(daemon_module.os, 'getpgid', _getpgid)
     monkeypatch.setattr(daemon_module.os, 'killpg', _killpg)
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
         timeout_secs=0.2,
-        _command=(sys.executable, '-c', 'import time; time.sleep(60)'),
+        command=(sys.executable, '-c', 'import threading; threading.Event().wait()'),
     )
 
     try:
         with pytest.raises(RuntimeError, match='could not be resolved'):
-            process._start()
+            process.start()
     finally:
-        child = cast('subprocess.Popen[bytes] | None', vars(process)['_process'])
+        child = cast('subprocess.Popen[bytes] | None', vars(process)['process'])
         if child is not None and child.poll() is None:
             child.kill()
-            child.wait(timeout=5)
-        process._close_logs()
+            child.wait()
+        process.close_logs()
 
     assert killed == []
 
 
 def test_supervisor_rejects_empty_injected_command(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match='command'):
-        _SupervisorProcess(
+        SupervisorProcess(
             config_path=tmp_path / 'config.toml',
             environment={},
             directory=tmp_path,
             timeout_secs=0.2,
-            _command=(),
+            command=(),
         )
 
 
@@ -907,23 +1000,23 @@ def test_supervisor_rejects_unsafe_process_groups_before_use(
 
     monkeypatch.setattr(daemon_module.os, 'getpgid', _getpgid)
     monkeypatch.setattr(daemon_module.os, 'killpg', _killpg)
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
         timeout_secs=0.2,
-        _command=(sys.executable, '-c', 'import time; time.sleep(60)'),
+        command=(sys.executable, '-c', 'import threading; threading.Event().wait()'),
     )
 
     try:
         with pytest.raises(RuntimeError, match='unsafe process group'):
-            process._start()
+            process.start()
     finally:
-        child = cast('subprocess.Popen[bytes] | None', vars(process)['_process'])
+        child = cast('subprocess.Popen[bytes] | None', vars(process)['process'])
         if child is not None and child.poll() is None:
             child.kill()
-            child.wait(timeout=5)
-        process._close_logs()
+            child.wait()
+        process.close_logs()
 
     assert killed == []
 
@@ -949,62 +1042,62 @@ def test_supervisor_status_parses_json_and_retains_last_response(
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), '')
 
     monkeypatch.setattr(daemon_module.subprocess, 'run', _run)
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={'SG_EVENT_TEST_SOURCE_KEY': 'source-key'},
         directory=tmp_path,
         timeout_secs=0.2,
     )
 
-    assert process._status(check='liveness')['liveness'] is True
-    readiness = process._status(check='readiness', group='sync')
+    assert process.status(check='liveness')['liveness'] is True
+    readiness = process.status(check='readiness')
 
     assert readiness['readiness'] is True
     assert readiness['detail'] == '<redacted>'
-    assert process._last_status == readiness
+    assert process.last_status == readiness
     assert calls[0][-2:] == ('--check', 'liveness')
-    assert calls[1][-4:] == ('--check', 'readiness', '--group', 'sync')
+    assert calls[1][-2:] == ('--check', 'readiness')
 
 
 def test_supervisor_stops_and_restarts_with_new_identity(tmp_path: Path) -> None:
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
-        timeout_secs=0.5,
-        _command=(sys.executable, '-c', 'import time; time.sleep(60)'),
+        timeout_secs=STALL_DEADLINE_SECS,
+        command=(sys.executable, '-c', 'import threading; threading.Event().wait()'),
     )
-    assert process._stop() == ()
+    assert process.stop() == ()
 
     try:
-        process._start()
-        first_pid = process._pid
-        first_logs = process._log_paths
+        process.start()
+        first_pid = process.pid
+        first_logs = process.log_paths
         assert first_pid is not None
-        assert process._stop() == ()
-        assert process._stop() == ()
+        assert process.stop() == ()
+        assert process.stop() == ()
 
-        process._start()
-        second_pid = process._pid
-        second_logs = process._log_paths
+        process.start()
+        second_pid = process.pid
+        second_logs = process.log_paths
         assert second_pid is not None
         assert second_pid != first_pid
         assert second_logs != first_logs
-        assert process._stop() == ()
+        assert process.stop() == ()
         assert all(path.is_file() for path in (*first_logs, *second_logs))
     finally:
-        child = cast('subprocess.Popen[bytes] | None', vars(process)['_process'])
+        child = cast('subprocess.Popen[bytes] | None', vars(process)['process'])
         if child is not None and child.poll() is None:
             child.kill()
-            child.wait(timeout=5)
-        process._close_logs()
+            child.wait()
+        process.close_logs()
 
 
 def test_unordered_probe_timeout_retains_last_inverted_callback_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = _SupervisorProcess(
+    process = SupervisorProcess(
         config_path=tmp_path / 'config.toml',
         environment={},
         directory=tmp_path,
@@ -1012,14 +1105,14 @@ def test_unordered_probe_timeout_retains_last_inverted_callback_rows(
     )
     live_case = _live_case(tmp_path, process)
     rows = [(102, 'two'), (101, 'one')]
-    _write_probe_rows(live_case._output_paths['async'], 'async', rows)
-    _write_probe_rows(live_case._output_paths['sync'], 'sync', rows)
+    _write_probe_rows(live_case.output_paths['async'], 'async', rows)
+    _write_probe_rows(live_case.output_paths['sync'], 'sync', rows)
     expected = (
         _live_event(101, 'one'),
         _live_event(102, 'two'),
         _live_event(103, 'three'),
     )
-    monkeypatch.setattr(daemon_module, '_LIVE_TIMEOUT_SECS', 0.0)
+    monkeypatch.setattr(daemon_module, 'LIVE_TIMEOUT_SECS', 0.0)
 
     with pytest.raises(AssertionError, match='expected event set') as caught:
         wait_for_group_event_set(live_case, expected)

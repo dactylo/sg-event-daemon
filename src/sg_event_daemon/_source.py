@@ -1,14 +1,17 @@
 """Bounded source polling, catch-up reads, and token-fenced live joins."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
+import logging
 import time
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import exp2, isfinite, log2
+from threading import Event as ThreadEvent
+from threading import Lock, current_thread
 from typing import (
     TYPE_CHECKING,
     Literal,
@@ -26,9 +29,17 @@ from ._events import EVENT_FIELDS, Event
 from ._fanout import (
     EncodedEvent,
     EncoderHaltedError,
-    EncoderWorker,
+    EventEncoder,
     EventFanout,
     GroupChannelInterface,
+)
+from ._gaps import (
+    clip_runs,
+    log_catchup_skipped,
+    log_gap_filled,
+    log_ids_given_up,
+    log_paused,
+    log_resumed,
 )
 from ._group_errors import RevisionConflictError
 from ._group_state import strict_capture_interval
@@ -37,21 +48,23 @@ from ._group_types import (
 )
 from ._health import bound_health_text
 from ._source_state import (
-    SourceCapacityError,
     SourceCommitResult,
     SourceIdentityError,
+    SourcePause,
     SourceState,
 )
 from ._watchdog import SOURCE_WATCHDOG_PHASES, SourceWatchdogPhase
-from ._write_lock import raise_owner_write_failure
+from ._write_lock import WriteLockTimeoutError, raise_owner_write_failure
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+    from contextlib import AbstractContextManager
     from types import TracebackType
     from typing import Self
 
     from ._config import CredentialConfig, SourceConfig
-    from ._fanout import StrictCapacityControl, StrictOrderingControl
+    from ._fanout import StrictOrderingControl
+    from ._gaps import IdRun
     from ._group_state import GroupState, SourceProgress
     from ._group_types import CatchupEpoch, GroupSnapshot
     from ._providers import Provider, SyncSG
@@ -59,14 +72,15 @@ if TYPE_CHECKING:
     from ._strict import StrictBuffer
     from ._watchdog import ComponentWatchdog
 
+_LOGGER = logging.getLogger(__name__)
+
 _MAX_RETRY_DELAY_STEP_BITS = 64
+_MAX_RUNS_PER_QUERY = 100
 
 _StrictAuthority: TypeAlias = tuple[str, str, str, int, str, str]
 
 SourceHaltStatus: TypeAlias = Literal[
-    'encoder-died',
     'encoder-failed',
-    'encoder-shutdown',
     'event-too-large',
     'frame-too-large',
     'late-capacity-exhausted',
@@ -76,15 +90,16 @@ SourceHaltStatus: TypeAlias = Literal[
     'stream-identity-changed',
 ]
 SourceRunStatus: TypeAlias = SourceHaltStatus | Literal['running', 'uninitialized']
+HALTS_IN_PLACE: frozenset[SourceHaltStatus] = frozenset(
+    {'encoder-failed', 'event-too-large', 'frame-too-large', 'stream-identity-changed'}
+)
 SOURCE_RUN_STATUSES: tuple[SourceRunStatus, ...] = tuple(
     status for status_group in get_args(SourceRunStatus) for status in get_args(status_group)
 )
 _SourceHaltCode: TypeAlias = SourceHaltStatus | Literal['commit-batch-capacity-exhausted']
 _SOURCE_HALT_CODES: dict[str, SourceHaltStatus] = {
     'commit-batch-capacity-exhausted': 'frame-too-large',
-    'encoder-died': 'encoder-died',
     'encoder-failed': 'encoder-failed',
-    'encoder-shutdown': 'encoder-shutdown',
     'event-too-large': 'event-too-large',
     'frame-too-large': 'frame-too-large',
     'late-capacity-exhausted': 'late-capacity-exhausted',
@@ -96,22 +111,18 @@ _SOURCE_HALT_CODES: dict[str, SourceHaltStatus] = {
 
 
 @dataclass(frozen=True)
+class _IdRunPage:
+    """Carry one ascending provider page and the last requested ID it covers."""
+
+    events: tuple[Event, ...]
+    covered_through: int
+
+
+@dataclass(frozen=True)
 class Attached:
     """Acknowledge source-side provisional preparation only."""
 
     identity: LiveJoinIdentity
-
-
-@dataclass(frozen=True)
-class _CatchupResult:
-    """Describe one completed body-free catch-up pass."""
-
-    _cursor: int
-    status: Literal['caught-up']
-    _source_frontier: int
-    _source_generation: str
-    _stream_incarnation: str
-    _source_successful_clock: float
 
 
 class HistoryTruncatedError(RuntimeError):
@@ -138,8 +149,6 @@ class HistoryTruncatedError(RuntimeError):
             no_visible_rows: Whether the floor represents empty visible history
                 rather than an observed provider row.
         """
-        self._no_visible_rows = no_visible_rows
-        self._required_event_id = required_event_id
         self.retention_floor = retention_floor
         message = (
             f'history-truncated: no visible rows for required id {required_event_id}'
@@ -195,6 +204,23 @@ class JoinProtocolError(RuntimeError):
     """Report a stale, conflicting, or invalid live-join message."""
 
 
+class LiveChannelDetachedError(JoinProtocolError):
+    """Carry the original channel detach reason across owner cleanup.
+
+    Attributes:
+        reason: First recorded channel detach condition.
+    """
+
+    def __init__(self, reason: str) -> None:
+        """Retain the detach condition observed before join settlement.
+
+        Args:
+            reason: Body-free channel detach condition.
+        """
+        super().__init__(f'live channel detached: {reason}')
+        self.reason = reason
+
+
 class JoinCapacityError(JoinProtocolError):
     """Report one exact strict attempt aborted by measured buffer capacity."""
 
@@ -219,8 +245,9 @@ class JoinRetry:
         """Reject invalid retry delays and headroom bounds at construction.
 
         Raises:
-            ValueError: The delay is not finite and nonnegative or either
-                headroom count is not an exact nonnegative integer.
+            ValueError: The delay is not an exact int or float with a finite,
+                nonnegative value, or either headroom count is not an exact
+                nonnegative integer.
         """
         delay = self.retry_after_secs
         if type(delay) not in {float, int} or delay < 0:
@@ -295,7 +322,7 @@ class SourceHealth:
     strict_buffer_event_count: int = 0
     strict_buffer_byte_count: int = 0
     strict_retention: tuple[tuple[str, int, int, int], ...] = ()
-    checkpoint_state: str = 'unknown'
+    conditions: tuple[str, ...] = ()
     stream_incarnation: str | None = None
     audit_count: int = 0
     database_size_bytes: int = 0
@@ -340,24 +367,11 @@ class SourceHealth:
 
 
 @dataclass(frozen=True)
-class StrictCatchupResult:
-    """Describe one bounded detached-strict epoch scheduling step.
+class _StrictCatchupResult:
+    """Describe one bounded detached-strict epoch scheduling step."""
 
-    Attributes:
-        source_generation: Source generation observed during the step.
-        stream_incarnation: Stream incarnation observed during the step.
-        join_ready: Whether the group may enter a live join.
-        exhausted_through: Highest event covered by exhausted evidence, if any.
-        exhausted_fence: Generation and revision fence for exhausted evidence.
-        exhausted_epoch_id: Epoch identifier for exhausted evidence, if any.
-    """
-
-    _cursor: int
-    _source_frontier: int
     source_generation: str
     stream_incarnation: str
-    _reader_clock: float
-    _pending_epoch_count: int
     join_ready: bool
     exhausted_through: int | None
     exhausted_fence: tuple[str, int, int] | None
@@ -386,6 +400,7 @@ class _CatchupOptions(TypedDict):
     delivery_floor: int
     source_progress: Callable[[], SourceProgress]
     deliver_page: Callable[[Sequence[Event]], None]
+    between_pages: NotRequired[Callable[[], None]]
     unresolved_bounds: NotRequired[Sequence[tuple[int, int]]]
     replay_from: NotRequired[int | None]
     service: NotRequired[Callable[[float], None]]
@@ -395,14 +410,14 @@ class _CatchupOptions(TypedDict):
 class _JoinRecord:
     """Hold one in-memory token-fenced join phase."""
 
-    _attempt: JoinAttemptIdentity
-    _identity: LiveJoinIdentity
-    _channel: GroupChannelInterface
-    _initial: JoinTarget | JoinRetry
-    _phase: Literal['aborted', 'finalized', 'prepared', 'reserved']
-    _attached: Attached | None = None
-    _finalized: JoinFinalized | None = None
-    _requires_fresh: bool = False
+    attempt: JoinAttemptIdentity
+    identity: LiveJoinIdentity
+    channel: GroupChannelInterface
+    initial: JoinTarget | JoinRetry
+    phase: Literal['aborted', 'finalized', 'prepared', 'reserved']
+    attached: Attached | None = None
+    finalized: JoinFinalized | None = None
+    requires_fresh: bool = False
 
 
 class _StrictJoinRetention(Protocol):
@@ -418,7 +433,7 @@ class _StrictJoinRetention(Protocol):
 
     def acknowledge_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Retire one exact lane-committed strict control.
 
@@ -483,8 +498,16 @@ class _SuccessfulQueryClock:
         self._last_observation = clock()
         self._successful_value = float(initial_value)
 
-    def _failed(self) -> float:
-        """Pause accumulation across one failed query."""
+    def failed(self) -> float:
+        """Pause accumulation across one failed query.
+
+        Returns:
+            Accumulated successful-query seconds, unchanged by this failed
+            query.
+
+        Raises:
+            RuntimeError: The supplied monotonic clock moves backward.
+        """
         now = self._clock()
         if now < self._last_observation:
             raise RuntimeError('successful-query wall clock moved backward')
@@ -492,15 +515,33 @@ class _SuccessfulQueryClock:
         self._last_observation = now
         return self._successful_value
 
-    def _resume_from(self, checkpoint: float) -> float:
-        """Adopt a durable checkpoint without counting process downtime."""
+    def resume_from(self, checkpoint: float) -> float:
+        """Adopt a durable checkpoint without counting process downtime.
+
+        Args:
+            checkpoint: Finite nonnegative successful-query time in seconds.
+
+        Returns:
+            The greater of the current accumulated time and the checkpoint.
+
+        Raises:
+            ValueError: The checkpoint is negative or non-finite.
+        """
         if not isfinite(checkpoint) or checkpoint < 0:
             raise ValueError('successful-query checkpoint must be finite and nonnegative')
         self._successful_value = max(self._successful_value, checkpoint)
         return self._successful_value
 
-    def _succeeded(self) -> float:
-        """Advance by elapsed time since the last query outcome."""
+    def succeeded(self) -> float:
+        """Advance successful-query time except across the first recovery interval.
+
+        Returns:
+            Accumulated successful-query seconds. The first success after a
+            failure ends recovery without adding the intervening elapsed time.
+
+        Raises:
+            RuntimeError: The supplied monotonic clock moves backward.
+        """
         now = self._clock()
         if now < self._last_observation:
             raise RuntimeError('successful-query wall clock moved backward')
@@ -512,7 +553,7 @@ class _SuccessfulQueryClock:
         return self._successful_value
 
     @property
-    def _value(self) -> float:
+    def value(self) -> float:
         """Return accumulated successful-query time."""
         return self._successful_value
 
@@ -566,7 +607,7 @@ class JoinCoordinator:
     def _matching(self, identity: LiveJoinIdentity) -> _JoinRecord:
         """Return the exact current record or reject a stale message."""
         record = self._records.get(identity.attempt_token)
-        if record is None or record._identity != identity:
+        if record is None or record.identity != identity:
             raise JoinProtocolError('stale join attempt')
         if self._active.get(identity.group) is not record:
             raise JoinProtocolError('stale join attempt')
@@ -583,25 +624,25 @@ class JoinCoordinator:
 
     def _abort_record(self, record: _JoinRecord, reason: str) -> None:
         """Abort one exact current record without touching a newer token."""
-        if record._phase == 'aborted':
-            record._requires_fresh = True
+        if record.phase == 'aborted':
+            record.requires_fresh = True
             return
-        if record._attempt.join_kind == 'strict':
-            self._require_strict_retention().abort(record._identity)
+        if record.attempt.join_kind == 'strict':
+            self._require_strict_retention().abort(record.identity)
         else:
-            current = self._fanout.channel(record._attempt.group)
-            if current is record._channel:
-                self._fanout.detach(record._attempt.group, reason=reason)
-        record._phase = 'aborted'
-        record._requires_fresh = True
-        self._active.pop(record._attempt.group, None)
+            current = self._fanout.channel(record.attempt.group)
+            if current is record.channel:
+                self._fanout.detach(record.attempt.group, reason=reason)
+        record.phase = 'aborted'
+        record.requires_fresh = True
+        self._active.pop(record.attempt.group, None)
 
     def _retire_terminal_history(self, group: str) -> None:
         """Discard the superseded terminal token for one group."""
         for token, previous in tuple(self._records.items()):
-            if previous._attempt.group != group:
+            if previous.attempt.group != group:
                 continue
-            if previous._phase not in {'aborted', 'finalized'}:
+            if previous.phase not in {'aborted', 'finalized'}:
                 raise JoinProtocolError('group join history is not terminal')
             del self._records[token]
 
@@ -609,7 +650,7 @@ class JoinCoordinator:
     def _retry(record: _JoinRecord) -> JoinRetry:
         """Build one deterministic fresh-token retry response."""
         return JoinRetry(
-            attempt=record._attempt,
+            attempt=record.attempt,
             retry_after_secs=0.0,
             headroom_events=0,
             headroom_bytes=0,
@@ -648,7 +689,7 @@ class JoinCoordinator:
             abort: Complete captured live-join identity.
         """
         record = self._records.get(abort.identity.attempt_token)
-        if record is None or record._identity != abort.identity:
+        if record is None or record.identity != abort.identity:
             return
         if self._active.get(abort.identity.group) is not record:
             return
@@ -656,7 +697,7 @@ class JoinCoordinator:
 
     def acknowledge_strict_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Retire one exact strict control after the configured-level lane commit.
 
@@ -672,11 +713,11 @@ class JoinCoordinator:
         record = self._records.get(identity.attempt_token)
         if (
             record is None
-            or record._identity != identity
+            or record.identity != identity
             or identity.source_generation != self._source_generation
         ):
             raise JoinProtocolError('stale strict control acknowledgement')
-        if record._attempt.join_kind != 'strict' or record._phase not in {
+        if record.attempt.join_kind != 'strict' or record.phase not in {
             'aborted',
             'finalized',
         }:
@@ -699,40 +740,43 @@ class JoinCoordinator:
         Raises:
             JoinProtocolError: The identity is stale or conflicts with the
                 current attempt.
+            ValueError: A different attached channel already owns the group.
+            OSError: Closing the remote channel after a strict-capacity retry
+                fails.
         """
         record = self._matching(confirmation.identity)
-        if record._phase == 'prepared' and record._attached is not None:
-            return record._attached
-        if record._phase == 'finalized' and record._attached is not None:
-            return record._attached
-        if record._attempt.join_kind == 'eager':
-            if not record._channel.status.attached:
-                record._phase = 'aborted'
-                record._requires_fresh = True
-                self._active.pop(record._attempt.group, None)
+        if record.phase == 'prepared' and record.attached is not None:
+            return record.attached
+        if record.phase == 'finalized' and record.attached is not None:
+            return record.attached
+        if record.attempt.join_kind == 'eager':
+            if not record.channel.status.attached:
+                record.phase = 'aborted'
+                record.requires_fresh = True
+                self._active.pop(record.attempt.group, None)
                 return self._retry(record)
-            attached = Attached(record._identity)
+            attached = Attached(record.identity)
         else:
             retention = self._require_strict_retention()
-            self._fanout.attach(record._channel, provisional=True)
+            self._fanout.attach(record.channel, provisional=True)
             try:
                 attached = retention.prepare(
-                    record._identity,
-                    record._channel,
+                    record.identity,
+                    record.channel,
                 )
             except JoinCapacityError:
                 self._fanout.detach(
-                    record._attempt.group,
+                    record.attempt.group,
                     reason='strict-buffer-capacity',
                 )
-                record._phase = 'aborted'
-                record._requires_fresh = True
-                self._active.pop(record._attempt.group, None)
+                record.phase = 'aborted'
+                record.requires_fresh = True
+                self._active.pop(record.attempt.group, None)
                 return self._retry(record)
-            if attached != Attached(record._identity):
+            if attached != Attached(record.identity):
                 raise JoinProtocolError('strict prepare acknowledgement conflicts')
-        record._attached = attached
-        record._phase = 'prepared'
+        record.attached = attached
+        record.phase = 'prepared'
         return attached
 
     def finalize(self, finalization: JoinFinalize) -> JoinFinalized:
@@ -751,40 +795,47 @@ class JoinCoordinator:
         Raises:
             JoinProtocolError: The identity is stale, conflicting, or not
                 prepared.
+            LiveChannelDetachedError: The channel detached before promotion;
+                the source attempt is aborted and a fresh join is required.
+            ValueError: Another attempt owns the registered fanout channel.
         """
         existing = self._records.get(finalization.identity.attempt_token)
         if (
             existing is not None
-            and existing._identity == finalization.identity
-            and existing._finalized is not None
-            and existing._phase == 'finalized'
-            and not existing._requires_fresh
+            and existing.identity == finalization.identity
+            and existing.finalized is not None
+            and existing.phase == 'finalized'
+            and not existing.requires_fresh
         ):
-            return existing._finalized
+            return existing.finalized
         record = self._matching(finalization.identity)
-        if record._phase != 'prepared':
+        if record.phase != 'prepared':
             raise JoinProtocolError('join attempt is not prepared')
-        if record._attempt.join_kind == 'strict':
+        retention = None
+        if record.attempt.join_kind == 'strict':
             retention = self._require_strict_retention()
-            finalized = retention.finalize(record._identity)
-            if finalized != JoinFinalized(record._identity):
+            finalized = retention.finalize(record.identity)
+            if finalized != JoinFinalized(record.identity):
                 raise JoinProtocolError('strict finalize acknowledgement conflicts')
-            try:
-                self._fanout.promote(
-                    record._attempt.group,
-                    record._channel,
-                )
-            except BaseException:
-                retention.abort(record._identity)
-                raise
         else:
+            finalized = JoinFinalized(record.identity)
+        try:
             self._fanout.promote(
-                record._attempt.group,
-                record._channel,
+                record.attempt.group,
+                record.channel,
             )
-            finalized = JoinFinalized(record._identity)
-        record._finalized = finalized
-        record._phase = 'finalized'
+        except BaseException as error:
+            if isinstance(error, (EncoderHaltedError, ConnectionError)):
+                status = record.channel.status
+                if not status.attached:
+                    reason = cast('str', status.reason)
+                    self._abort_record(record, reason)
+                    raise LiveChannelDetachedError(reason) from error
+            if retention is not None:
+                retention.abort(record.identity)
+            raise
+        record.finalized = finalized
+        record.phase = 'finalized'
         return finalized
 
     def group_died(self, group: str, group_generation: int) -> None:
@@ -795,7 +846,7 @@ class JoinCoordinator:
             group_generation: Exact durable generation.
         """
         record = self._active.get(group)
-        if record is not None and record._attempt.group_generation == group_generation:
+        if record is not None and record.attempt.group_generation == group_generation:
             self._abort_record(record, 'group-died')
 
     def request(
@@ -814,6 +865,10 @@ class JoinCoordinator:
 
         Raises:
             JoinProtocolError: The token is stale, reused, or conflicts.
+            sqlite3.Error: Reading durable source state fails.
+            RuntimeError: Source metadata is missing or its persisted condition
+                is unknown.
+            ValueError: A different attached channel already owns the group.
         """
         attempt = request.attempt
         self._validate_attempt(attempt, channel)
@@ -822,11 +877,11 @@ class JoinCoordinator:
             raise JoinProtocolError('join source identity conflicts')
         recorded = self._records.get(attempt.attempt_token)
         if recorded is not None:
-            if recorded._attempt != attempt:
+            if recorded.attempt != attempt:
                 raise JoinProtocolError('join attempt token was reused')
-            if recorded._requires_fresh:
+            if recorded.requires_fresh:
                 raise JoinProtocolError('join retry requires a fresh attempt token')
-            return recorded._initial
+            return recorded.initial
         current = self._active.get(attempt.group)
         if current is not None:
             raise JoinProtocolError('group already has an active join attempt')
@@ -844,17 +899,17 @@ class JoinCoordinator:
                 self._fanout.attach(channel, provisional=True)
                 initial = target
         record = _JoinRecord(
-            _attempt=attempt,
-            _identity=identity,
-            _channel=channel,
-            _initial=initial,
-            _phase='reserved',
+            attempt=attempt,
+            identity=identity,
+            channel=channel,
+            initial=initial,
+            phase='reserved',
         )
         self._records[attempt.attempt_token] = record
         if isinstance(initial, JoinTarget):
             self._active[attempt.group] = record
         else:
-            record._phase = 'aborted'
+            record.phase = 'aborted'
         return initial
 
 
@@ -875,32 +930,29 @@ class _StrictCatchupOptions(TypedDict):
 class _StrictStepContext:
     """Hold one validated detached-strict scheduling decision."""
 
-    _deliver: Callable[[Sequence[Event], float], StrictDeliveryOutcome]
-    _holdback_secs: float
-    _interval: float
-    _join_boundary: int | None
-    _max_pending_epochs: int
-    _reader_clock: float
-    _state: GroupState
-    _synchronization: SourceProgress
-    _target: int
-    _unresolved_bounds: Sequence[tuple[int, int]]
-    _obligation_fence: tuple[str, int, int] | None
-    _service: Callable[[float], None] | None
+    deliver: Callable[[Sequence[Event], float], StrictDeliveryOutcome]
+    holdback_secs: float
+    interval: float
+    join_boundary: int | None
+    max_pending_epochs: int
+    reader_clock: float
+    state: GroupState
+    synchronization: SourceProgress
+    target: int
+    unresolved_bounds: Sequence[tuple[int, int]]
+    obligation_fence: tuple[str, int, int] | None
+    service: Callable[[float], None] | None
 
 
 @dataclass(frozen=True)
 class _StrictPreparedPage:
     """Retain one provider page and its immutable query evidence for one step."""
 
-    _events: tuple[Event, ...]
-    _authority: _StrictAuthority
-    _epoch: CatchupEpoch
-    _fence: tuple[str, int, int] | None
-    _query_low: int
-    _query_high: int
-    _page_cursor: int
-    _exhausted: bool
+    events: tuple[Event, ...]
+    authority: _StrictAuthority
+    epoch: CatchupEpoch
+    fence: tuple[str, int, int] | None
+    query_high: int
 
 
 class _Waiter(Protocol):
@@ -931,6 +983,8 @@ class _CatchupReaderOptions(TypedDict):
     batch_size: int
     fetch_interval_secs: float
     waiter: _Waiter
+    log_extra: NotRequired[Mapping[str, str]]
+    provider_watch: NotRequired[Callable[[], AbstractContextManager[object]] | None]
     successful_clock: NotRequired[_SuccessfulQueryClock | None]
 
 
@@ -964,7 +1018,9 @@ class CatchupReader:
         self._handle: SyncSG | None = None
         self._latest_strict_capture_at: float | None = None
         self._latest_strict_capture_bound: int | None = None
+        self._log_extra = options.get('log_extra', {})
         self._provider = options['provider']
+        self._provider_watch = options.get('provider_watch')
         self._site_url = options['site_url']
         successful_clock = options.get('successful_clock')
         self._successful_clock = (
@@ -977,12 +1033,17 @@ class CatchupReader:
 
         Returns:
             This live catch-up reader.
+
+        Raises:
+            Exception: Creating or configuring the supplied provider handle
+                fails.
         """
         if self._handle is None:
-            self._handle = self._provider.create_sync(
-                self._site_url,
-                self._credential,
-            )
+            with self._provider_watch() if self._provider_watch is not None else nullcontext():
+                self._handle = self._provider.create_sync(
+                    self._site_url,
+                    self._credential,
+                )
         return self
 
     def __exit__(
@@ -991,7 +1052,11 @@ class CatchupReader:
         _exc_value: BaseException | None,
         _traceback: TracebackType | None,
     ) -> None:
-        """Close the reader at context exit."""
+        """Close the reader at context exit.
+
+        Raises:
+            Exception: Closing the supplied provider handle fails.
+        """
         self.close()
 
     def _capture_strict_epoch(
@@ -1011,21 +1076,21 @@ class CatchupReader:
                 self._latest_strict_capture_bound = latest.high_id
         low_id = snapshot.cursor + 1 if not pending else pending[-1].high_id + 1
         spaced = not pending or (
-            context._reader_clock >= pending[-1].captured_at + context._interval
+            context.reader_clock >= pending[-1].captured_at + context.interval
         )
-        if len(pending) >= context._max_pending_epochs or not spaced or context._target < low_id:
+        if len(pending) >= context.max_pending_epochs or not spaced or context.target < low_id:
             return snapshot
-        captured = context._state.capture_epoch(
+        captured = context.state.capture_epoch(
             low_id=low_id,
-            high_id=context._target,
-            captured_at=context._reader_clock,
-            eligibility_point=context._reader_clock + context._holdback_secs,
-            reader_clock_checkpoint=context._reader_clock,
+            high_id=context.target,
+            captured_at=context.reader_clock,
+            eligibility_point=context.reader_clock + context.holdback_secs,
+            reader_clock_checkpoint=context.reader_clock,
             source_generation=snapshot.source_generation,
             expected_revision=snapshot.revision,
         )
-        self._latest_strict_capture_at = context._reader_clock
-        self._latest_strict_capture_bound = context._target
+        self._latest_strict_capture_at = context.reader_clock
+        self._latest_strict_capture_bound = context.target
         return captured
 
     @staticmethod
@@ -1041,13 +1106,13 @@ class CatchupReader:
         snapshot: GroupSnapshot,
     ) -> GroupSnapshot:
         """Persist due reader-clock progress while any epoch remains."""
-        reader_clock = self._successful_clock._value
+        reader_clock = self._successful_clock.value
         if (
             not snapshot.epochs
-            or reader_clock < snapshot.reader_clock_checkpoint + context._interval
+            or reader_clock < snapshot.reader_clock_checkpoint + context.interval
         ):
             return snapshot
-        return context._state.checkpoint_reader_clock(
+        return context.state.checkpoint_reader_clock(
             reader_clock,
             source_generation=snapshot.source_generation,
             expected_revision=snapshot.revision,
@@ -1078,48 +1143,23 @@ class CatchupReader:
     @contextmanager
     def _query(self) -> Generator[None]:
         """Record one provider operation's clock outcome at its owner's boundary."""
-        try:
-            yield
-        except BaseException:
-            self._successful_clock._failed()
-            raise
-        self._successful_clock._succeeded()
+        with self._provider_watch() if self._provider_watch is not None else nullcontext():
+            try:
+                yield
+            except BaseException:
+                self._successful_clock.failed()
+                raise
+            self._successful_clock.succeeded()
 
     def _latest_visible_id(self, handle: SyncSG) -> int | None:
         """Query and validate one liveness-probe frontier."""
         with self._query():
-            rows = handle.find(
-                'EventLogEntry',
-                [],
-                ['id'],
-                limit=1,
-                order=[{'field_name': 'id', 'direction': 'desc'}],
-                page=0,
-            )
-        if not rows:
-            return None
-        value = rows[0].get('id')
-        if type(value) is not int or value <= 0:
-            raise ValueError('latest visible EventLogEntry id is invalid')
-        return value
+            return edge_visible_id(handle, 'desc')
 
     def _lowest_visible_id(self, handle: SyncSG) -> int | None:
         """Query and validate the current retention floor."""
         with self._query():
-            rows = handle.find(
-                'EventLogEntry',
-                [],
-                ['id'],
-                limit=1,
-                order=[{'field_name': 'id', 'direction': 'asc'}],
-                page=0,
-            )
-        if not rows:
-            return None
-        value = rows[0].get('id')
-        if type(value) is not int or value <= 0:
-            raise ValueError('lowest visible EventLogEntry id is invalid')
-        return value
+            return edge_visible_id(handle, 'asc')
 
     @staticmethod
     def _oldest_required(
@@ -1200,39 +1240,26 @@ class CatchupReader:
             raise RuntimeError('catch-up reader is not open')
         return self._handle
 
-    @staticmethod
-    def _result(
-        cursor: int,
-        status: Literal['caught-up'],
-        synchronization: SourceProgress,
-    ) -> _CatchupResult:
-        """Build one complete catch-up result."""
-        return _CatchupResult(
-            _cursor=cursor,
-            status=status,
-            _source_frontier=synchronization.frontier,
-            _source_generation=synchronization.source_generation,
-            _stream_incarnation=synchronization.stream_incarnation,
-            _source_successful_clock=synchronization.source_successful_clock,
-        )
-
-    def _service_catchup(self, options: _CatchupOptions, seconds: float = 0.0) -> None:
-        """Service owner work or wait interruptibly between eager provider calls."""
-        service = options.get('service')
+    def _service_reader(
+        self,
+        service: Callable[[float], None] | None,
+        seconds: float = 0.0,
+    ) -> None:
+        """Service owner work or wait interruptibly between provider calls."""
         if service is not None:
             service(seconds)
         elif seconds and self._waiter.wait(seconds):
             raise InterruptedError('catch-up interrupted')
 
-    def _consume_ordinary_page(
+    def _query_gap_page(
         self,
         handle: SyncSG,
         cursor: int,
         target: int,
         gap_target: int | None,
-        options: _CatchupOptions,
-    ) -> tuple[int, int | None]:
-        """Consume one page or discard it before a narrower gap probe."""
+        service: Callable[[float], None] | None,
+    ) -> tuple[int, int | None, tuple[Event, ...]]:
+        """Return the contiguous prefix or floor-checked two-read gap progress."""
         query_target = target if gap_target is None else gap_target
         inclusive_low = gap_target is not None
         query_cursor = cursor + 1 if inclusive_low else cursor
@@ -1242,59 +1269,66 @@ class CatchupReader:
             query_target,
             inclusive_low=inclusive_low,
         )
-        self._service_catchup(options)
+        self._service_reader(service)
         if not events:
             if gap_target is None:
-                return cursor, target
+                return cursor, target, ()
             floor = self._lowest_visible_id(handle)
-            self._service_catchup(options)
+            self._service_reader(service)
             self._check_floor(floor, cursor + 1, query_target)
-            return query_target, None
+            return query_target, None, ()
         expected = cursor + 1
         for index, event in enumerate(events):
             event_id = cast('int', event['id'])
             if event_id > expected:
-                self._deliver_page(events[:index], options)
-                return cursor, event_id - 1
+                return cursor, event_id - 1, events[:index]
             cursor = event_id
             expected = event_id + 1
-        self._deliver_page(events, options)
         if cursor >= query_target:
-            return cursor, None
+            return cursor, None, events
         if exhausted:
-            return cursor, query_target
-        return cursor, gap_target
+            return cursor, query_target, events
+        return cursor, gap_target, events
 
-    def _consume_replay_page(
+    def _consume_ordinary_page(
         self,
         handle: SyncSG,
         cursor: int,
         target: int,
-        *,
-        inclusive_low: bool,
+        gap_target: int | None,
         options: _CatchupOptions,
-    ) -> tuple[int, bool]:
-        """Consume one replay page without retaining it across fetches."""
-        page_cursor, events, exhausted = self._query_events(
+    ) -> tuple[int, int | None]:
+        """Deliver the contiguous prefix before discarding and re-querying a gap."""
+        page_cursor, gap_target, events = self._query_gap_page(
             handle,
             cursor,
             target,
-            inclusive_low=inclusive_low,
+            gap_target,
+            options.get('service'),
         )
-        self._service_catchup(options)
         self._deliver_page(events, options)
-        return page_cursor, exhausted
+        if not events and page_cursor > cursor:
+            log_catchup_skipped(
+                self._log_extra, cursor + 1, page_cursor, self._fetch_interval_secs
+            )
+        return page_cursor, gap_target
+
+    def _service_catchup(self, options: _CatchupOptions, seconds: float = 0.0) -> None:
+        """Service eager owner work with the reader's interruptible fallback."""
+        self._service_reader(options.get('service'), seconds)
 
     def _read_ordinary(
         self,
         handle: SyncSG,
         target: int,
         options: _CatchupOptions,
-    ) -> int:
+    ) -> None:
         """Read ordinary pages with discard-and-refetch gap checks."""
         cursor = options['cursor']
         gap_target: int | None = None
         while cursor < target:
+            if (between_pages := options.get('between_pages')) is not None:
+                between_pages()
             if gap_target is not None:
                 self._service_catchup(options, self._fetch_interval_secs)
             cursor, gap_target = self._consume_ordinary_page(
@@ -1304,7 +1338,6 @@ class CatchupReader:
                 gap_target,
                 options,
             )
-        return target
 
     def _read_replay(
         self,
@@ -1312,33 +1345,23 @@ class CatchupReader:
         target: int,
         options: _CatchupOptions,
         replay_from: int,
-    ) -> int:
+    ) -> None:
         """Read replay pages while leaving the ordinary cursor unchanged."""
-        cursor = replay_from
-        inclusive_low = True
-        while True:
-            cursor, exhausted = self._consume_replay_page(
-                handle,
-                cursor,
-                target,
-                inclusive_low=inclusive_low,
-                options=options,
-            )
-            if cursor >= target or exhausted:
-                return options['cursor']
-            inclusive_low = False
+        cursor = max(replay_from - 1, options['delivery_floor'])
+        self._read_ordinary(handle, target, {**options, 'cursor': cursor})
 
     def _read_and_deliver(
         self,
         handle: SyncSG,
         target: int,
         options: _CatchupOptions,
-    ) -> int:
+    ) -> None:
         """Read every bounded page without retaining it across fetches."""
         replay_from = options.get('replay_from')
         if replay_from is None:
-            return self._read_ordinary(handle, target, options)
-        return self._read_replay(handle, target, options, replay_from)
+            self._read_ordinary(handle, target, options)
+            return
+        self._read_replay(handle, target, options, replay_from)
 
     @staticmethod
     def _service_strict(options: _StrictCatchupOptions) -> GroupSnapshot:
@@ -1366,15 +1389,15 @@ class CatchupReader:
         epoch: CatchupEpoch,
     ) -> int:
         """Return the safe prefix ceiling or a body-free stall sentinel."""
-        if context._synchronization.frontier < epoch.high_id:
+        if context.synchronization.frontier < epoch.high_id:
             return epoch.low_id - 1
         lower_bounds = (
             low_id
-            for low_id, high_id in context._unresolved_bounds
+            for low_id, high_id in context.unresolved_bounds
             if high_id >= epoch.low_id and low_id <= epoch.high_id
         )
         first_unresolved = min(lower_bounds, default=None)
-        fence = context._obligation_fence
+        fence = context.obligation_fence
         if fence is not None and fence[1] <= epoch.high_id:
             first_unresolved = (
                 fence[1] if first_unresolved is None else min(first_unresolved, fence[1])
@@ -1389,37 +1412,37 @@ class CatchupReader:
         page: _StrictPreparedPage,
     ) -> bool:
         """Accept prepared prefixes only after fresh post-service authority reads."""
-        remaining = page._events
+        remaining = page.events
         while True:
-            if context._service is not None:
-                context._service(0.0)
-            current = context._state.snapshot()
-            fence = context._state.strict_obligation_fence()
+            if context.service is not None:
+                context.service(0.0)
+            current = context.state.snapshot()
+            fence = context.state.strict_obligation_fence()
             if (
-                self._strict_authority(current) != page._authority
+                self._strict_authority(current) != page.authority
                 or current.status != 'running'
                 or not current.epochs
-                or current.epochs[0] != page._epoch
-                or fence != page._fence
+                or current.epochs[0] != page.epoch
+                or fence != page.fence
             ):
                 return False
             fresh = replace(
                 context,
-                _reader_clock=self._successful_clock._value,
-                _unresolved_bounds=(
-                    *context._unresolved_bounds,
-                    *context._state.unresolved_obligation_bounds(),
+                reader_clock=self._successful_clock.value,
+                unresolved_bounds=(
+                    *context.unresolved_bounds,
+                    *context.state.unresolved_obligation_bounds(),
                 ),
-                _obligation_fence=fence,
+                obligation_fence=fence,
             )
-            if self._strict_delivery_ceiling(fresh, page._epoch) < page._query_high:
+            if self._strict_delivery_ceiling(fresh, page.epoch) < page.query_high:
                 return False
             remaining = tuple(
                 event for event in remaining if cast('int', event['id']) > current.cursor
             )
             if not remaining:
                 return True
-            outcome = fresh._deliver(remaining, page._epoch.captured_at)
+            outcome = fresh.deliver(remaining, page.epoch.captured_at)
             if not 0 <= outcome.consumed <= len(remaining):
                 raise ValueError('strict delivery consumed invalid page prefix')
             if not outcome.accepted or not outcome.continue_epoch or outcome.consumed == 0:
@@ -1436,45 +1459,51 @@ class CatchupReader:
         if not snapshot.epochs or snapshot.epochs[0].state != 'delivering':
             return snapshot, False
         epoch = snapshot.epochs[0]
-        if context._synchronization.frontier < epoch.high_id or snapshot.conditions:
+        if context.synchronization.frontier < epoch.high_id or snapshot.conditions:
             return snapshot, False
         delivery_ceiling = self._strict_delivery_ceiling(context, epoch)
-        query_cursor = max(epoch.low_id, snapshot.cursor + 1)
-        while query_cursor <= delivery_ceiling:
-            page_cursor, events, exhausted = self._query_events(
+        cursor = max(epoch.low_id - 1, snapshot.cursor)
+        gap_target: int | None = None
+        while cursor < delivery_ceiling:
+            if gap_target is not None:
+                self._service_reader(context.service, self._fetch_interval_secs)
+            page_cursor, gap_target, events = self._query_gap_page(
                 handle,
-                query_cursor,
+                cursor,
                 delivery_ceiling,
-                inclusive_low=True,
+                gap_target,
+                context.service,
             )
             page = _StrictPreparedPage(
-                _events=events,
-                _authority=self._strict_authority(snapshot),
-                _epoch=epoch,
-                _fence=context._obligation_fence,
-                _query_low=query_cursor,
-                _query_high=delivery_ceiling,
-                _page_cursor=page_cursor,
-                _exhausted=exhausted,
+                events=events,
+                authority=self._strict_authority(snapshot),
+                epoch=epoch,
+                fence=context.obligation_fence,
+                query_high=delivery_ceiling,
             )
             if not self._deliver_strict_page(context, page):
-                current = context._state.snapshot()
+                current = context.state.snapshot()
                 if (
-                    self._strict_authority(current) == page._authority
+                    self._strict_authority(current) == page.authority
                     and current.epochs
-                    and current.epochs[0] == page._epoch
-                    and context._state.strict_obligation_fence() == page._fence
+                    and current.epochs[0] == page.epoch
+                    and context.state.strict_obligation_fence() == page.fence
                 ):
                     current = self._checkpoint_strict_reader(context, current)
                 return current, False
-            if page._page_cursor >= page._query_high or page._exhausted:
-                break
-            query_cursor = page._page_cursor + 1
+            if not events and page_cursor > cursor:
+                log_catchup_skipped(
+                    self._log_extra,
+                    cursor + 1,
+                    page_cursor,
+                    self._fetch_interval_secs,
+                )
+            cursor = page_cursor
             del page, events
-        current = context._state.snapshot()
+        current = context.state.snapshot()
         exhausted = not current.conditions and current.required_event_id is None
         if delivery_ceiling >= epoch.high_id and exhausted:
-            current = context._state.complete_epoch(
+            current = context.state.complete_epoch(
                 epoch.epoch_id,
                 epoch.high_id,
                 expected_revision=current.revision,
@@ -1489,17 +1518,17 @@ class CatchupReader:
         """Return whether catch-up may request or finish a fixed join."""
         if snapshot.epochs:
             return False
-        if context._join_boundary is not None:
-            return snapshot.cursor >= context._join_boundary
-        if context._synchronization.frontier <= snapshot.cursor:
+        if context.join_boundary is not None:
+            return snapshot.cursor >= context.join_boundary
+        if context.synchronization.frontier <= snapshot.cursor:
             return True
         bound = self._latest_strict_capture_bound
         captured_at = self._latest_strict_capture_at
         if bound is None or captured_at is None or snapshot.cursor < bound:
             return False
         return (
-            bound >= context._synchronization.frontier
-            or context._reader_clock < captured_at + context._interval
+            bound >= context.synchronization.frontier
+            or context.reader_clock < captured_at + context.interval
         )
 
     @staticmethod
@@ -1525,19 +1554,13 @@ class CatchupReader:
     @staticmethod
     def _strict_result(
         snapshot: GroupSnapshot,
-        synchronization: SourceProgress,
-        reader_clock: float,
         *,
         join_ready: bool,
-    ) -> StrictCatchupResult:
+    ) -> _StrictCatchupResult:
         """Build one complete detached-strict scheduling result."""
-        return StrictCatchupResult(
-            _cursor=snapshot.cursor,
-            _source_frontier=synchronization.frontier,
+        return _StrictCatchupResult(
             source_generation=snapshot.source_generation,
             stream_incarnation=snapshot.verified_incarnation,
-            _reader_clock=reader_clock,
-            _pending_epoch_count=len(snapshot.epochs),
             join_ready=join_ready,
             exhausted_through=None,
             exhausted_fence=None,
@@ -1554,10 +1577,10 @@ class CatchupReader:
         if not snapshot.epochs:
             return snapshot, False
         oldest = snapshot.epochs[0]
-        if oldest.state == 'waiting' and context._reader_clock >= oldest.eligibility_point:
-            snapshot = context._state.mark_epoch_eligible(
+        if oldest.state == 'waiting' and context.reader_clock >= oldest.eligibility_point:
+            snapshot = context.state.mark_epoch_eligible(
                 oldest.epoch_id,
-                reader_clock_checkpoint=context._reader_clock,
+                reader_clock_checkpoint=context.reader_clock,
                 expected_revision=snapshot.revision,
             )
         elif oldest.state == 'waiting':
@@ -1567,14 +1590,14 @@ class CatchupReader:
     def catch_up(
         self,
         **options: Unpack[_CatchupOptions],
-    ) -> _CatchupResult:
+    ) -> None:
         """Run one durable-state-refreshed, retention-checked catch-up pass.
 
         Reading is bounded by the lesser of the requested frontier and the
-        synchronized source frontier. Replay starts at `replay_from` but leaves
-        the ordinary result cursor unchanged. `deliver_page` receives eligible
-        events from at most one provider page while its concurrency permit is
-        held; ordinary delivery stops before an unverified gap. The callback
+        synchronized source frontier. Replay starts at `replay_from`
+        independently of the ordinary starting cursor. `deliver_page` receives
+        eligible events from at most one provider page while its concurrency
+        permit is held; delivery stops before an unverified gap. The callback
         must raise if it stops before consuming the supplied events.
 
         Args:
@@ -1584,14 +1607,16 @@ class CatchupReader:
                 with zero seconds, or owns a bounded gap wait for the supplied
                 seconds. It must service due work during waits and raise on
                 cooperative stop. Without it, gap waits use the reader waiter.
-
-        Returns:
-            Current catch-up pass result.
+                Optional `between_pages` runs before each page query, after the
+                previous page has been delivered and released.
 
         Raises:
             HistoryTruncatedError: Required history is no longer visible.
             InterruptedError: An interrupt stopped a required gap recheck.
-            ValueError: Replay begins above the captured frontier.
+            ValueError: Replay begins above the captured frontier or provider
+                event data is invalid.
+            Exception: A supplied provider, synchronization, delivery, or
+                service operation fails; its failure propagates unchanged.
         """
         cursor = options['cursor']
         frontier = options['frontier']
@@ -1614,19 +1639,68 @@ class CatchupReader:
         if replay_from is None:
             options['cursor'] = max(cursor, min(options['delivery_floor'], target))
         if replay_from is None and options['cursor'] >= target:
-            return self._result(options['cursor'], 'caught-up', synchronization)
-        result_cursor = self._read_and_deliver(
+            return
+        self._read_and_deliver(
             handle,
             target,
             options,
         )
-        return self._result(result_cursor, 'caught-up', synchronization)
 
     def close(self) -> None:
-        """Close the independent provider handle idempotently."""
+        """Close the independent provider handle idempotently.
+
+        Raises:
+            Exception: Closing the supplied provider handle fails.
+        """
         if self._handle is not None:
             self._handle.close()
             self._handle = None
+
+    def fetch_id_runs(self, runs: Sequence[IdRun]) -> Generator[_IdRunPage]:
+        """Read exact missing ID runs in ascending bounded pages.
+
+        Args:
+            runs: Ascending, disjoint inclusive ID runs.
+
+        Yields:
+            One page at a time. A full page covers through its last row;
+            a short page covers through the highest ID requested by that call.
+
+        Raises:
+            RuntimeError: The reader is not open.
+            ValueError: Provider events are malformed, have invalid IDs, fall
+                outside the requested runs, or do not strictly ascend.
+            Exception: A supplied provider query or provider-watch context
+                fails.
+        """
+        handle = self._require_open()
+        remaining = tuple(runs)
+        while remaining:
+            requested = remaining[:_MAX_RUNS_PER_QUERY]
+            with self._query():
+                rows = handle.find(
+                    'EventLogEntry',
+                    _id_runs_filter(requested),
+                    list(EVENT_FIELDS),
+                    limit=self._batch_size,
+                    order=[{'field_name': 'id', 'direction': 'asc'}],
+                    page=0,
+                )
+            events = self._events(rows)
+            if any(
+                not any(low <= cast('int', event['id']) <= high for low, high in requested)
+                for event in events
+            ):
+                raise ValueError('catch-up provider page is outside the requested runs')
+            covered_through = (
+                cast('int', events[-1]['id'])
+                if len(events) == self._batch_size
+                else requested[-1][1]
+            )
+            yield _IdRunPage(events=events, covered_through=covered_through)
+            # Release this page before reading the next one.
+            del events, rows
+            remaining = clip_runs(remaining, low=covered_through + 1)
 
     def latest_visible_id(self) -> int | None:
         """Query one fresh latest-visible event id.
@@ -1635,7 +1709,12 @@ class CatchupReader:
             Latest visible positive id, or `None` for an empty source.
 
         Raises:
-            RuntimeError: The reader is not open.
+            RuntimeError: The reader is not open or its supplied monotonic
+                clock moves backward.
+            ValueError: The provider's visible event ID is not a positive
+                integer.
+            Exception: The supplied provider query or provider-watch context
+                fails.
         """
         return self._latest_visible_id(self._require_open())
 
@@ -1644,47 +1723,21 @@ class CatchupReader:
 
         Returns:
             Lowest visible positive id, or `None` when no rows remain visible.
-        """
-        return self._lowest_visible_id(self._require_open())
-
-    def scan_range(self, low_id: int, high_id: int) -> Generator[Event, None, None]:
-        """Stream one complete inclusive range in ascending provider pages.
-
-        Args:
-            low_id: Inclusive least event id.
-            high_id: Inclusive greatest event id.
-
-        Yields:
-            Validated events in strictly ascending provider order.
 
         Raises:
-            RuntimeError: The reader is not open.
-            ValueError: The inclusive bounds are invalid.
+            ValueError: The provider's visible event ID is not a positive
+                integer.
+            Exception: The supplied provider query or provider-watch context
+                fails.
+            RuntimeError: The reader is not open or its supplied monotonic
+                clock moves backward.
         """
-        if type(low_id) is not int or low_id <= 0:
-            raise ValueError('scan range low id must be positive')
-        if type(high_id) is not int or high_id < low_id:
-            raise ValueError('scan range high id must not precede its low id')
-        handle = self._require_open()
-        cursor = low_id
-        inclusive_low = True
-        while cursor <= high_id:
-            page_cursor, events, exhausted = self._query_events(
-                handle,
-                cursor,
-                high_id,
-                inclusive_low=inclusive_low,
-            )
-            yield from events
-            if exhausted or page_cursor >= high_id:
-                return
-            cursor = page_cursor
-            inclusive_low = False
+        return self._lowest_visible_id(self._require_open())
 
     def strict_step(
         self,
         **options: Unpack[_StrictCatchupOptions],
-    ) -> StrictCatchupResult:
+    ) -> _StrictCatchupResult:
         """Run one bounded durable detached-strict epoch scheduling step.
 
         The delivery callback must durably commit an event before returning
@@ -1696,15 +1749,27 @@ class CatchupReader:
                 delivery, holdback policy, and optional fixed join boundary.
                 Optional `service(seconds)` runs on the owner thread with zero
                 seconds after provider calls and committed delivery prefixes;
-                durable authority is recaptured after it returns. The callback
-                must propagate cooperative stop and owner failures.
+                durable authority is recaptured after it returns. It also owns
+                a bounded gap wait for the supplied nonzero seconds. Without
+                it, gap waits use the reader waiter. The callback must
+                propagate cooperative stop and owner failures.
 
         Returns:
-            Current cursor, epoch pressure, clocks, and join readiness.
+            Source generation, stream incarnation, and join readiness, plus the
+            exhausted-through ID, strict obligation fence, and epoch identity
+            when this step proves a prefix exhausted; exhaustion fields are
+            `None` otherwise.
 
         Raises:
             HistoryTruncatedError: Required epoch history is no longer visible.
-            ValueError: Strict policy or synchronized bounds are invalid.
+            ValueError: Strict policy, synchronized bounds, provider event
+                data, or the delivery callback's consumed-prefix result is
+                invalid.
+            InterruptedError: An interrupt stops a required gap recheck.
+            RevisionConflictError: Durable group state changes while the group
+                remains running.
+            Exception: A supplied provider, state, delivery, synchronization,
+                or service operation fails; its failure propagates unchanged.
         """
         holdback_secs = options['holdback_secs']
         max_pending_epochs = options['max_pending_epochs']
@@ -1715,23 +1780,19 @@ class CatchupReader:
         state = options['state']
         snapshot = state.snapshot()
         authority = self._strict_authority(snapshot)
-        self._successful_clock._resume_from(snapshot.reader_clock_checkpoint)
+        self._successful_clock.resume_from(snapshot.reader_clock_checkpoint)
         synchronization = options['source_progress']()
         snapshot = self._service_strict(options)
         if not self._strict_authority_matches(snapshot, authority, synchronization):
             return self._strict_result(
                 snapshot,
-                synchronization,
-                self._successful_clock._value,
                 join_ready=False,
             )
         handle = self._require_open()
         floor = self._lowest_visible_id(handle)
         snapshot = self._service_strict(options)
         if not self._strict_authority_matches(snapshot, authority, synchronization):
-            return self._strict_result(
-                snapshot, synchronization, self._successful_clock._value, join_ready=False
-            )
+            return self._strict_result(snapshot, join_ready=False)
         target = synchronization.frontier
         boundary = options.get('join_boundary')
         if boundary is not None:
@@ -1743,27 +1804,25 @@ class CatchupReader:
         self._latest_visible_id(handle)
         snapshot = self._service_strict(options)
         if not self._strict_authority_matches(snapshot, authority, synchronization):
-            return self._strict_result(
-                snapshot, synchronization, self._successful_clock._value, join_ready=False
-            )
-        reader_clock = self._successful_clock._value
+            return self._strict_result(snapshot, join_ready=False)
+        reader_clock = self._successful_clock.value
         interval = strict_capture_interval(holdback_secs, max_pending_epochs)
         context = _StrictStepContext(
-            _deliver=options['deliver'],
-            _holdback_secs=holdback_secs,
-            _interval=interval,
-            _join_boundary=boundary,
-            _max_pending_epochs=max_pending_epochs,
-            _reader_clock=reader_clock,
-            _state=state,
-            _synchronization=synchronization,
-            _target=target,
-            _unresolved_bounds=(
+            deliver=options['deliver'],
+            holdback_secs=holdback_secs,
+            interval=interval,
+            join_boundary=boundary,
+            max_pending_epochs=max_pending_epochs,
+            reader_clock=reader_clock,
+            state=state,
+            synchronization=synchronization,
+            target=target,
+            unresolved_bounds=(
                 *options.get('unresolved_bounds', ()),
                 *state.unresolved_obligation_bounds(),
             ),
-            _obligation_fence=state.strict_obligation_fence(),
-            _service=options.get('service'),
+            obligation_fence=state.strict_obligation_fence(),
+            service=options.get('service'),
         )
         try:
             snapshot = self._capture_strict_epoch(context, snapshot)
@@ -1775,15 +1834,11 @@ class CatchupReader:
                 raise
             return self._strict_result(
                 current,
-                synchronization,
-                self._successful_clock._value,
                 join_ready=False,
             )
         join_ready = self._strict_join_ready(context, snapshot)
         result = self._strict_result(
             snapshot,
-            synchronization,
-            self._successful_clock._value,
             join_ready=join_ready,
         )
         return replace(
@@ -1793,9 +1848,114 @@ class CatchupReader:
                 if exhausted and epoch is not None
                 else None
             ),
-            exhausted_fence=context._obligation_fence if exhausted else None,
+            exhausted_fence=context.obligation_fence if exhausted else None,
             exhausted_epoch_id=epoch.epoch_id if exhausted and epoch is not None else None,
         )
+
+
+class _SourceFindOptions(TypedDict, total=False):
+    """Type the source wrapper's complete synchronous query keyword surface."""
+
+    limit: int
+    order: list[dict[str, str]] | None
+    page: int
+
+
+class SourceOwnerError(Exception):
+    """Keep fatal source-owner failures out of the provider retry boundary.
+
+    Attributes:
+        error: Original failure to re-raise at the owner entry point.
+    """
+
+    def __init__(self, error: BaseException) -> None:
+        """Retain the original fatal error for the source owner."""
+        self.error = error
+        super().__init__(str(error))
+
+
+class _ServicingSyncSG:
+    """Keep source-owned sockets moving while one serialized provider call runs."""
+
+    def __init__(self, inner: SyncSG, service: Callable[[], None]) -> None:
+        """Own one provider handle and a serial query helper."""
+        self._inner = inner
+        self._service = service
+        self._lock = Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f'{current_thread().name}:query'
+        )
+        self._closed = False
+
+    def close(self) -> None:
+        """Close the provider after its last query and join the helper thread.
+
+        Raises:
+            Exception: Closing the supplied provider handle fails; the query
+                executor is still shut down.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._inner.close()
+            finally:
+                self._executor.shutdown(wait=True)
+
+    def find(
+        self,
+        entity_type: str,
+        filters: object,
+        fields: list[str] | None = None,
+        **kwargs: Unpack[_SourceFindOptions],
+    ) -> list[dict[str, object]]:
+        """Run one query while servicing the caller's sockets until completion.
+
+        Provider failures retain their identity. A socket-service failure takes
+        precedence, but is raised only after the provider operation finishes.
+
+        Args:
+            entity_type: Provider entity type to query.
+            filters: Provider filter expression, forwarded unchanged.
+            fields: Requested provider fields, forwarded unchanged.
+            **kwargs: Provider limit, ordering, and page options.
+
+        Returns:
+            The supplied provider's query result.
+
+        Raises:
+            RuntimeError: The wrapper is closed or its query helper cannot
+                start.
+            SourceOwnerError: Servicing the source owner fails while the query
+                runs; the original failure is retained in the wrapper.
+            Exception: The supplied provider query fails.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('source provider handle is closed')
+            completed = ThreadEvent()
+            future = self._executor.submit(
+                copy_context().run,
+                self._inner.find,
+                entity_type,
+                filters,
+                fields,
+                **kwargs,
+            )
+            future.add_done_callback(lambda _future: completed.set())
+            try:
+                while not completed.wait(0.01):
+                    self._service()
+            except BaseException as error:
+                completed.wait()
+                raise SourceOwnerError(error) from error
+            return future.result()
+
+    def set_session_uuid(self, session_uuid: str | None) -> None:
+        """Set the provider session UUID between serialized queries."""
+        with self._lock:
+            self._inner.set_session_uuid(session_uuid)
 
 
 class _SourcePollerOptions(TypedDict):
@@ -1815,8 +1975,9 @@ class _SourcePollerOptions(TypedDict):
     internal_deadline_secs: float
     wait_tolerance_secs: float
     health_dirty: NotRequired[Callable[[], None]]
+    service: NotRequired[Callable[[], None]]
+    query_service: NotRequired[Callable[[], None] | None]
     worker_instance: NotRequired[str]
-    checkpoint_state: NotRequired[Callable[[], str]]
     strict_retention_health: NotRequired[Callable[[], tuple[tuple[str, int, int, int], ...]]]
     successful_clock: NotRequired[_SuccessfulQueryClock | None]
     strict_buffer: NotRequired[StrictBuffer | None]
@@ -1839,11 +2000,17 @@ class SourcePoller:
         Args:
             options: Durable authority, provider, policy, fanout, and injected
                 timing dependencies.
+
+        Raises:
+            sqlite3.Error: Reading durable source state fails.
+            RuntimeError: Source metadata is missing.
         """
+        self._blocked_id: int | None = None
+        self._pause_warned = False
+        self._paused_since = time.monotonic() if options['state'].capacity_paused else None
         self._config = options['config']
-        self._checkpoint_state = options.get('checkpoint_state', lambda: 'unknown')
         self._credential = options['credential']
-        self._encoder: EncoderWorker | None = None
+        self._encoder: EventEncoder | None = None
         self._fanout = options['fanout']
         self._handle: SyncSG | None = None
         self._health_dirty = options.get('health_dirty', lambda: None)
@@ -1855,8 +2022,12 @@ class SourcePoller:
         self._next_retry_secs: float | None = None
         self._provider = options['provider']
         self._random_value = options['random_value']
+        self._recheck_position = 0
+        self._last_missing_recheck_at: float | None = None
         self._retry_attempt = 0
         self._site_url = options['site_url']
+        self._service = options.get('service', lambda: None)
+        self._query_service = options.get('query_service')
         self._source_generation = options['source_generation']
         self._state = options['state']
         self._stop_signaled = False
@@ -1882,6 +2053,10 @@ class SourcePoller:
 
         Returns:
             This live source poller.
+
+        Raises:
+            Exception: Creating or configuring the supplied provider handle
+                fails.
         """
         if self._handle is not None:
             return self
@@ -1893,7 +2068,11 @@ class SourcePoller:
                 self._site_url,
                 self._credential,
             )
-        self._encoder = EncoderWorker(
+        if self._query_service is not None:
+            self._handle = _ServicingSyncSG(self._handle, self._query_service)
+        if self._paused_since is not None:
+            self._paused_since = time.monotonic()
+        self._encoder = EventEncoder(
             max_event_bytes=self._config.max_event_bytes,
             max_ipc_frame_bytes=self._max_ipc_frame_bytes,
         )
@@ -1905,7 +2084,11 @@ class SourcePoller:
         _exc_value: BaseException | None,
         _traceback: TracebackType | None,
     ) -> None:
-        """Close the source poller at context exit."""
+        """Close the source poller at context exit.
+
+        Raises:
+            Exception: Closing the supplied provider handle fails.
+        """
         self.close()
 
     def _clear_retry_diagnostics(self) -> None:
@@ -1915,6 +2098,8 @@ class SourcePoller:
             or self._next_retry_secs is not None
             or self._last_error is not None
         )
+        if self._last_error is not None:
+            _LOGGER.info('source %s at %s polling recovered', self._config.name, self._site_url)
         self._retry_attempt = 0
         self._next_retry_secs = None
         self._last_error = None
@@ -1923,7 +2108,7 @@ class SourcePoller:
 
     def _encoded_chunks(
         self,
-        encoder: EncoderWorker,
+        encoder: EventEncoder,
         rows: Sequence[Mapping[str, object]],
     ) -> Iterator[tuple[EncodedEvent, ...]]:
         """Yield encoded chunks incrementally within count and byte bounds."""
@@ -1937,7 +2122,9 @@ class SourcePoller:
             encoded = encoder.encode(Event(row))
             if encoded.byte_count > self._config.commit_batch_max_bytes:
                 raise SourceHaltedError(
-                    f'commit-batch-capacity-exhausted: {encoded.byte_count} complete frame bytes',
+                    f'commit-batch-capacity-exhausted: event {encoded.event_id} uses '
+                    f'{encoded.byte_count} complete frame bytes; source commit_batch_max_bytes '
+                    f'is {self._config.commit_batch_max_bytes}',
                     code='commit-batch-capacity-exhausted',
                 )
             if (
@@ -1970,22 +2157,56 @@ class SourcePoller:
         """Record and construct one terminal source halt."""
         self._local_status = code
         self._last_error = str(error)
+        _LOGGER.warning(
+            'source %s at %s halted (%s): %s', self._config.name, self._site_url, code, error
+        )
         return SourceHaltedError(f'{code}: {error}', code=code)
 
     def _classify_terminal_failure(
         self,
-        error: EncoderHaltedError | SourceCapacityError | SourceHaltedError,
+        error: EncoderHaltedError | SourceHaltedError,
     ) -> SourceHaltedError:
-        """Publish one encoder or capacity failure as a terminal source halt."""
+        """Publish one encoder or non-pause source failure as a terminal halt."""
         code = _source_halt_code(error)
         if isinstance(error, SourceHaltedError) and self._local_status == code:
             return error
         return self._halt(code, error)
 
+    def _log_poll_failure(self, error: Exception, delay: float, *, first_failure: bool) -> None:
+        """Report the first failed poll in a retry streak."""
+        if first_failure:
+            _LOGGER.warning(
+                'source %s at %s poll failed; retrying in %ss: %s',
+                self._config.name,
+                self._site_url,
+                delay,
+                error,
+            )
+
+    def _provider_retry_delay(self) -> float:
+        """Advance provider backoff and apply its bounded jitter."""
+        self._retry_attempt += 1
+        unjittered = saturating_retry_delay(
+            self._retry_attempt,
+            base_secs=self._config.poll_retry_base_secs,
+            max_secs=self._config.poll_retry_max_secs,
+            multiplier=self._config.poll_retry_multiplier,
+        )
+        random_sample = self._last_random_sample
+        if random_sample is None:
+            random_sample = self._random_value()
+        return jitter_retry_delay(
+            unjittered,
+            fraction=self._config.poll_retry_jitter_fraction,
+            sample=random_sample,
+        )
+
     def _publish_committed(
         self,
         events: Sequence[EncodedEvent],
         successful_clock: float,
+        *,
+        late: bool = False,
     ) -> None:
         """Publish one committed chunk through eager and strict boundaries."""
         strict_buffer = self._strict_buffer
@@ -1995,14 +2216,8 @@ class SourcePoller:
                 strict_buffer.synchronize_ranges(strict_ranges)
                 for group, generation in self._state.replay_required_groups():
                     strict_buffer.halt_for_replay(group, generation)
-            strict_buffer.observe_many(
-                events,
-                successful_time=successful_clock,
-                range_ids={
-                    encoded.event_id: strict_buffer.range_ids_for(encoded.event_id)
-                    for encoded in events
-                },
-            )
+            if not late:
+                strict_buffer.observe_many(events, successful_time=successful_clock)
         statuses = self._fanout.publish_events(events)
         if strict_buffer is not None:
             strict_buffer.pump_many(
@@ -2015,36 +2230,47 @@ class SourcePoller:
         committed: SourceCommitResult,
         events: Sequence[EncodedEvent],
         successful_clock: float,
+        *,
+        late: bool = False,
     ) -> None:
         """Publish one committed range change hint and its normal delivery."""
+        if committed.closed is not None:
+            closed = committed.closed
+            extra = self._state.log_identity()
+            if closed.missing:
+                log_ids_given_up(extra, closed.missing, closed.secs)
+            else:
+                log_gap_filled(extra, closed.low_id, closed.high_id, closed.secs)
         if committed.range_changed:
             self._fanout.publish_range_changed()
         self._publish_committed(
             events,
             successful_clock,
+            late=late,
         )
 
     def _publish_observation_chunks(
         self,
-        encoder: EncoderWorker,
+        encoder: EventEncoder,
         rows: Sequence[Mapping[str, object]],
         successful_clock: float,
-    ) -> int:
-        """Commit and publish each encoded chunk before requesting the next."""
-        chunks = self._encoded_chunks(encoder, rows)
-        committed_chunks = 0
-        while True:
-            try:
-                chunk = next(chunks)
-            except StopIteration:
-                return committed_chunks
+    ) -> tuple[int, SourcePause | None]:
+        """Publish only admitted prefixes and stop encoding after a refused gap."""
+        committed_count = 0
+        for chunk in self._encoded_chunks(encoder, rows):
             committed = self._state.commit_observations(
                 tuple(item.event_id for item in chunk),
                 successful_clock=successful_clock,
             )
-            self._publish_range_commit(committed, chunk, successful_clock)
-            committed_chunks += 1
+            if committed.committed_count or committed.range_changed:
+                self._publish_range_commit(
+                    committed, chunk[: committed.committed_count], successful_clock
+                )
+                committed_count += committed.committed_count
+            if committed.pause is not None:
+                return committed_count, committed.pause
             del chunk
+        return committed_count, None
 
     @contextmanager
     def _query(self) -> Generator[None]:
@@ -2053,10 +2279,10 @@ class SourcePoller:
             yield
         except BaseException:
             self._enter_internal()
-            self._successful_clock._failed()
+            self._successful_clock.failed()
             raise
         self._enter_internal()
-        self._successful_clock._succeeded()
+        self._successful_clock.succeeded()
 
     def _query_latest(self, handle: SyncSG) -> int | None:
         """Return the latest visible source id for first initialization."""
@@ -2064,20 +2290,7 @@ class SourcePoller:
             'provider-query',
             deadline_at=time.monotonic() + self._internal_deadline_secs,
         ):
-            rows = handle.find(
-                'EventLogEntry',
-                [],
-                ['id'],
-                limit=1,
-                order=[{'field_name': 'id', 'direction': 'desc'}],
-                page=0,
-            )
-        if not rows:
-            return None
-        latest = rows[0].get('id')
-        if type(latest) is not int or latest <= 0:
-            raise ValueError('latest visible EventLogEntry id is invalid')
-        return latest
+            return edge_visible_id(handle, 'desc')
 
     def _query_main(self, handle: SyncSG, frontier: int) -> list[dict[str, object]]:
         """Fetch one provider batch strictly above the durable frontier."""
@@ -2094,21 +2307,37 @@ class SourcePoller:
                 page=0,
             )
 
-    def _require_open(self) -> tuple[SyncSG, EncoderWorker]:
+    def _require_open(self) -> tuple[SyncSG, EventEncoder]:
         """Return live poller resources or reject use outside its context."""
         if self._handle is None or self._encoder is None:
             raise RuntimeError('source poller is not open')
         return self._handle, self._encoder
 
     def _require_queryable(self) -> None:
-        """Halt before any query or delivery under a changed stream identity."""
+        """Reject retained data halts or a changed identity before SG queries."""
+        status = self._local_status
+        if status in HALTS_IN_PLACE and status != 'stream-identity-changed':
+            raise SourceHaltedError(
+                f'{status}: {self._last_error}', code=cast('SourceHaltStatus', status)
+            )
         if not self._state.can_query:
             raise self._halt(
                 'stream-identity-changed',
-                SourceIdentityError(
-                    'configured stream identity conflicts', code='configured-stream-conflict'
-                ),
+                SourceIdentityError('configured stream identity conflicts'),
             )
+
+    def _serve_before_query(self) -> bool:
+        """Serve queued callers without retrying source-owner failures."""
+        if self._poller_stopped:
+            return False
+        try:
+            with self._watchdog.watch(
+                'internal', deadline_at=time.monotonic() + self._internal_deadline_secs
+            ):
+                self._service()
+        except Exception as error:
+            raise SourceOwnerError(error) from error
+        return not self._poller_stopped
 
     def _perform_recheck(self, obligation_id: str) -> int:
         """Execute one unclassified bounded late-range recheck cycle."""
@@ -2124,6 +2353,8 @@ class SourcePoller:
         )
         processed = 0
         while True:
+            if not self._serve_before_query():
+                return processed
             with (
                 self._query(),
                 self._watchdog.watch(
@@ -2143,7 +2374,7 @@ class SourcePoller:
                     page=1,
                 )
             successful_clock = max(
-                self._successful_clock._value,
+                self._successful_clock.value,
                 self._state.successful_clock(),
             )
             if not rows:
@@ -2154,7 +2385,7 @@ class SourcePoller:
                     successful_clock=successful_clock,
                     query_page_complete=True,
                 )
-                self._publish_range_commit(committed, (), successful_clock)
+                self._publish_range_commit(committed, (), successful_clock, late=True)
                 return processed
             processed += len(rows)
             chunks = self._encoded_chunks(encoder, rows)
@@ -2173,7 +2404,9 @@ class SourcePoller:
                     successful_clock=successful_clock,
                     query_page_complete=query_page_complete,
                 )
-                self._publish_range_commit(committed, chunk, successful_clock)
+                self._publish_range_commit(committed, chunk, successful_clock, late=True)
+                if committed.closed is not None:
+                    return processed
                 del chunk
             scan = self._state.range_for(obligation_id)
             if scan is None:
@@ -2185,10 +2418,112 @@ class SourcePoller:
             ):
                 return processed
 
+    def _recheck_missing(self) -> None:
+        """Walk each missing run at most once without starving higher gaps."""
+        handle, encoder = self._require_open()
+        self._enter_internal()
+        self._require_queryable()
+        ranges = tuple(item for item in self._state.ranges() if item.state == 'open')
+        runs = tuple(
+            run for item in ranges for run in self._state.missing_runs(item.obligation_id)
+        )
+        # Keep the two ascending segments separate so one cycle cannot wrap twice.
+        segments = (
+            clip_runs(runs, low=self._recheck_position + 1),
+            clip_runs(runs, high=self._recheck_position),
+        )
+        pages = 0
+        for segment in segments:
+            remaining = segment
+            while remaining and pages < self._config.max_range_query_pages:
+                if not self._serve_before_query():
+                    return
+                requested = remaining[:_MAX_RUNS_PER_QUERY]
+                with (
+                    self._query(),
+                    self._watchdog.watch(
+                        'provider-query',
+                        deadline_at=time.monotonic() + self._internal_deadline_secs,
+                    ),
+                ):
+                    rows = handle.find(
+                        'EventLogEntry',
+                        _id_runs_filter(requested),
+                        list(EVENT_FIELDS),
+                        limit=self._config.batch_size,
+                        order=[{'field_name': 'id', 'direction': 'asc'}],
+                        page=0,
+                    )
+                pages += 1
+                successful_clock = max(
+                    self._successful_clock.value, self._state.successful_clock()
+                )
+                for retained in ranges:
+                    found = [
+                        row
+                        for row in rows
+                        if retained.low_id <= cast('int', row['id']) <= retained.high_id
+                    ]
+                    for chunk in self._encoded_chunks(encoder, found):
+                        committed = self._state.record_missing_rows(
+                            retained.obligation_id,
+                            tuple(item.event_id for item in chunk),
+                            successful_clock=successful_clock,
+                        )
+                        self._publish_range_commit(committed, chunk, successful_clock, late=True)
+                covered = (
+                    cast('int', rows[-1]['id'])
+                    if len(rows) == self._config.batch_size
+                    else requested[-1][1]
+                )
+                self._recheck_position = covered
+                remaining = clip_runs(remaining, low=covered + 1)
+
+    def _recheck_missing_once(self) -> None:
+        """Classify terminal failures while retaining ordinary retry behavior."""
+        try:
+            self._recheck_missing()
+        except (EncoderHaltedError, SourceHaltedError) as exc:
+            halted = self._classify_terminal_failure(exc)
+            if halted is exc:
+                raise
+            raise halted from exc
+
+    def _recheck_missing_if_due(self) -> None:
+        """Limit missing-ID rechecks to the configured fetch interval."""
+        now = time.monotonic()
+        if (
+            self._last_missing_recheck_at is None
+            or now - self._last_missing_recheck_at >= self._config.fetch_interval_secs
+        ):
+            self._last_missing_recheck_at = now
+            self._recheck_missing_once()
+
+    def _recheck_once(self, obligation_id: str) -> int:
+        """Execute one bounded inclusive late-range recheck cycle."""
+        try:
+            return self._perform_recheck(obligation_id)
+        except (EncoderHaltedError, SourceHaltedError) as exc:
+            halted = self._classify_terminal_failure(exc)
+            if halted is exc:
+                raise
+            raise halted from exc
+
+    def _stamp_generation(self) -> None:
+        """Keep generation-stamp failures fatal except for acquisition expiry."""
+        try:
+            self._state.stamp_generation()
+        except WriteLockTimeoutError:
+            raise
+        except Exception as error:
+            raise SourceOwnerError(error) from error
+
     def _poll_once(self) -> int:
         """Execute one initialization or main-stream polling attempt."""
         handle, encoder = self._require_open()
         self._enter_internal()
+        if not self._state.stamped:
+            self._stamp_generation()
         self._require_queryable()
         self._last_random_sample = self._random_value()
         current = self._state.begin_cycle()
@@ -2203,31 +2538,50 @@ class SourcePoller:
             return 0
         with self._query():
             rows = self._query_main(handle, current.frontier)
-        successful_clock = self._successful_clock._value
+        successful_clock = self._successful_clock.value
         try:
-            committed_chunks = self._publish_observation_chunks(
+            committed_count, pause = self._publish_observation_chunks(
                 encoder,
                 rows,
                 successful_clock,
             )
-            if committed_chunks == 0:
+            if committed_count == 0:
                 self._state.record_successful_query(successful_clock)
                 self._publish_committed((), successful_clock)
-        except (EncoderHaltedError, SourceCapacityError, SourceHaltedError) as exc:
+        except (EncoderHaltedError, SourceHaltedError) as exc:
             raise self._classify_terminal_failure(exc) from exc
         self._local_status = None
         self._clear_retry_diagnostics()
+        if pause is not None:
+            self._blocked_id = max(self._blocked_id or 0, pause.blocked_id)
+            if self._paused_since is None:
+                self._paused_since = time.monotonic()
+            if not self._pause_warned:
+                log_paused(
+                    self._state.log_identity(),
+                    pause.setting,
+                    pause.limit,
+                    pause.count,
+                )
+                self._pause_warned = True
+            return 0
+        if (
+            committed_count
+            and self._paused_since is not None
+            and (
+                self._blocked_id is None
+                or max(current.frontier, cast('int', rows[-1]['id'])) >= self._blocked_id
+            )
+        ):
+            self._state.end_capacity_pause()
+            log_resumed(
+                self._state.log_identity(),
+                time.monotonic() - self._paused_since,
+            )
+            self._blocked_id = None
+            self._paused_since = None
+            self._pause_warned = False
         return len(rows)
-
-    def _recheck_once(self, obligation_id: str) -> int:
-        """Execute one bounded inclusive late-range recheck cycle."""
-        try:
-            return self._perform_recheck(obligation_id)
-        except (EncoderHaltedError, SourceCapacityError, SourceHaltedError) as exc:
-            halted = self._classify_terminal_failure(exc)
-            if halted is exc:
-                raise
-            raise halted from exc
 
     def adopt_stream(
         self,
@@ -2262,6 +2616,10 @@ class SourcePoller:
             SourceIdentityError: Adoption fencing, reservation, stream or
                 command identity, or audit reason conflicts with durable source
                 state.
+            ValueError: The provider's latest visible event ID is invalid.
+            Exception: A provider query or durable-state operation fails. Fresh
+                adoption can already be committed when a later query or
+                initialization fails.
         """
         handle, _encoder = self._require_open()
         self._enter_internal()
@@ -2280,10 +2638,12 @@ class SourcePoller:
         return snapshot
 
     def close(self) -> None:
-        """Close the encoder and provider handle idempotently."""
-        if self._encoder is not None:
-            self._encoder.close()
-            self._encoder = None
+        """Release the encoder and close the provider handle idempotently.
+
+        Raises:
+            Exception: Closing the supplied provider handle fails.
+        """
+        self._encoder = None
         if self._handle is not None:
             self._handle.close()
             self._handle = None
@@ -2308,6 +2668,11 @@ class SourcePoller:
         Returns:
             Durable and process-local source health without another snapshot
             query.
+
+        Raises:
+            sqlite3.Error: Reading audit counts fails.
+            OSError: Inspecting the source database family fails.
+            Exception: The supplied strict-retention health projection fails.
         """
         strict_buffer = self._strict_buffer
         return SourceHealth(
@@ -2320,7 +2685,7 @@ class SourcePoller:
             retry_attempt=self._retry_attempt,
             next_retry_secs=self._next_retry_secs,
             open_range_count=sum(item.state == 'open' for item in snapshot.ranges),
-            late_id_count=sum(len(item.late_ids) for item in snapshot.ranges),
+            late_id_count=sum(item.late_id_count for item in snapshot.ranges),
             last_error=self._last_error,
             worker_instance=self._worker_instance,
             initialized=snapshot.initialized if self._worker_instance else False,
@@ -2329,7 +2694,6 @@ class SourcePoller:
             strict_buffer_event_count=0 if strict_buffer is None else strict_buffer.event_count,
             strict_buffer_byte_count=0 if strict_buffer is None else strict_buffer.byte_count,
             strict_retention=self._strict_retention_health(),
-            checkpoint_state=self._checkpoint_state(),
             stream_incarnation=snapshot.stream_incarnation,
             audit_count=self._state.audit_count(),
             database_size_bytes=self._state.database_size_bytes(),
@@ -2341,31 +2705,36 @@ class SourcePoller:
 
         Returns:
             Durable source state plus process-local retry or encoder state.
+
+        Raises:
+            sqlite3.Error: Reading durable source state or audit counts fails.
+            OSError: Inspecting the source database family fails.
+            Exception: The supplied strict-retention health projection fails.
+            RuntimeError: Source metadata is missing or its persisted condition
+                is unknown.
         """
         return self.health_from_snapshot(self._state.snapshot())
 
-    @property
-    def last_error(self) -> str | None:
-        """Return the latest polling error without reading durable source state."""
-        return self._last_error
-
     def run(self, *, max_cycles: int | None = None) -> None:
-        """Run polls and one due-range recheck per successful cycle.
+        """Run polls, interval-limited missing-ID rechecks, and due scans.
 
         Ordinary polling failures retry with configured backoff and jitter.
-        Terminal source halts and owner write acquisition failures propagate
-        instead of being retried.
+        Lock expiry waits one base interval without growing provider backoff.
+        Terminal source halts, generation-stamp failures other than lock
+        expiry, and cooperative write stops propagate.
 
         Args:
             max_cycles: Optional deterministic attempt bound.
 
         Raises:
-            SourceHaltedError: A terminal capacity, encoder, or stream-identity
-                condition prevents polling.
-            WriteLockTimeoutError: A source write exhausted its acquisition
-                budget.
+            SourceHaltedError: An encoder, event/frame size, or stream-identity
+                failure prevents polling.
             WriteLockStoppedError: Source write acquisition was stopped
                 cooperatively.
+            Exception: Generation stamping or a source-owner service operation
+                fails;
+                the original owner failure propagates instead of entering
+                provider retry.
         """
         cycles = 0
         while not self._poller_stopped and (max_cycles is None or cycles < max_cycles):
@@ -2374,29 +2743,23 @@ class SourcePoller:
             try:
                 count = self._poll_once()
                 self._retry_attempt = cycle_retry_attempt
+                self._recheck_missing_if_due()
                 due = self._state.due_range_id()
                 if due is not None and not self._poller_stopped:
                     self._recheck_once(due)
             except SourceHaltedError:
                 raise
             except BaseException as exc:
+                _raise_source_owner_error(exc)
                 if not isinstance(exc, Exception):
                     raise
                 raise_owner_write_failure(exc)
-                self._retry_attempt += 1
-                unjittered = _saturating_retry_delay(
-                    self._retry_attempt,
-                    base_secs=self._config.poll_retry_base_secs,
-                    max_secs=self._config.poll_retry_max_secs,
-                    multiplier=self._config.poll_retry_multiplier,
-                )
-                random_sample = self._last_random_sample
-                if random_sample is None:
-                    random_sample = self._random_value()
-                factor = 1.0 + self._config.poll_retry_jitter_fraction * (
-                    2.0 * random_sample - 1.0
-                )
-                delay = unjittered * factor
+                if isinstance(exc, WriteLockTimeoutError):
+                    self._retry_attempt = cycle_retry_attempt
+                    delay = self._config.poll_retry_base_secs
+                else:
+                    delay = self._provider_retry_delay()
+                self._log_poll_failure(exc, delay, first_failure=cycle_retry_attempt == 0)
                 self._next_retry_secs = delay
                 self._last_error = str(exc)
                 self._health_dirty()
@@ -2419,44 +2782,59 @@ class SourcePoller:
             self._stop_signaled = True
 
 
-def _saturating_retry_delay(
-    attempt: int,
-    *,
-    base_secs: float,
-    max_secs: float,
-    multiplier: float,
-) -> float:
-    """Return one bounded retry delay without overflowing an intermediate."""
-    delay = min(base_secs, max_secs)
-    remaining = attempt - 1
-    if remaining <= 0 or delay >= max_secs or multiplier == 1.0:
-        return delay
-    # The positive binary64 range spans less than a factor of 2**2098.
-    # Its smallest multiplier above one crosses that span within 2**64 steps.
-    if remaining.bit_length() > _MAX_RETRY_DELAY_STEP_BITS:
-        return max_secs
+def _id_runs_filter(runs: Sequence[IdRun]) -> list[object]:
+    """Match any of the inclusive ID runs in one provider filter."""
+    return [
+        {'filter_operator': 'any', 'filters': [['id', 'between', low, high] for low, high in runs]}
+    ]
 
-    candidate_log2 = log2(delay) + float(remaining) * log2(multiplier)
-    if candidate_log2 >= log2(max_secs):
-        return max_secs
-    # One arithmetic path keeps successive attempts monotone, including the
-    # subnormal range. Float rounding may saturate just before the exact cap.
-    return min(max_secs, max(delay, exp2(candidate_log2)))
+
+def _raise_source_owner_error(error: BaseException) -> None:
+    """Unwrap fatal owner failures without replacing their original cause."""
+    if isinstance(error, SourceOwnerError):
+        raise error.error from error.error.__cause__
 
 
 def _source_halt_code(error: BaseException) -> SourceHaltStatus:
     """Return the closed source status encoded by one raised error."""
-    code = (
-        error.code
-        if isinstance(error, (EncoderHaltedError, SourceCapacityError, SourceHaltedError))
-        else None
-    )
+    code = error.code if isinstance(error, (EncoderHaltedError, SourceHaltedError)) else None
     if code is None:
         raise RuntimeError('unknown source halt code: None') from error
     try:
         return _SOURCE_HALT_CODES[code]
     except KeyError:
         raise RuntimeError(f'unknown source halt code: {code}') from error
+
+
+def edge_visible_id(handle: SyncSG, direction: Literal['asc', 'desc']) -> int | None:
+    """Read and validate the lowest or latest visible provider event id.
+
+    Args:
+        handle: Open synchronous provider handle.
+        direction: `asc` selects the lowest id; `desc` selects the latest id.
+
+    Returns:
+        A positive event id, or `None` when no event is visible.
+
+    Raises:
+        ValueError: The visible event id is not a positive integer.
+        Exception: The supplied provider query fails.
+    """
+    rows = handle.find(
+        'EventLogEntry',
+        [],
+        ['id'],
+        limit=1,
+        order=[{'field_name': 'id', 'direction': direction}],
+        page=0,
+    )
+    if not rows:
+        return None
+    value = rows[0].get('id')
+    if type(value) is not int or value <= 0:
+        edge = 'lowest' if direction == 'asc' else 'latest'
+        raise ValueError(f'{edge} visible EventLogEntry id is invalid')
+    return value
 
 
 def history_truncation(
@@ -2482,3 +2860,54 @@ def history_truncation(
     if floor is not None and floor > required:
         return HistoryTruncatedError(floor, required)
     return None
+
+
+def jitter_retry_delay(delay: float, *, fraction: float, sample: float) -> float:
+    """Apply symmetric retry jitter using a caller-owned unit-interval sample.
+
+    Args:
+        delay: Unjittered retry delay in seconds.
+        fraction: Fractional width on either side of the unjittered delay.
+        sample: Sample from zero through one; one half leaves the delay
+            unchanged.
+
+    Returns:
+        Delay in seconds scaled between `1 - fraction` and `1 + fraction`.
+    """
+    return delay * (1.0 + fraction * (2.0 * sample - 1.0))
+
+
+def saturating_retry_delay(
+    attempt: int,
+    *,
+    base_secs: float,
+    max_secs: float,
+    multiplier: float,
+) -> float:
+    """Return one bounded retry delay without overflowing an intermediate.
+
+    Args:
+        attempt: Retry attempt; values at or below one use the initial delay.
+        base_secs: Finite positive initial delay in seconds.
+        max_secs: Finite positive upper bound in seconds.
+        multiplier: Finite growth factor at least one.
+
+    Returns:
+        Initial delay clamped to the maximum, then increased by the multiplier
+        for each later attempt until it saturates at the maximum.
+    """
+    delay = min(base_secs, max_secs)
+    remaining = attempt - 1
+    if remaining <= 0 or delay >= max_secs or multiplier == 1.0:
+        return delay
+    # The positive binary64 range spans less than a factor of 2**2098.
+    # Its smallest multiplier above one crosses that span within 2**64 steps.
+    if remaining.bit_length() > _MAX_RETRY_DELAY_STEP_BITS:
+        return max_secs
+
+    candidate_log2 = log2(delay) + float(remaining) * log2(multiplier)
+    if candidate_log2 >= log2(max_secs):
+        return max_secs
+    # One arithmetic path keeps successive attempts monotone, including the
+    # subnormal range. Float rounding may saturate just before the exact cap.
+    return min(max_secs, max(delay, exp2(candidate_log2)))

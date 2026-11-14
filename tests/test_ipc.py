@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import select
 import selectors
@@ -12,9 +13,10 @@ import tempfile
 import threading
 import time
 from collections import deque
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext, suppress
 from dataclasses import MISSING, fields, replace
 from datetime import UTC, date, datetime
+from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Literal, cast
@@ -24,6 +26,7 @@ import pytest
 
 import sg_event_daemon._fanout as fanout_module
 import sg_event_daemon._ipc as ipc_module
+import sg_event_daemon._source as source_module
 from sg_event_daemon._events import Event, decode_event, encode_event
 from sg_event_daemon._fanout import (
     EncodedEvent,
@@ -31,7 +34,6 @@ from sg_event_daemon._fanout import (
     EventFanout,
     GroupChannel,
     GroupChannelInterface,
-    StrictCapacityControl,
     StrictOrderingControl,
 )
 from sg_event_daemon._group_types import (
@@ -44,7 +46,6 @@ from sg_event_daemon._health import (
     GroupHealth,
     WatchdogHealth,
     WorkerHealth,
-    aggregate_status,
 )
 from sg_event_daemon._ipc import (
     _CONTROL_PROTOCOL_VERSION,
@@ -61,9 +62,11 @@ from sg_event_daemon._ipc import (
     HealthUpdate,
     OperatorCommand,
     PendingDispositionSourceGroupAssignment,
+    SocketBufferSizes,
     StopCommand,
     WorkerAssignment,
     WorkerControl,
+    WorkerControlOutbox,
     _decode_control_body,
     _decode_event_wire,
     _encode_fanout_message,
@@ -87,12 +90,19 @@ from sg_event_daemon._source import (
     JoinRequest,
     JoinRetry,
     JoinTarget,
+    LiveChannelDetachedError,
     SourceHealth,
     SourceRunStatus,
 )
+from sg_event_daemon._watchdog import ComponentWatchdog, shutdown_slice_secs, watchdog_grace_secs
+from tests._ipc_support import receive_control
+from tests.health_helpers import status_from_health
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator, Mapping
+    from typing import Self
+
+    from tests._stall_policy import StallDetectors
 
 _ATTEMPT_ID = 'attempt-1'
 _MAX_FRAME_BYTES = 131_072
@@ -100,23 +110,30 @@ _QUEUE_BYTES = 262_144
 _SHORT_SOCKET_ROOT: list[Path] = []
 
 
-class _AlwaysBlockingSocket:
-    def __init__(self, sock: socket.socket) -> None:
-        self._socket = sock
+class _DeadlineSelector:
+    def __init__(
+        self, selector: selectors.BaseSelector, clock: list[float], *, step: float
+    ) -> None:
+        self._selector = selector
+        self._clock = clock
+        self._step = step
+        self._calls = 0
 
-    def close(self) -> None:
-        self._socket.close()
+    def __enter__(self) -> Self:
+        return self
 
-    def fileno(self) -> int:
-        return self._socket.fileno()
+    def __exit__(self, *_args: object) -> None:
+        self._selector.close()
 
-    @staticmethod
-    def recv(_size: int) -> bytes:
-        raise BlockingIOError
+    def register(self, sock: socket.socket, event: int) -> None:
+        self._selector.register(sock, event)
 
-    @staticmethod
-    def send(_value: memoryview) -> int:
-        raise BlockingIOError
+    def select(self, timeout: float) -> list[tuple[selectors.SelectorKey, int]]:
+        self._calls += 1
+        assert self._calls <= 10
+        ready = self._selector.select(0)
+        self._clock[0] += min(timeout, self._step) if ready else timeout
+        return ready
 
 
 class _JoinSourceStub:
@@ -125,7 +142,7 @@ class _JoinSourceStub:
 
     def acknowledge_strict_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         raise AssertionError(control)
 
@@ -225,6 +242,49 @@ class _ScriptedStartupSocket:
         self._socket.settimeout(timeout)
 
 
+class _SlowSocketQuery:
+    def __init__(self, wait_for_drain: Callable[[], None]) -> None:
+        self._wait_for_drain = wait_for_drain
+
+    def close(self) -> None:
+        pass
+
+    def find(self, *_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        self._wait_for_drain()
+        return []
+
+    def set_session_uuid(self, session_uuid: str | None) -> None:
+        del session_uuid
+
+
+class _SlowSocketReaderProgress:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._offered_target = 0
+        self.received: list[int] = []
+
+    def drained(self) -> bool:
+        with self._condition:
+            return len(self.received) >= self._offered_target
+
+    def offer(self, count: int) -> None:
+        with self._condition:
+            self._offered_target += count
+
+    def record(self, sink: GroupChannel) -> None:
+        page_ids: list[int] = []
+        for item in sink.drain():
+            assert isinstance(item, EventDelivery)
+            page_ids.append(item.encoded.event_id)
+        with self._condition:
+            self.received.extend(page_ids)
+            self._condition.notify_all()
+
+    def wait_for_drain(self) -> None:
+        with self._condition:
+            self._condition.wait_for(lambda: len(self.received) >= self._offered_target)
+
+
 class _SourceThreadHarness:
     def __init__(self, server: EventServer, source: _JoinSourceStub) -> None:
         self._action_complete = threading.Event()
@@ -234,50 +294,59 @@ class _SourceThreadHarness:
         self._owner: int | None = None
         self._server = server
         self._source = source
-        self._started = threading.Event()
+        self.started = threading.Event()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run)
+        self.thread = threading.Thread(target=self._run)
 
-    def _call(self, action: Callable[[], None]) -> None:
-        self._action_complete.clear()
+    def _run(self) -> None:
+        self._owner = threading.get_ident()
+        self.started.set()
+        try:
+            while not self._stop.is_set():
+                self._server.poll(0.001)
+                self._server.dispatch_join_requests(self._source)
+                with self._actions_lock:
+                    action = self._actions.popleft() if self._actions else None
+                if action is None:
+                    continue
+                try:
+                    action()
+                except (AssertionError, ConnectionError, _FrameError, KeyError) as error:
+                    self._errors.append(error)
+                finally:
+                    self._action_complete.set()
+        except (AssertionError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            self._errors.append(error)
+        finally:
+            with self._actions_lock:
+                self._action_complete.set()
+
+    def call(self, action: Callable[[], None]) -> None:
         with self._actions_lock:
+            if self._errors:
+                raise self._errors.popleft()
+            assert self.thread.is_alive(), 'source-owner thread exited'
+            self._action_complete.clear()
             self._actions.append(action)
-        if not self._action_complete.wait(1.0):
+        if not self._action_complete.wait():
             raise AssertionError('source-thread action did not complete')
         if self._errors:
             raise self._errors.popleft()
 
-    def _close(self) -> None:
+    def close(self) -> None:
         self._stop.set()
-        if self._thread.ident is None:
+        if self.thread.ident is None:
             return
-        self._thread.join(1.0)
-        if self._thread.is_alive():
-            raise AssertionError('source-owner thread did not stop')
+        self.thread.join()
+        if self._errors:
+            raise self._errors.popleft()
 
-    def _owner_ident(self) -> int | None:
+    def owner_ident(self) -> int | None:
         return self._owner
 
-    def _run(self) -> None:
-        self._owner = threading.get_ident()
-        self._started.set()
-        while not self._stop.is_set():
-            self._server.poll(0.001)
-            self._server.dispatch_join_requests(self._source)
-            with self._actions_lock:
-                action = self._actions.popleft() if self._actions else None
-            if action is None:
-                continue
-            try:
-                action()
-            except (AssertionError, ConnectionError, _FrameError, KeyError) as error:
-                self._errors.append(error)
-            finally:
-                self._action_complete.set()
-
-    def _start(self) -> None:
-        self._thread.start()
-        if not self._started.wait(1.0):
+    def start(self) -> None:
+        self.thread.start()
+        if not self.started.wait():
             raise AssertionError('source-owner thread did not start')
 
 
@@ -319,16 +388,20 @@ class _SpuriousShortSendSocket:
 
 
 class _StalledConnectSocket:
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: socket.socket, clock: list[float]) -> None:
         self._socket = sock
+        self._clock = clock
+        self.timeouts: list[float] = []
         self._timeout: float | None = None
 
     def close(self) -> None:
         self._socket.close()
 
     def connect(self, _path: str) -> None:
-        delay = 0.25 if self._timeout is None else self._timeout
-        time.sleep(delay)
+        assert self._timeout is not None
+        self.timeouts.append(self._timeout)
+        assert len(self.timeouts) <= 2
+        self._clock[0] += self._timeout
         raise TimeoutError
 
     def fileno(self) -> int:
@@ -347,19 +420,19 @@ class _StalledConnectSocket:
 
 class _StartupSelector:
     def __init__(self, *, fail_registration: bool) -> None:
-        self._closed = False
-        self._registered = False
-        self._registration_attempted = False
+        self.closed = False
+        self.registered = False
+        self.registration_attempted = False
         self._fail_registration = fail_registration
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def register(self, _fileobj: object, _events: int) -> None:
-        self._registration_attempted = True
+        self.registration_attempted = True
         if self._fail_registration:
             raise OSError(errno.EBADF, 'scripted selector registration failure')
-        self._registered = True
+        self.registered = True
 
 
 def _clamp_coordination_send_buffer(client: EventClient, requested: int) -> int:
@@ -367,12 +440,6 @@ def _clamp_coordination_send_buffer(client: EventClient, requested: int) -> int:
     assert coordination is not None
     coordination.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, requested)
     return int(coordination.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))
-
-
-def _decode_control_message(
-    frame: bytes, *, max_frame_bytes: int = _MAX_FRAME_BYTES
-) -> ControlMessage:
-    return _decode_control_body(_unpack_length_frame(frame, max_frame_bytes=max_frame_bytes))
 
 
 def _decode_enum_payload(decoder: str, payload: dict[str, object]) -> object:
@@ -391,70 +458,19 @@ def _decode_enum_payload(decoder: str, payload: dict[str, object]) -> object:
     return decode(payload)
 
 
-def _event(event_id: int, *, text: str = 'payload') -> Event:
-    return Event(
-        {
-            'id': event_id,
-            'type': 'EventLogEntry',
-            'event_type': 'Shotgun_Test',
-            'attribute_name': None,
-            'meta': {
-                'active': True,
-                'blob': b'\x00\xff',
-                'day': date(2026, 7, 27),
-                'items': [None, 4, 1.5, text],
-                'when': datetime(2026, 7, 27, 12, 30, 1, 9, UTC),
-            },
-            'entity': {'id': 3, 'type': 'Asset'},
-            'user': None,
-            'project': {'id': 2, 'type': 'Project'},
-            'session_uuid': 'session',
-            'created_at': datetime(2026, 7, 27, 12, 30, 1, 9, UTC),
-        }
-    )
-
-
-def _event_authentication_frame(
-    role: Literal['coordination', 'event'],
-    *,
-    capability: str = 'capability-1',
-    connection_id: str = 'connection-1',
-) -> bytes:
-    body = json.dumps(
-        {
-            'capability': capability,
-            'connection_id': connection_id,
-            'group': 'group-a',
-            'role': role,
-            'schema': 'sg-event-daemon-event-auth',
-            'source': 'events',
-            'spawn_instance': 'spawn-1',
-            'version': 1,
-        },
-        ensure_ascii=True,
-        separators=(',', ':'),
-        sort_keys=True,
-    ).encode()
-    return struct.pack('!I', len(body)) + body
-
-
-def _event_client(path: Path, group: str = 'group-a') -> EventClient:
-    return EventClient(
-        path=path,
-        source='events',
-        group=group,
-        spawn_instance='spawn-1',
-        capability='capability-1',
-        max_frame_bytes=_MAX_FRAME_BYTES,
-        queue_max_entries=2,
-        queue_max_bytes=_QUEUE_BYTES,
-        coordination_deadline_secs=1.0,
-        stop=threading.Event(),
-    )
+def _drain_outbox(
+    outbox: WorkerControlOutbox, peer: WorkerControl, count: int
+) -> list[ControlMessage]:
+    messages: list[ControlMessage] = []
+    while True:
+        outbox.write_available()
+        messages.extend(peer.receive_available())
+        if len(messages) == count:
+            return messages
 
 
 def _frame_bytes(frame: _OutboundFrame) -> bytes:
-    return b''.join(frame._parts)
+    return b''.join(frame.parts)
 
 
 def _frame_reader(*, max_frame_bytes: int) -> _FrameReader:
@@ -471,8 +487,6 @@ def _health_update() -> HealthUpdate:
             monitor_alive=True,
             thread_names=('source:events',),
             stuck_threads=(),
-            breaker_open=False,
-            breaker_reason=None,
             socket_buffer_requested=_MAX_FRAME_BYTES,
             socket_send_buffer=_MAX_FRAME_BYTES * 2,
             socket_receive_buffer=_MAX_FRAME_BYTES * 2,
@@ -548,7 +562,6 @@ def _complete_health_update() -> HealthUpdate:
         park_reason=None,
         failure_kind=None,
         failure_text=None,
-        checkpoint_state='complete',
         conditions=(),
     )
     watchdogs = (
@@ -604,7 +617,11 @@ def _invoke_join_lifecycle(
     if operation == 'abort':
         client.abort(JoinAbort(identity))
     elif operation == 'acknowledge':
-        client.acknowledge_strict_control(StrictCapacityControl(identity=identity, abort_limit=4))
+        client.acknowledge_strict_control(
+            StrictOrderingControl(
+                identity=identity, event_id=1, last_delivered_id=2, delivery_floor=0, action='halt'
+            )
+        )
     elif operation == 'confirm':
         client.confirm(JoinConfirm(identity))
     else:
@@ -637,6 +654,230 @@ def _join_enum_payload(decoder: str) -> dict[str, object]:
     return payload
 
 
+def _large_outbox_health(sample: float) -> HealthUpdate:
+    update = _health_update()
+    return replace(
+        update, worker=replace(update.worker, heartbeat_at=sample, thread_names=('x' * 60_000,))
+    )
+
+
+def _offer_joined_messages(
+    channel: GroupChannelInterface,
+    ordering: Literal['eager', 'strict'],
+    first: EventDelivery,
+    second: EventDelivery,
+) -> None:
+    offer = channel.offer_paced if ordering == 'strict' else channel.offer
+    assert offer(first)
+    assert offer(second)
+
+
+def _pump(
+    server: EventServer,
+    clients: tuple[EventClient, ...],
+    channels: tuple[GroupChannelInterface, ...],
+) -> None:
+    while True:
+        server.poll(0.001)
+        for client in clients:
+            client.poll(0.001)
+        for channel in channels:
+            assert channel.status.attached, channel.status.reason
+        if all(channel.status.queued_count for channel in channels):
+            return
+
+
+def _retained_connection_identity_count(server: EventServer) -> int:
+    return len(server._connection_fences)
+
+
+def _run_bounded_client_call(
+    client: EventClient,
+    call: Callable[[], object],
+) -> object | Exception:
+    complete = threading.Event()
+    results: list[object | Exception] = []
+
+    def invoke() -> None:
+        try:
+            results.append(call())
+        except (ConnectionError, JoinProtocolError) as error:
+            results.append(error)
+        finally:
+            complete.set()
+
+    thread = threading.Thread(target=invoke)
+    thread.start()
+    try:
+        assert complete.wait()
+    finally:
+        if not complete.is_set():
+            client.close()
+        thread.join()
+    assert not thread.is_alive()
+    assert len(results) == 1
+    return results[0]
+
+
+def _script_peer_recv(
+    peer: ipc_module._ServerPeer,
+    *outcomes: bytes | OSError,
+) -> None:
+    sock = peer.socket
+    vars(peer)['socket'] = cast(
+        'socket.socket',
+        _ScriptedRecvSocket(sock, outcomes),
+    )
+
+
+def _server_coordination_socket(server: EventServer) -> socket.socket:
+    peers = server._peers
+    return next(peer.socket for peer in peers.values() if peer.role == 'coordination')
+
+
+def _server_pair_connection_id(server: EventServer, group: str) -> str | None:
+    peers = tuple(peer for peer in server._peers.values() if peer.group == group)
+    if len(peers) != 2 or {peer.role for peer in peers} != {
+        'coordination',
+        'event',
+    }:
+        return None
+    connection_ids = {peer.connection_id for peer in peers}
+    if len(connection_ids) != 1:
+        return None
+    return connection_ids.pop()
+
+
+def _server_peer(
+    server: EventServer,
+    role: Literal['coordination', 'event'] | None,
+) -> ipc_module._ServerPeer:
+    return next(peer for peer in server._peers.values() if peer.role == role)
+
+
+def _socket_path(tmp_path: Path) -> Path:
+    assert len(_SHORT_SOCKET_ROOT) == 1
+    return _SHORT_SOCKET_ROOT[0] / f'{tmp_path.name}.sock'
+
+
+def _source_owner_guard(
+    original_modify_peer: Callable[[EventServer, object], None],
+    owner_ident: Callable[[], int | None],
+) -> Callable[[EventServer, object], None]:
+
+    def require_source_owner_thread(
+        current_server: EventServer,
+        peer: object,
+    ) -> None:
+        assert threading.get_ident() == owner_ident()
+        original_modify_peer(current_server, peer)
+
+    return require_source_owner_thread
+
+
+@pytest.fixture(autouse=True)
+def _transport_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.monotonic()
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: now))
+
+
+def _advance_transport_waits(
+    monkeypatch: pytest.MonkeyPatch, *, step: float = 0.01
+) -> list[float]:
+    clock = [10.0]
+    selector_factory = selectors.DefaultSelector
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    calls = [0]
+
+    def make_selector() -> _DeadlineSelector:
+        calls[0] += 1
+        assert calls[0] <= 20, 'transport continued after its scripted deadline'
+        return _DeadlineSelector(selector_factory(), clock, step=step)
+
+    monkeypatch.setattr(
+        ipc_module,
+        'selectors',
+        SimpleNamespace(
+            DefaultSelector=make_selector,
+            EVENT_READ=selectors.EVENT_READ,
+            EVENT_WRITE=selectors.EVENT_WRITE,
+        ),
+    )
+    return clock
+
+
+class _AlwaysBlockingSocket:
+    def __init__(self, sock: socket.socket) -> None:
+        self._socket = sock
+
+    def close(self) -> None:
+        self._socket.close()
+
+    def fileno(self) -> int:
+        return self._socket.fileno()
+
+    @staticmethod
+    def recv(_size: int) -> bytes:
+        raise BlockingIOError
+
+    @staticmethod
+    def send(_value: memoryview) -> int:
+        raise BlockingIOError
+
+
+def _decode_control_message(
+    frame: bytes, *, max_frame_bytes: int = _MAX_FRAME_BYTES
+) -> ControlMessage:
+    return _decode_control_body(_unpack_length_frame(frame, max_frame_bytes=max_frame_bytes))
+
+
+def _event(event_id: int, *, text: str = 'payload') -> Event:
+    return Event(
+        {
+            'id': event_id,
+            'type': 'EventLogEntry',
+            'event_type': 'Shotgun_Test',
+            'attribute_name': None,
+            'meta': {
+                'active': True,
+                'blob': b'\x00\xff',
+                'day': date(2026, 7, 27),
+                'items': [None, 4, 1.5, text],
+                'when': datetime(2026, 7, 27, 12, 30, 1, 9, UTC),
+            },
+            'entity': {'id': 3, 'type': 'Asset'},
+            'user': None,
+            'project': {'id': 2, 'type': 'Project'},
+            'session_uuid': 'session',
+            'created_at': datetime(2026, 7, 27, 12, 30, 1, 9, UTC),
+        }
+    )
+
+
+def _event_authentication_frame(
+    role: Literal['coordination', 'event'],
+    *,
+    capability: str = 'capability-1',
+    connection_id: str = 'connection-1',
+) -> bytes:
+    body = json.dumps(
+        {
+            'capability': capability,
+            'connection_id': connection_id,
+            'group': 'group-a',
+            'role': role,
+            'schema': 'sg-event-daemon-event-auth',
+            'source': 'events',
+            'spawn_instance': 'spawn-1',
+            'version': 1,
+        },
+        ensure_ascii=True,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode()
+    return struct.pack('!I', len(body)) + body
+
+
 def _enum_payload(decoder: str) -> dict[str, object]:
     if decoder in {
         '_decode_attempt',
@@ -657,90 +898,21 @@ def _enum_payload(decoder: str) -> dict[str, object]:
     raise AssertionError(decoder)
 
 
-def _new_text_health_update() -> HealthUpdate:
-    update = _health_update()
-    source = SourceHealth(
-        site='main',
+def _event_client(path: Path, group: str = 'group-a') -> EventClient:
+    return EventClient(
+        path=path,
         source='events',
-        source_generation='source-1',
-        status='running',
-        frontier=99,
-        successful_clock=10.0,
-        retry_attempt=0,
-        next_retry_secs=None,
-        open_range_count=0,
-        late_id_count=0,
-        last_error=None,
-        overdue_reason='source-phase-overdue',
+        group=group,
+        spawn_instance='spawn-1',
+        capability='capability-1',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+        coordination_deadline_secs=1.0,
+        stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
-    group = GroupHealth(
-        site='main',
-        source='events',
-        group='editorial',
-        worker_instance='spawn-1',
-        execution='sync',
-        ordering='strict',
-        phase='idle',
-        status='running',
-        cursor=99,
-        current_event_id=None,
-        current_plugin_id=None,
-        current_callback_id=None,
-        delivery_attempt=None,
-        heartbeat_at=10.0,
-        heartbeat_age=0.0,
-        queue_event_count=0,
-        queue_byte_count=0,
-        catchup_frontier=None,
-        pending_catchup_epoch_count=0,
-        oldest_catchup_epoch_age=None,
-        join_phase='attached',
-        outstanding_late_obligation_count=0,
-        outstanding_late_id_count=0,
-        outstanding_late_ids=(),
-        outstanding_late_ids_truncated=False,
-        parked=False,
-        park_reason=None,
-        failure_kind=None,
-        failure_text=None,
-        checkpoint_state='complete',
-        conditions=(),
-        overdue_reason='lane-phase-overdue',
-    )
-    watchdog = WatchdogHealth(
-        kind='operator',
-        site='main',
-        source='events',
-        group='editorial',
-        worker_instance='spawn-1',
-        phase='internal',
-        heartbeat_at=10.0,
-        deadline_at=20.0,
-        plugin_id='plugin-a',
-        callback_id='callback-a',
-        operator_command='park',
-    )
-    return replace(
-        update,
-        worker=replace(
-            update.worker,
-            watchdog_failure='watchdog-sampling-failed',
-        ),
-        watchdogs=(watchdog,),
-        sources=(source,),
-        groups=(group,),
-    )
-
-
-def _offer_joined_messages(
-    channel: GroupChannelInterface,
-    ordering: Literal['eager', 'strict'],
-    first: EventDelivery,
-    second: EventDelivery,
-) -> None:
-    offer = channel.offer_paced if ordering == 'strict' else channel.offer
-    assert offer(first)
-    assert offer(second)
 
 
 @contextmanager
@@ -758,6 +930,8 @@ def _paired_event_client(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=1.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     channel = GroupChannel(
         group='group-a', ordering='eager', max_events=queue_max_entries, max_bytes=_QUEUE_BYTES
@@ -836,10 +1010,10 @@ def _join_client(
     )
     source_thread = _SourceThreadHarness(server, Source())
     try:
-        source_thread._start()
+        source_thread.start()
         assert client.request(JoinRequest(attempt), channel) == JoinTarget(identity)
     finally:
-        source_thread._close()
+        source_thread.close()
     (remote,) = channels
     assert remote.status.attached
     return channel, remote
@@ -849,121 +1023,99 @@ def _partial_writer(*, max_bytes: int | None = None) -> _PartialWriter:
     return ipc_module._PartialWriter(max_bytes=max_bytes)
 
 
-def _pump(
-    server: EventServer,
-    clients: tuple[EventClient, ...],
-    channels: tuple[GroupChannelInterface, ...],
-) -> None:
-    for _ in range(100):
-        server.poll(0.001)
-        for client in clients:
-            client.poll(0.001)
-        if all(channel.status.queued_count for channel in channels):
-            return
-    raise AssertionError('event IPC did not make progress')
-
-
-def _retained_connection_identity_count(server: EventServer) -> int:
-    return len(server._connection_fences)
-
-
-def _run_bounded_client_call(
-    client: EventClient,
-    call: Callable[[], object],
-) -> object | Exception:
-    complete = threading.Event()
-    results: list[object | Exception] = []
-
-    def invoke() -> None:
-        try:
-            results.append(call())
-        except (ConnectionError, JoinProtocolError) as error:
-            results.append(error)
-        finally:
-            complete.set()
-
-    thread = threading.Thread(target=invoke)
-    thread.start()
-    try:
-        assert complete.wait(1.0)
-    finally:
-        if not complete.is_set():
-            client.close()
-        thread.join(1.0)
-    assert not thread.is_alive()
-    assert len(results) == 1
-    return results[0]
-
-
-def _script_peer_recv(
-    peer: ipc_module._ServerPeer,
-    *outcomes: bytes | OSError,
-) -> None:
-    sock = peer._socket
-    vars(peer)['_socket'] = cast(
-        'socket.socket',
-        _ScriptedRecvSocket(sock, outcomes),
-    )
-
-
-def _server_coordination_socket(server: EventServer) -> socket.socket:
-    peers = server._peers
-    return next(peer._socket for peer in peers.values() if peer._role == 'coordination')
-
-
-def _server_pair_connection_id(server: EventServer, group: str) -> str | None:
-    peers = tuple(peer for peer in server._peers.values() if peer._group == group)
-    if len(peers) != 2 or {peer._role for peer in peers} != {
-        'coordination',
-        'event',
-    }:
-        return None
-    connection_ids = {peer._connection_id for peer in peers}
-    if len(connection_ids) != 1:
-        return None
-    return connection_ids.pop()
-
-
-def _server_peer(
-    server: EventServer,
-    role: Literal['coordination', 'event'] | None,
-) -> ipc_module._ServerPeer:
-    return next(peer for peer in server._peers.values() if peer._role == role)
-
-
 def _service_event_server_until(
     server: EventServer,
     predicate: Callable[[], bool],
     *,
     source: _JoinSourceStub | None = None,
 ) -> None:
-    for _ in range(200):
+    while True:
         server.poll(0.001)
         if source is not None:
             server.dispatch_join_requests(source)
         if predicate():
             return
-    raise AssertionError('event server did not reach expected state')
 
 
-def _socket_path(tmp_path: Path) -> Path:
-    assert len(_SHORT_SOCKET_ROOT) == 1
-    return _SHORT_SOCKET_ROOT[0] / f'{tmp_path.name}.sock'
+def _slow_query_socket_pages(tmp_path: Path, *, reading: bool) -> tuple[list[int], str | None]:
+    path = _socket_path(tmp_path)
+    progress = _SlowSocketReaderProgress()
+    stop = threading.Event()
+    errors: list[BaseException] = []
 
+    with EventServer(
+        path=path,
+        source='events',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=1_000,
+        queue_max_bytes=100_000_000,
+    ) as server:
+        _install_grant(server, 'group-a')
+        client = EventClient(
+            path=path,
+            source='events',
+            group='group-a',
+            spawn_instance='spawn-1',
+            capability='capability-1',
+            max_frame_bytes=_MAX_FRAME_BYTES,
+            queue_max_entries=1_000,
+            queue_max_bytes=100_000_000,
+            coordination_deadline_secs=5,
+            stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.01,
+        )
+        client.connect()
+        sink, remote = _join_client(server, client, max_events=1_000)
+        peer = server._current_event_peer('group-a')
+        assert peer is not None
+        peer.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65_536)
+        granted = peer.socket.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+        inner = _SlowSocketQuery(progress.wait_for_drain if reading else lambda: None)
+        wrapper = source_module._ServicingSyncSG
+        handle = wrapper(inner, lambda: server.poll(0.0))
 
-def _source_owner_guard(
-    original_modify_peer: Callable[[EventServer, object], None],
-    owner_ident: Callable[[], int | None],
-) -> Callable[[EventServer, object], None]:
+        def read() -> None:
+            try:
+                while not stop.is_set():
+                    client.poll(0.005)
+                    progress.record(sink)
+            except (AssertionError, ConnectionError, OSError, ValueError) as error:
+                errors.append(error)
 
-    def require_source_owner_thread(
-        current_server: EventServer,
-        peer: object,
-    ) -> None:
-        assert threading.get_ident() == owner_ident()
-        original_modify_peer(current_server, peer)
-
-    return require_source_owner_thread
+        reader = threading.Thread(target=read, name='reading-group')
+        if reading:
+            reader.start()
+        try:
+            for page in range(10):
+                frames = tuple(
+                    EncodedEvent.from_event_frame(
+                        identifier, encode_event(_event(identifier, text='x' * 4_096))
+                    )
+                    for identifier in range(page * 500 + 1, (page + 1) * 500 + 1)
+                )
+                assert sum(frame.byte_count for frame in frames) > granted
+                for frame in frames:
+                    remote.offer(EventDelivery(frame))
+                progress.offer(len(frames))
+                server.poll(0.0)
+                if not reading and not remote.status.attached:
+                    # Re-offer after detachment to protect once-only detach logging.
+                    remote.offer(EventDelivery(frames[-1]))
+                    break
+                handle.find('EventLogEntry', [])
+            while reading and remote.status.attached and not progress.drained():
+                server.poll(0.001)
+            reason = server._group_status('group-a').reason
+        finally:
+            handle.close()
+            stop.set()
+            if reading:
+                reader.join()
+                assert not reader.is_alive()
+            client.close()
+        assert not errors
+    return progress.received, reason
 
 
 def _wait_for_channel_count(
@@ -971,11 +1123,11 @@ def _wait_for_channel_count(
     channel: GroupChannelInterface,
     expected: int,
 ) -> None:
-    for _ in range(100):
+    while True:
         client.poll(0.001)
+        assert channel.status.attached, channel.status.reason
         if channel.status.queued_count == expected:
             return
-    raise AssertionError('event channel did not reach expected count')
 
 
 def _wait_for_client_state(
@@ -984,12 +1136,13 @@ def _wait_for_client_state(
     *,
     connected: bool,
 ) -> None:
-    for _ in range(100):
+    while True:
         server.poll(0.001)
         client.poll(0.001)
+        if connected:
+            assert client.connected, client.detach_reason
         if client.connected == connected and (not connected or bool(server._connected_groups)):
             return
-    raise AssertionError('event client did not reach expected state')
 
 
 def _wait_for_server_pair_replacement(
@@ -997,12 +1150,11 @@ def _wait_for_server_pair_replacement(
     group: str,
     previous_connection_id: str,
 ) -> str:
-    for _ in range(200):
+    while True:
         server.poll(0.001)
         connection_id = _server_pair_connection_id(server, group)
         if connection_id is not None and connection_id != previous_connection_id:
             return connection_id
-    raise AssertionError('event server did not authenticate a replacement pair')
 
 
 def _write_event_server_stream(
@@ -1011,7 +1163,7 @@ def _write_event_server_stream(
     data: bytes,
 ) -> None:
     offset = 0
-    for _ in range(1_000):
+    while True:
         try:
             written = sock.send(memoryview(data)[offset:])
         except BlockingIOError:
@@ -1022,7 +1174,6 @@ def _write_event_server_stream(
         server.poll(0.001)
         if offset == len(data):
             return
-    raise AssertionError('event stream write did not complete')
 
 
 def test_body_free_event_messages_charge_complete_wire_bytes() -> None:
@@ -1037,7 +1188,9 @@ def test_body_free_event_messages_charge_complete_wire_bytes() -> None:
         attempt_token=_ATTEMPT_ID,
     )
     messages = (
-        StrictCapacityControl(identity=identity, abort_limit=4),
+        StrictOrderingControl(
+            identity=identity, event_id=1, last_delivered_id=2, delivery_floor=0, action='halt'
+        ),
         StrictOrderingControl(
             identity=identity,
             event_id=21,
@@ -1053,7 +1206,7 @@ def test_body_free_event_messages_charge_complete_wire_bytes() -> None:
         decoded = _decode_event_wire(_frame_bytes(frame))
         assert isinstance(
             decoded,
-            StrictCapacityControl | StrictOrderingControl,
+            StrictOrderingControl,
         )
         channel = GroupChannel(
             group='group-a',
@@ -1099,11 +1252,13 @@ def test_client_reconnect_drops_stale_queue(tmp_path: Path) -> None:
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     with server:
         _install_grant(server, 'group-a')
         client.connect()
-        for _ in range(100):
+        while True:
             server.poll(0.001)
             if server._connected_groups:
                 break
@@ -1134,7 +1289,7 @@ def test_compact_health_control_encoding_expands_bounded_nul_diagnostic() -> Non
     update = _health_update()
     update = replace(
         update,
-        worker=replace(update.worker, breaker_reason=diagnostic),
+        worker=replace(update.worker, watchdog_failure=diagnostic),
     )
     encoded = encode_control_message(update)
 
@@ -1146,26 +1301,18 @@ def test_compact_health_control_limit_excludes_only_outer_length_prefix() -> Non
     update = _health_update()
     body_bytes = len(encode_control_message(update)) - 4
     exact_parent_socket, exact_child_socket = socket.socketpair()
-    exact_parent = WorkerControl(
-        exact_parent_socket, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1.0
-    )
-    exact_child = WorkerControl(
-        exact_child_socket, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1.0
-    )
+    exact_parent = WorkerControl(exact_parent_socket, max_frame_bytes=_MAX_FRAME_BYTES)
+    exact_child = WorkerControl(exact_child_socket, max_frame_bytes=_MAX_FRAME_BYTES)
     small_parent_socket, small_child_socket = socket.socketpair()
-    small_parent = WorkerControl(
-        small_parent_socket, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1.0
-    )
-    small_child = WorkerControl(
-        small_child_socket, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1.0
-    )
+    small_parent = WorkerControl(small_parent_socket, max_frame_bytes=_MAX_FRAME_BYTES)
+    small_child = WorkerControl(small_child_socket, max_frame_bytes=_MAX_FRAME_BYTES)
     try:
-        vars(exact_parent)['_max_frame_bytes'] = body_bytes
-        vars(small_parent)['_max_frame_bytes'] = body_bytes - 1
-        exact_parent.send(update)
-        assert exact_child.receive(timeout=1.0) == update
+        vars(exact_parent)['max_frame_bytes'] = body_bytes
+        vars(small_parent)['max_frame_bytes'] = body_bytes - 1
+        exact_parent.send(update, deadline_secs=1.0)
+        assert receive_control(exact_child) == update
         with pytest.raises(_FrameError, match='exceeds'):
-            small_parent.send(update)
+            small_parent.send(update, deadline_secs=1.0)
     finally:
         exact_parent.close()
         exact_child.close()
@@ -1182,7 +1329,7 @@ def test_connect_preserves_initiating_failure_and_closes_every_acquisition(
 
     class Socket:
         def __init__(self, name: str) -> None:
-            self.name = name
+            self._name = name
 
         def settimeout(self, _timeout: float) -> None:
             pass
@@ -1191,19 +1338,19 @@ def test_connect_preserves_initiating_failure_and_closes_every_acquisition(
             pass
 
         def close(self) -> None:
-            attempts.append(self.name)
+            attempts.append(self._name)
 
     class Selector:
         def __init__(self, name: str) -> None:
-            self.name = name
+            self._name = name
 
         def register(self, *_args: object) -> None:
-            if self.name == 'coordination-selector':
+            if self._name == 'coordination-selector':
                 raise initiating
 
         def close(self) -> None:
-            attempts.append(self.name)
-            raise OSError(self.name + ' cleanup failed')
+            attempts.append(self._name)
+            raise OSError(self._name + ' cleanup failed')
 
     sockets = iter((Socket('event'), Socket('coordination')))
     selectors = iter((Selector('event-selector'), Selector('coordination-selector')))
@@ -1222,6 +1369,8 @@ def test_connect_preserves_initiating_failure_and_closes_every_acquisition(
         queue_max_bytes=262_144,
         coordination_deadline_secs=1.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     with pytest.raises(ValueError, match='failed') as caught:
         client.connect()
@@ -1279,14 +1428,14 @@ def test_control_messages_are_closed_versioned_and_secret_safe() -> None:
     redacted_health = HealthUpdate(
         worker=replace(
             health.worker,
-            breaker_reason='token=must-not-cross-ipc',
+            watchdog_failure='api_key=example',
         ),
         watchdogs=health.watchdogs,
         sources=health.sources,
         groups=health.groups,
         event_sockets=health.event_sockets,
     )
-    assert redacted_health.worker.breaker_reason == '<redacted>'
+    assert redacted_health.worker.watchdog_failure == '<redacted>'
     assert _decode_control_message(encode_control_message(redacted_health)) == redacted_health
 
 
@@ -1300,33 +1449,34 @@ def test_coordination_channel_rejects_fanout_before_decoding_body(
     monkeypatch.setattr(ipc_module, 'decode_event', decode)
 
     with pytest.raises(_FrameError, match='coordination stream received a fanout frame'):
-        client._coordination_reader._feed(frame)
+        client._coordination_reader.feed(frame)
 
     decode.assert_not_called()
 
 
 def test_detach_frame_charges_complete_wire_bytes_at_exact_limit() -> None:
-    detach_frame = ipc_module._detach_frame
-    frame = detach_frame('queue-closed')
+    frame = ipc_module._event_control_frame('detach', {'reason': 'queue-closed'})
     wire_bytes = len(_frame_bytes(frame))
     exact_writer = _partial_writer(max_bytes=wire_bytes)
     short_writer = _partial_writer(max_bytes=wire_bytes - 1)
 
-    assert exact_writer._append(frame)
-    assert not short_writer._append(frame)
-    assert short_writer._rejection_reason == 'queue-byte-exhausted'
-    assert frame._charge_bytes == wire_bytes
+    assert exact_writer.append(frame)
+    assert not short_writer.append(frame)
+    assert short_writer.rejection_reason == 'queue-byte-exhausted'
+    assert frame.charge_bytes == wire_bytes
 
 
 def test_event_client_connect_deadline_closes_both_private_sockets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = [10.0]
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
     real_socket = socket.socket
     created: list[_StalledConnectSocket] = []
 
     def socket_factory(family: int, kind: int) -> _StalledConnectSocket:
-        wrapped = _StalledConnectSocket(real_socket(family, kind))
+        wrapped = _StalledConnectSocket(real_socket(family, kind), clock)
         created.append(wrapped)
         return wrapped
 
@@ -1342,15 +1492,15 @@ def test_event_client_connect_deadline_closes_both_private_sockets(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=0.05,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
-    started = time.monotonic()
     with pytest.raises(ConnectionError, match='event endpoint connection failed'):
         client.connect()
-    elapsed = time.monotonic() - started
 
     state = vars(client)
-    assert 0.04 <= elapsed < 1.0
+    assert created[0].timeouts == [pytest.approx(0.05)]
     assert len(created) == 2
     assert all(sock.fileno() == -1 for sock in created)
     assert state['_socket'] is None
@@ -1374,6 +1524,8 @@ def test_event_client_detach_preserves_additional_cleanup_note(tmp_path: Path) -
         queue_max_bytes=262_144,
         coordination_deadline_secs=1.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     vars(client)['_selector'] = SimpleNamespace(close=Mock(side_effect=first))
     vars(client)['_join_channel'] = SimpleNamespace(detach=Mock(side_effect=later))
@@ -1388,7 +1540,7 @@ def test_event_client_detach_preserves_additional_cleanup_note(tmp_path: Path) -
 def test_event_client_poll_handles_partial_prefix_and_body(tmp_path: Path) -> None:
     message = EventDelivery(EncodedEvent.from_event_frame(1, encode_event(_event(1))))
     frame = _encode_fanout_message(message)
-    wire = b''.join(frame._parts)
+    wire = b''.join(frame.parts)
     halfway = 4 + (len(wire) - 4) // 2
     with _paired_event_client(tmp_path / 'unused.sock') as (client, writer, channel):
         writer.sendall(wire[:2])
@@ -1404,7 +1556,7 @@ def test_event_client_poll_reads_whole_frame_in_one_call(tmp_path: Path) -> None
     first = EventDelivery(EncodedEvent.from_event_frame(1, encode_event(_event(1))))
     second = EventDelivery(EncodedEvent.from_event_frame(2, encode_event(_event(2))))
     wire = b''.join(
-        part for message in (first, second) for part in _encode_fanout_message(message)._parts
+        part for message in (first, second) for part in _encode_fanout_message(message).parts
     )
     with _paired_event_client(tmp_path / 'unused.sock') as (client, writer, channel):
         writer.sendall(wire)
@@ -1417,8 +1569,8 @@ def test_event_client_poll_reads_whole_frame_in_one_call(tmp_path: Path) -> None
 def test_event_client_poll_stops_reading_body_when_queue_is_full(tmp_path: Path) -> None:
     first = EventDelivery(EncodedEvent.from_event_frame(1, encode_event(_event(1))))
     second = EventDelivery(EncodedEvent.from_event_frame(2, encode_event(_event(2))))
-    first_wire = b''.join(_encode_fanout_message(first)._parts)
-    second_wire = b''.join(_encode_fanout_message(second)._parts)
+    first_wire = b''.join(_encode_fanout_message(first).parts)
+    second_wire = b''.join(_encode_fanout_message(second).parts)
     with _paired_event_client(tmp_path / 'unused.sock', queue_max_entries=1) as (
         client,
         writer,
@@ -1470,16 +1622,18 @@ def test_event_client_selector_failure_closes_private_resources(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=0.1,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
     with pytest.raises(ConnectionError, match='event endpoint connection failed'):
         client.connect()
 
     state = vars(client)
-    assert selectors_created[0]._registered
-    assert selectors_created[1]._registration_attempted
-    assert not selectors_created[1]._registered
-    assert all(selector._closed for selector in selectors_created)
+    assert selectors_created[0].registered
+    assert selectors_created[1].registration_attempted
+    assert not selectors_created[1].registered
+    assert all(selector.closed for selector in selectors_created)
     assert all(sock.fileno() == -1 for sock in sockets)
     assert state['_socket'] is None
     assert state['_coordination_socket'] is None
@@ -1514,6 +1668,8 @@ def test_event_client_socket_creation_failure_closes_created_socket(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=0.05,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
     try:
@@ -1566,6 +1722,8 @@ def test_event_client_zero_authentication_send_closes_both_private_sockets(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=0.1,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
     with pytest.raises(ConnectionError, match='event endpoint connection failed'):
@@ -1582,7 +1740,7 @@ def test_event_client_zero_authentication_send_closes_both_private_sockets(
 
 def test_event_codec_reuses_encoded_body_and_preserves_frame_order() -> None:
     encoded = EncodedEvent.from_event_frame(21, encode_event(_event(21)))
-    control = StrictCapacityControl(
+    control = StrictOrderingControl(
         identity=LiveJoinIdentity(
             site='main',
             source='events',
@@ -1593,13 +1751,16 @@ def test_event_codec_reuses_encoded_body_and_preserves_frame_order() -> None:
             boundary=20,
             attempt_token=_ATTEMPT_ID,
         ),
-        abort_limit=4,
+        event_id=1,
+        last_delivered_id=2,
+        delivery_floor=0,
+        action='halt',
     )
     delivery = EventDelivery(encoded)
 
     control_frame = _encode_fanout_message(control)
     event_frame = _encode_fanout_message(delivery)
-    assert event_frame._payload is encoded.event_frame
+    assert event_frame.payload is encoded.event_frame
     assert _decode_event_wire(_frame_bytes(control_frame)) == control
     decoded_delivery = _decode_event_wire(_frame_bytes(event_frame))
     assert isinstance(decoded_delivery, EventDelivery)
@@ -1608,8 +1769,8 @@ def test_event_codec_reuses_encoded_body_and_preserves_frame_order() -> None:
 
     reader = _frame_reader(max_frame_bytes=8_388_608)
     stream = _frame_bytes(control_frame) + _frame_bytes(event_frame)
-    assert reader._feed(stream[:7]) == ()
-    decoded = reader._feed(stream[7:])
+    assert reader.feed(stream[:7]) == ()
+    decoded = reader.feed(stream[7:])
     assert decoded == (control, decoded_delivery)
 
 
@@ -1640,6 +1801,8 @@ def test_event_connection_fence_is_removed_when_grant_is_replaced(tmp_path: Path
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
 
     group_a = _client('group-a', capability='capability-a')
@@ -1737,6 +1900,8 @@ def test_event_connection_fence_stays_bounded_and_rejects_ancient_delayed_role(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
     with (
@@ -1757,7 +1922,7 @@ def test_event_connection_fence_stays_bounded_and_rejects_ancient_delayed_role(
         _service_event_server_until(
             server,
             lambda: any(
-                vars(peer)['_connection_id'] == 'old-connection' for peer in server._peers.values()
+                vars(peer)['connection_id'] == 'old-connection' for peer in server._peers.values()
             ),
         )
 
@@ -1781,11 +1946,11 @@ def test_event_connection_fence_stays_bounded_and_rejects_ancient_delayed_role(
 
         assert _retained_connection_identity_count(server) == 1
         authenticated = tuple(
-            peer for peer in server._peers.values() if vars(peer)['_group'] == 'group-a'
+            peer for peer in server._peers.values() if vars(peer)['group'] == 'group-a'
         )
         assert len(authenticated) == 2
-        assert {vars(peer)['_role'] for peer in authenticated} == {'coordination', 'event'}
-        assert len({vars(peer)['_connection_id'] for peer in authenticated}) == 1
+        assert {vars(peer)['role'] for peer in authenticated} == {'coordination', 'event'}
+        assert len({vars(peer)['connection_id'] for peer in authenticated}) == 1
 
         _write_event_server_stream(
             server,
@@ -1793,7 +1958,7 @@ def test_event_connection_fence_stays_bounded_and_rejects_ancient_delayed_role(
             _event_authentication_frame('coordination', connection_id='old-connection'),
         )
         ancient_closed = False
-        for _ in range(200):
+        while True:
             server.poll(0.001)
             client.poll(0.001)
             try:
@@ -1832,6 +1997,8 @@ def test_event_coordination_rpc_caller_stop_wins_before_timeout(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=stop,
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     request = GroupBootstrapRequest(
         source='events',
@@ -1906,6 +2073,8 @@ def test_event_coordination_rpc_finishes_after_real_socket_short_writes(
         queue_max_bytes=max_frame_bytes * 2,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     complete = threading.Event()
     results: list[Attached | JoinRetry | Exception] = []
@@ -1938,18 +2107,17 @@ def test_event_coordination_rpc_finishes_after_real_socket_short_writes(
                 (server_coordination,),
                 (),
                 (),
-                1.0,
             )
             assert readable == [server_coordination]
             source_thread = _SourceThreadHarness(server, _Source())
-            source_thread._start()
-            assert complete.wait(2.0)
+            source_thread.start()
+            assert complete.wait()
         finally:
             if not complete.is_set():
                 client.close()
-            thread.join(1.0)
+            thread.join()
             if source_thread is not None:
-                source_thread._close()
+                source_thread.close()
             client.close()
 
     assert not thread.is_alive()
@@ -1960,7 +2128,17 @@ def test_event_coordination_rpc_finishes_after_real_socket_short_writes(
 
 def test_event_coordination_rpc_times_out_when_no_reply_arrives(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = [10.0]
+    phases: list[float] = []
+    polls: list[float] = []
+
+    @contextmanager
+    def wait_phase() -> Generator[None]:
+        phases.append(clock[0])
+        yield
+
     path = _socket_path(tmp_path)
     stop = threading.Event()
     server = EventServer(
@@ -1979,7 +2157,9 @@ def test_event_coordination_rpc_times_out_when_no_reply_arrives(
         max_frame_bytes=_MAX_FRAME_BYTES,
         queue_max_entries=2,
         queue_max_bytes=_QUEUE_BYTES,
-        coordination_deadline_secs=0.05,
+        coordination_deadline_secs=0.25,
+        wait_phase=wait_phase,
+        wait_slice_secs=0.1,
         stop=stop,
     )
     request = GroupBootstrapRequest(
@@ -1989,7 +2169,6 @@ def test_event_coordination_rpc_times_out_when_no_reply_arrives(
         start_mode='initialize',
     )
 
-    time.sleep(0.1)
     with server:
         _install_grant(
             server,
@@ -1999,39 +2178,29 @@ def test_event_coordination_rpc_times_out_when_no_reply_arrives(
         )
         client.connect()
         _wait_for_client_state(server, client, connected=True)
-        start = time.monotonic()
+
+        def poll(timeout: float) -> None:
+            polls.append(timeout)
+            assert len(polls) <= 3
+            clock[0] += timeout
+
+        monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(client, '_poll_coordination', poll)
+        phases.clear()
         result = _run_bounded_client_call(client, lambda: client.observe_group(request))
-        elapsed = time.monotonic() - start
 
     assert isinstance(result, ConnectionError)
     assert str(result) == 'event coordination reply timed out'
-    assert 0.04 <= elapsed < 0.5
+    assert polls == pytest.approx([0.1, 0.1, 0.05])
+    assert phases == pytest.approx([10.0, 10.1, 10.2])
     assert client.detach_reason == 'coordination-reply-timeout'
 
 
 def test_event_frame_headers_match_golden_event_and_strict_control_bytes() -> None:
     delivery = EventDelivery(EncodedEvent.from_event_frame(21, b'event'))
-    identity = LiveJoinIdentity(
-        site='main',
-        source='events',
-        group='group-a',
-        join_kind='strict',
-        source_generation='source-1',
-        group_generation=1,
-        boundary=20,
-        attempt_token=_ATTEMPT_ID,
-    )
-    strict = StrictCapacityControl(identity=identity, abort_limit=4)
 
-    assert _encode_fanout_message(delivery)._header == (
+    assert _encode_fanout_message(delivery).header == (
         b'{"kind":"event","metadata":{"event_id":21},"schema":'
-        b'"sg-event-daemon-event-channel","version":1}'
-    )
-    assert _encode_fanout_message(strict)._header == (
-        b'{"kind":"strict-capacity","metadata":{"abort_limit":4,"identity":'
-        b'{"attempt_token":"attempt-1","boundary":20,"group":"group-a",'
-        b'"group_generation":1,"join_kind":"strict","site":"main",'
-        b'"source":"events","source_generation":"source-1"}},"schema":'
         b'"sg-event-daemon-event-channel","version":1}'
     )
 
@@ -2077,6 +2246,8 @@ def test_event_grants_are_exact_reconnectable_and_replace_old_spawn(
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
 
     unprovisioned = _client(
@@ -2168,6 +2339,8 @@ def test_event_join_rpc_runs_on_source_thread_and_releases_on_eof(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     identity = LiveJoinIdentity(
         site='main',
@@ -2189,7 +2362,7 @@ def test_event_join_rpc_runs_on_source_thread_and_releases_on_eof(
 
         def acknowledge_strict_control(
             self,
-            control: StrictCapacityControl | StrictOrderingControl,
+            control: StrictOrderingControl,
         ) -> None:
             del control
             operations.append(('acknowledge', threading.get_ident()))
@@ -2259,7 +2432,13 @@ def test_event_join_rpc_runs_on_source_thread_and_releases_on_eof(
             assert client.confirm(JoinConfirm(identity)) == Attached(identity)
             assert client.finalize(JoinFinalize(identity)) == JoinFinalized(identity)
             client.acknowledge_strict_control(
-                StrictCapacityControl(identity=identity, abort_limit=4)
+                StrictOrderingControl(
+                    identity=identity,
+                    event_id=1,
+                    last_delivered_id=2,
+                    delivery_floor=0,
+                    action='halt',
+                )
             )
             client.abort(JoinAbort(identity))
             _wait_for_channel_count(client, channel, 1)
@@ -2267,10 +2446,10 @@ def test_event_join_rpc_runs_on_source_thread_and_releases_on_eof(
             assert isinstance(delivery, EventDelivery)
             assert delivery.encoded.event_id == 21
             client.close()
-            assert channel_lost.wait(1.0)
+            assert channel_lost.wait()
         finally:
             stop.set()
-            source_thread.join(1.0)
+            source_thread.join()
 
     assert tuple(name for name, _thread_id in operations) == (
         'request',
@@ -2314,6 +2493,22 @@ def test_event_server_creates_socket_privately_before_bind_returns(
     assert observed_modes == [0o600]
 
 
+def test_event_server_detaches_a_stalled_reader_with_its_reason(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger='sg_event_daemon'):
+        received, reason = _slow_query_socket_pages(tmp_path, reading=False)
+    assert received == []
+    assert reason == 'queue-count-exhausted'
+    assert (
+        caplog.messages.count(
+            'detached group group-a from its live channel: queue-count-exhausted'
+        )
+        == 1
+    )
+
+
 def test_event_server_enforces_frame_and_queue_byte_bounds(tmp_path: Path) -> None:
     path = _socket_path(tmp_path)
     oversized = EventDelivery(
@@ -2327,7 +2522,7 @@ def test_event_server_enforces_frame_and_queue_byte_bounds(tmp_path: Path) -> No
         queue_max_bytes=_QUEUE_BYTES,
     )
     with pytest.raises(_FrameError, match='exceeds'):
-        server._publish_connection('group-a', 'missing', oversized)
+        server.publish_connection('group-a', 'missing', oversized)
 
     event = EventDelivery(EncodedEvent.from_event_frame(51, encode_event(_event(51))))
     with EventServer(
@@ -2349,17 +2544,25 @@ def test_event_server_enforces_frame_and_queue_byte_bounds(tmp_path: Path) -> No
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
         client.connect()
-        for _ in range(100):
+        while True:
             server.poll(0.001)
             if server._connected_groups:
                 break
         _channel, remote = _join_client(server, client, max_events=4)
         assert not remote.offer(event)
 
-        assert server._group_status('group-a')._reason == 'queue-byte-exhausted'
+        assert server._group_status('group-a').reason == 'queue-byte-exhausted'
         client.close()
+
+
+def test_event_server_feeds_a_reader_during_slow_provider_queries(tmp_path: Path) -> None:
+    received, reason = _slow_query_socket_pages(tmp_path, reading=True)
+    assert reason is None
+    assert received == list(range(1, 5_001))
 
 
 def test_event_server_keeps_malformed_frames_distinct_from_eof(tmp_path: Path) -> None:
@@ -2382,6 +2585,8 @@ def test_event_server_keeps_malformed_frames_distinct_from_eof(tmp_path: Path) -
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     read_peer = cast(
         'Callable[[EventServer, object], None]',
@@ -2397,8 +2602,8 @@ def test_event_server_keeps_malformed_frames_distinct_from_eof(tmp_path: Path) -
         read_peer(server, peer)
 
         status = server._group_status('group-a')
-        assert not status._connected
-        assert status._reason == 'authentication-failed'
+        assert not status.connected
+        assert status.reason == 'authentication-failed'
     client.close()
 
 
@@ -2425,9 +2630,11 @@ def test_event_server_paced_offer_keeps_a_full_strict_peer_attached(tmp_path: Pa
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
         client.connect()
-        for _ in range(100):
+        while True:
             server.poll(0.001)
             if server._connected_groups:
                 break
@@ -2438,7 +2645,7 @@ def test_event_server_paced_offer_keeps_a_full_strict_peer_attached(tmp_path: Pa
         assert remote.offer_paced(first)
         assert not remote.offer_paced(second)
         status = server._group_status('strict')
-        assert status._connected
+        assert status.connected
         assert status.queued_count == 1
 
         _pump(server, (client,), (channel,))
@@ -2467,6 +2674,8 @@ def test_event_server_propagates_non_disconnect_receive_errors(tmp_path: Path) -
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     read_peer = cast(
         'Callable[[EventServer, object], None]',
@@ -2482,7 +2691,7 @@ def test_event_server_propagates_non_disconnect_receive_errors(tmp_path: Path) -
         with pytest.raises(OSError, match='input/output error'):
             read_peer(server, peer)
 
-        assert server._group_status('group-a')._connected
+        assert server._group_status('group-a').connected
         assert server._connected_groups == ('group-a',)
     client.close()
 
@@ -2510,8 +2719,8 @@ def test_event_server_rechecks_parent_security_before_bind() -> None:
 def test_event_server_rejects_post_authentication_input_from_event_role(tmp_path: Path) -> None:
     path = _socket_path(tmp_path)
     call = vars(ipc_module)['_JoinCall'](
-        _request_id=1,
-        _value=GroupBootstrapRequest(
+        request_id=1,
+        value=GroupBootstrapRequest(
             source='events',
             group='group-a',
             group_generation=1,
@@ -2541,20 +2750,20 @@ def test_event_server_rejects_post_authentication_input_from_event_role(tmp_path
         _write_event_server_stream(server, client, _event_authentication_frame('event'))
         _service_event_server_until(
             server,
-            lambda: vars(peer)['_role'] == 'event',
+            lambda: vars(peer)['role'] == 'event',
         )
-        assert vars(peer)['_role'] == 'event'
+        assert vars(peer)['role'] == 'event'
 
         _write_event_server_stream(server, client, request_frame)
         _service_event_server_until(
             server,
-            lambda: server._group_status('group-a')._reason == 'authentication-failed',
+            lambda: server._group_status('group-a').reason == 'authentication-failed',
         )
 
         status = server._group_status('group-a')
-        assert not status._connected
-        assert status._reason == 'authentication-failed'
-        assert peer._socket.fileno() == -1
+        assert not status.connected
+        assert status.reason == 'authentication-failed'
+        assert peer.socket.fileno() == -1
 
 
 def test_event_server_replaces_only_safe_stale_socket(tmp_path: Path) -> None:
@@ -2643,6 +2852,27 @@ def test_event_server_restores_umask_after_interrupted_bind_and_restarts(
         path.unlink(missing_ok=True)
 
 
+def test_event_server_stale_socket_probe_uses_owner_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[float] = []
+
+    def check(_path: Path, *, timeout_secs: float = 1.0) -> None:
+        timeouts.append(timeout_secs)
+
+    monkeypatch.setattr(ipc_module, 'remove_stale_socket', check)
+    with EventServer(
+        path=_socket_path(tmp_path),
+        source='events',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+        socket_probe_timeout_secs=0.0625,
+    ):
+        pass
+    assert timeouts == [0.0625]
+
+
 def test_fanout_bridges_shared_frames_to_independent_joined_peers(tmp_path: Path) -> None:
     fanout = EventFanout()
     framed: list[object] = []
@@ -2682,7 +2912,7 @@ def test_fanout_bridges_shared_frames_to_independent_joined_peers(tmp_path: Path
             assert framed[0].encoded is encoded
             assert not by_group['stalled'].attached
             assert by_group['stalled'].reason == 'connection-replaced'
-            assert server._group_status('stalled')._reason == 'queue-count-exhausted'
+            assert server._group_status('stalled').reason == 'queue-count-exhausted'
             assert by_group['first'].attached
             assert by_group['second'].attached
             _pump(server, clients[:2], tuple(sinks[:2]))
@@ -2690,6 +2920,56 @@ def test_fanout_bridges_shared_frames_to_independent_joined_peers(tmp_path: Path
         finally:
             for client in clients:
                 client.close()
+
+
+def test_finalize_reply_requires_the_detach_reason_field() -> None:
+    with pytest.raises(_FrameError, match='fields conflict'):
+        ipc_module._decode_join_reply(
+            {'error': None, 'request_id': 17, 'result': None, 'result_kind': 'none'}
+        )
+
+
+@pytest.mark.parametrize('reason', [None, 'queue-count-exhausted', 'channel-closed'])
+def test_finalize_reply_round_trips_detach_reason(reason: str | None) -> None:
+    decoded = ipc_module._decode_join_reply(
+        {
+            'detach_reason': reason,
+            'error': None,
+            'request_id': 17,
+            'result': None,
+            'result_kind': 'none',
+        }
+    )
+    assert decoded.detach_reason == reason
+    frame = ipc_module._encode_join_reply(decoded)
+    assert ipc_module._decode_event_wire(_frame_bytes(frame)) == decoded
+
+
+@pytest.mark.parametrize('reason', [False, 1, [], {}])
+def test_finalize_reply_detach_reason_requires_text_or_null(reason: object) -> None:
+    with pytest.raises(_FrameError, match='detach reason must be text or null'):
+        ipc_module._decode_join_reply(
+            {
+                'detach_reason': reason,
+                'error': None,
+                'request_id': 17,
+                'result': None,
+                'result_kind': 'none',
+            }
+        )
+
+
+def test_finalize_reply_with_error_and_detach_reason_is_rejected() -> None:
+    with pytest.raises(_FrameError, match='error and detach reason'):
+        ipc_module._decode_join_reply(
+            {
+                'detach_reason': 'channel-closed',
+                'error': 'identity conflicts',
+                'request_id': 17,
+                'result': None,
+                'result_kind': 'none',
+            }
+        )
 
 
 def test_float_wire_decoders_preserve_nullable_join_target_clock() -> None:
@@ -2722,9 +3002,9 @@ def test_frame_reader_rejects_malformed_and_oversized_lengths() -> None:
     reader = _frame_reader(max_frame_bytes=32)
 
     with pytest.raises(_FrameError, match='exceeds'):
-        reader._feed((33).to_bytes(4, 'big'))
+        reader.feed((33).to_bytes(4, 'big'))
     with pytest.raises(_FrameError, match='positive'):
-        _frame_reader(max_frame_bytes=32)._feed(b'\x00\x00\x00\x00')
+        _frame_reader(max_frame_bytes=32).feed(b'\x00\x00\x00\x00')
 
 
 def test_group_bootstrap_observation_runs_on_source_thread(
@@ -2749,6 +3029,8 @@ def test_group_bootstrap_observation_runs_on_source_thread(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     request_value = GroupBootstrapRequest(
         source='events',
@@ -2803,7 +3085,7 @@ def test_group_bootstrap_observation_runs_on_source_thread(
         finally:
             client.close()
             stop.set()
-            source_thread.join(1.0)
+            source_thread.join()
 
     assert tuple(name for name, _thread_id in operations) == ('observe', 'observe')
     assert {thread_id for _name, thread_id in operations} == {source_thread.ident}
@@ -2833,15 +3115,16 @@ def test_group_bootstrap_pending_codec_is_closed_exact_and_bounded(
     )
     encoded = encode_join_reply(
         SimpleNamespace(
-            _request_id=1,
-            _result=pending,
-            _error=None,
+            request_id=1,
+            result=pending,
+            error=None,
+            detach_reason=None,
         )
     )
 
     decoded = decode_event_wire(_frame_bytes(encoded))
 
-    assert vars(decoded)['_result'] == pending
+    assert vars(decoded)['result'] == pending
     assert {field.name for field in fields(pending)} == {
         'group',
         'group_generation',
@@ -2859,6 +3142,7 @@ def test_group_bootstrap_pending_codec_is_closed_exact_and_bounded(
     def _decode_pending(value: Mapping[str, object]) -> object:
         return decode_join_reply(
             {
+                'detach_reason': None,
                 'error': None,
                 'request_id': 1,
                 'result': dict(value),
@@ -2866,7 +3150,7 @@ def test_group_bootstrap_pending_codec_is_closed_exact_and_bounded(
             }
         )
 
-    assert vars(_decode_pending(payload))['_result'] == GroupBootstrapPending(
+    assert vars(_decode_pending(payload))['result'] == GroupBootstrapPending(
         source='events',
         group='group-a',
         group_generation=7,
@@ -2916,6 +3200,8 @@ def test_group_bootstrap_pending_codec_is_closed_exact_and_bounded(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     for conflicting in (
         GroupBootstrapPending(
@@ -2958,9 +3244,7 @@ def test_health_frame_preserves_false_liveness_and_typed_collections() -> None:
     update = _complete_health_update()
     update = replace(
         update,
-        worker=replace(
-            update.worker, monitor_alive=False, source_outages=(('events', 'unavailable'),)
-        ),
+        worker=replace(update.worker, monitor_alive=False),
         sources=(replace(update.sources[0], strict_retention=(('editorial', 1, 2, 3),)),),
         groups=(
             replace(
@@ -2976,7 +3260,7 @@ def test_health_frame_preserves_false_liveness_and_typed_collections() -> None:
     assert decoded == update
     assert isinstance(decoded, HealthUpdate)
     assert decoded.worker.monitor_alive is False
-    snapshot = aggregate_status(
+    snapshot = status_from_health(
         workers=(decoded.worker,),
         sources=decoded.sources,
         groups=decoded.groups,
@@ -3072,7 +3356,6 @@ def test_health_update_round_trips_bounded_late_id_metadata() -> None:
         park_reason=None,
         failure_kind=None,
         failure_text=None,
-        checkpoint_state='complete',
         conditions=(),
     )
     update = replace(_health_update(), groups=(group,))
@@ -3108,6 +3391,25 @@ def test_health_update_round_trips_exact_watchdog_inventory() -> None:
     assert _decode_control_message(encoded) == update
 
 
+@pytest.mark.parametrize('record_kind', ['sources', 'groups'])
+def test_health_update_round_trips_source_conditions(record_kind: str) -> None:
+    update = _complete_health_update()
+    update = replace(
+        update,
+        sources=(
+            replace(update.sources[0], conditions=('write-lock-stalled', 'checkpoint-stalled')),
+        ),
+        groups=(replace(update.groups[0], conditions=('write-lock-stalled',)),),
+    )
+    assert _decode_control_message(encode_control_message(update)) == update
+    envelope = cast('dict[str, object]', json.loads(encode_control_message(update)[4:]))
+    payload = cast('dict[str, object]', envelope['payload'])
+    cast('list[dict[str, object]]', payload[record_kind])[0]['checkpoint_state'] = 'complete'
+    body = json.dumps(envelope).encode()
+    with pytest.raises(_FrameError):
+        _decode_control_message(struct.pack('!I', len(body)) + body)
+
+
 def test_health_update_round_trips_write_watch_phases() -> None:
     update = _complete_health_update()
     update = replace(
@@ -3122,28 +3424,6 @@ def test_health_update_round_trips_write_watch_phases() -> None:
     )
 
     assert _decode_control_message(encode_control_message(update)) == update
-
-
-def test_join_call_round_trips_capacity_control() -> None:
-    identity = LiveJoinIdentity(
-        site='main',
-        source='events',
-        group='group-a',
-        join_kind='strict',
-        source_generation='source-1',
-        group_generation=3,
-        boundary=20,
-        attempt_token=_ATTEMPT_ID,
-    )
-    control = StrictCapacityControl(identity=identity, abort_limit=7)
-    call = ipc_module._JoinCall(29, control)
-
-    decoded = ipc_module._decode_join_call(_frame_bytes(ipc_module._encode_join_call(call))[4:])
-
-    assert decoded._request_id == 29
-    assert isinstance(decoded._value, StrictCapacityControl)
-    assert decoded._value.identity == identity
-    assert decoded._value.abort_limit == 7
 
 
 def test_join_call_round_trips_ordering_control() -> None:
@@ -3162,19 +3442,19 @@ def test_join_call_round_trips_ordering_control() -> None:
         event_id=22,
         last_delivered_id=21,
         delivery_floor=20,
-        action='skip',
+        action='halt',
     )
     call = ipc_module._JoinCall(31, control)
 
     decoded = ipc_module._decode_join_call(_frame_bytes(ipc_module._encode_join_call(call))[4:])
 
-    assert decoded._request_id == 31
-    assert isinstance(decoded._value, StrictOrderingControl)
-    assert decoded._value.identity == identity
-    assert decoded._value.event_id == 22
-    assert decoded._value.last_delivered_id == 21
-    assert decoded._value.delivery_floor == 20
-    assert decoded._value.action == 'skip'
+    assert decoded.request_id == 31
+    assert isinstance(decoded.value, StrictOrderingControl)
+    assert decoded.value.identity == identity
+    assert decoded.value.event_id == 22
+    assert decoded.value.last_delivered_id == 21
+    assert decoded.value.delivery_floor == 20
+    assert decoded.value.action == 'halt'
 
 
 def test_join_rpc_disconnect_while_event_queue_is_full_raises_connection_error(
@@ -3199,6 +3479,8 @@ def test_join_rpc_disconnect_while_event_queue_is_full_raises_connection_error(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     identity = LiveJoinIdentity(
         site='main',
@@ -3235,7 +3517,7 @@ def test_join_rpc_disconnect_while_event_queue_is_full_raises_connection_error(
     source_thread = _SourceThreadHarness(server, _Source())
     with server:
         _install_grant(server, 'group-a')
-        source_thread._start()
+        source_thread.start()
         try:
             client.connect()
             channel = GroupChannel(
@@ -3259,7 +3541,7 @@ def test_join_rpc_disconnect_while_event_queue_is_full_raises_connection_error(
                     EventDelivery(EncodedEvent.from_event_frame(61, encode_event(_event(61)))),
                 )
 
-            source_thread._call(_publish_full_event)
+            source_thread.call(_publish_full_event)
             _wait_for_channel_count(client, channel, 1)
             assert channel.status.queued_count == 1
             result = _run_bounded_client_call(
@@ -3272,7 +3554,7 @@ def test_join_rpc_disconnect_while_event_queue_is_full_raises_connection_error(
             assert not channel.status.attached
         finally:
             client.close()
-            source_thread._close()
+            source_thread.close()
 
 
 def test_join_target_decoder_rejects_negative_successful_clock() -> None:
@@ -3318,6 +3600,30 @@ def test_json_encoder_materializes_only_the_top_level_mapping() -> None:
         encode_json({'value': float('nan')})
 
 
+def test_last_arrival_advances_on_both_receive_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [10.0]
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    sender, receiver = socket.socketpair()
+    with (
+        closing(sender),
+        closing(WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES)) as peer,
+    ):
+        frame = encode_control_message(_large_outbox_health(1))
+        assert peer.last_arrival_at is None
+        sender.sendall(frame[:100])
+        assert not list(peer.receive_available())
+        first = peer.last_arrival_at
+        assert first is not None
+        clock[0] = 11.0
+        sender.sendall(frame[100:200])
+        with pytest.raises(TimeoutError):
+            peer.receive(timeout=0)
+        assert peer.last_arrival_at > first
+        latest = peer.last_arrival_at
+        assert not list(peer.receive_available())
+        assert peer.last_arrival_at == latest
+
+
 def test_operator_command_and_result_round_trip_with_request_correlation() -> None:
     command = OperatorCommand(
         request_id='operator-request-2',
@@ -3347,13 +3653,13 @@ def test_partial_writer_finishes_frames_without_whole_frame_buffer_space() -> No
 
     class _ShortSocket:
         def __init__(self) -> None:
-            self._output = bytearray()
-            self._calls = 0
+            self.output = bytearray()
+            self.calls = 0
 
         def send(self, value: memoryview) -> int:
-            self._calls += 1
+            self.calls += 1
             accepted = min(3, len(value))
-            self._output.extend(value[:accepted])
+            self.output.extend(value[:accepted])
             return accepted
 
     message = EventDelivery(
@@ -3362,13 +3668,13 @@ def test_partial_writer_finishes_frames_without_whole_frame_buffer_space() -> No
     frame = _encode_fanout_message(message)
     sock = _ShortSocket()
     writer = _partial_writer()
-    writer._append(frame)
+    writer.append(frame)
 
-    while writer._pending_count:
-        writer._flush(sock)
+    while writer.pending_count:
+        writer.flush(sock)
 
-    assert bytes(sock._output) == _frame_bytes(frame)
-    assert sock._calls > 2
+    assert bytes(sock.output) == _frame_bytes(frame)
+    assert sock.calls > 2
 
 
 def test_private_event_endpoint_authenticates_and_reports_socket_buffers(
@@ -3393,6 +3699,8 @@ def test_private_event_endpoint_authenticates_and_reports_socket_buffers(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     with server:
         _install_grant(server, 'group-a')
@@ -3400,7 +3708,7 @@ def test_private_event_endpoint_authenticates_and_reports_socket_buffers(
         client.connect()
         assert client.connected
         assert server._connected_groups == ()
-        for _ in range(100):
+        while True:
             server.poll(0.001)
             if server._connected_groups == ('group-a',):
                 break
@@ -3453,9 +3761,9 @@ def test_raw_frame_reader_read_size_fences_authentication_from_next_frame() -> N
     offset = 0
     decoded: list[object] = []
     while offset < len(stream):
-        chunk = stream[offset : offset + reader._read_size]
+        chunk = stream[offset : offset + reader.read_size]
         offset += len(chunk)
-        batch = reader._feed(chunk)
+        batch = reader.feed(chunk)
         assert len(batch) <= 1
         decoded.extend(batch)
 
@@ -3479,7 +3787,7 @@ def test_remote_range_changed_is_dropped_when_the_writer_is_full(tmp_path: Path)
             first = EventDelivery(EncodedEvent.from_event_frame(7, encode_event(_event(7))))
             assert remote.offer(first)
             assert not remote.offer_hint(fanout_module.RangeChanged())
-            assert server._group_status('group-a')._connected
+            assert server._group_status('group-a').connected
             assert server._group_status('group-a').queued_count == 1
             _pump(server, (client,), (sink,))
             assert sink.drain() == (first,)
@@ -3487,7 +3795,7 @@ def test_remote_range_changed_is_dropped_when_the_writer_is_full(tmp_path: Path)
             assert remote.offer_hint(fanout_module.RangeChanged())
             assert server._group_status('group-a').queued_count == 0
             received: tuple[object, ...] = ()
-            for _ in range(100):
+            while True:
                 server.poll(0.001)
                 client.poll(0.001)
                 received = sink.drain()
@@ -3502,6 +3810,154 @@ def test_remote_range_changed_is_dropped_when_the_writer_is_full(tmp_path: Path)
             assert sink.drain() == (second, fanout_module.RangeChanged())
         finally:
             client.close()
+
+
+def test_request_absolute_cap_with_short_health_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [10.0]
+    health_interval, shutdown = 0.01, 0.25
+    polls: list[float] = []
+    phases: list[float] = []
+    detached: list[str] = []
+    watchdog = ComponentWatchdog(
+        kind='lane',
+        identity='group-a',
+        worker_instance='dependent-1',
+        registration_token=_ATTEMPT_ID,
+        startup_deadline_secs=1.0,
+        clock=lambda: now[0],
+    )
+
+    @contextmanager
+    def wait_phase() -> Generator[None]:
+        with watchdog.watch(
+            'idle', deadline_at=now[0] + health_interval + watchdog_grace_secs(health_interval)
+        ):
+            yield
+
+    client = EventClient(
+        path=tmp_path / 'event.sock',
+        source='events',
+        group='group-a',
+        spawn_instance='dependent-1',
+        capability='capability-1',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+        coordination_deadline_secs=0.8,
+        stop=threading.Event(),
+        wait_phase=wait_phase,
+        wait_slice_secs=min(health_interval, shutdown_slice_secs(shutdown)),
+    )
+    client._coordination_socket = cast('socket.socket', object())
+
+    def poll(timeout: float) -> None:
+        assert now[0] < 11.0
+        assert 0 < timeout <= min(health_interval, shutdown_slice_secs(shutdown), 11.0 - now[0])
+        sample = watchdog.sample()
+        assert sample.phase == 'idle'
+        assert sample.deadline_at is not None
+        phases.append(sample.deadline_at)
+        polls.append(timeout)
+        now[0] = min(11.0, now[0] + timeout)
+        assert now[0] < sample.deadline_at
+
+    def detach(reason: str) -> None:
+        detached.append(reason)
+        client._coordination_socket = None
+
+    monkeypatch.setattr(client, '_poll_coordination', poll)
+    monkeypatch.setattr(client, '_set_coordination_interest', lambda: None)
+    monkeypatch.setattr(client, '_detach', detach)
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: now[0]))
+    attempt = JoinAttemptIdentity(
+        site='main',
+        source='events',
+        group='group-a',
+        join_kind='eager',
+        group_generation=1,
+        attempt_token=_ATTEMPT_ID,
+    )
+    channel = GroupChannel(group='group-a', ordering='eager', max_events=2, max_bytes=_QUEUE_BYTES)
+    now[0] = 10.2
+    with pytest.raises(ConnectionError, match='event coordination reply timed out'):
+        client.request(JoinRequest(attempt), channel)
+    assert now[0] == 11.0
+    assert sum(polls) == pytest.approx(0.8)
+    assert len(polls) > 2
+    assert all(later > earlier for earlier, later in pairwise(phases))
+    assert detached == ['coordination-reply-timeout']
+    assert client._reply is None
+    assert client._in_flight_request_id is None
+
+
+@pytest.mark.parametrize(
+    ('requested', 'send_cap', 'receive_cap', 'send_requests', 'receive_requests'),
+    [
+        (8, 8, 8, [8], [8]),
+        (
+            8_388_608,
+            6_291_456,
+            2_097_152,
+            [8_388_608, 4_194_304],
+            [8_388_608, 4_194_304, 2_097_152],
+        ),
+        (9, 0, 4, [9, 4, 2, 1], [9, 4]),
+        (9, 4, 0, [9, 4], [9, 4, 2, 1]),
+        (1, 0, 0, [1], [1]),
+    ],
+    ids=['full-request', 'independent-caps', 'send-refused', 'receive-refused', 'both-refused'],
+)
+def test_request_socket_buffers_falls_back_to_supported_sizes(
+    requested: int,
+    send_cap: int,
+    receive_cap: int,
+    send_requests: list[int],
+    receive_requests: list[int],
+) -> None:
+    caps = {socket.SO_SNDBUF: send_cap, socket.SO_RCVBUF: receive_cap}
+    calls: list[tuple[int, int]] = []
+    effective = {socket.SO_SNDBUF: 16_384, socket.SO_RCVBUF: 32_768}
+
+    def set_buffer(level: int, option: int, value: int) -> None:
+        assert level == socket.SOL_SOCKET
+        assert value > 0
+        calls.append((option, value))
+        if value > caps[option]:
+            raise OSError(errno.ENOBUFS, 'requested socket buffer exceeds platform cap')
+        # A platform may report a different effective size from the request.
+        effective[option] = value + 1024
+
+    def get_buffer(level: int, option: int) -> int:
+        assert level == socket.SOL_SOCKET
+        return effective[option]
+
+    sock = Mock(spec=socket.socket)
+    sock.setsockopt.side_effect = set_buffer
+    sock.getsockopt.side_effect = get_buffer
+    sizes = ipc_module._request_socket_buffers(sock, requested)
+    assert calls == [
+        *((socket.SO_SNDBUF, value) for value in send_requests),
+        *((socket.SO_RCVBUF, value) for value in receive_requests),
+    ]
+    assert sizes == SocketBufferSizes(
+        requested=requested,
+        send=send_requests[-1] + 1024 if send_cap else 16_384,
+        receive=receive_requests[-1] + 1024 if receive_cap else 32_768,
+    )
+
+
+@pytest.mark.parametrize('option', [socket.SO_SNDBUF, socket.SO_RCVBUF])
+@pytest.mark.parametrize('error_number', [errno.EINVAL, errno.EBADF])
+def test_request_socket_buffers_propagates_other_errors(option: int, error_number: int) -> None:
+    error = OSError(error_number, 'buffer setup failed')
+    sock = Mock(spec=socket.socket)
+    sock.setsockopt.side_effect = [error] if option == socket.SO_SNDBUF else [None, error]
+    with pytest.raises(OSError, match='buffer setup failed') as caught:
+        ipc_module._request_socket_buffers(sock, 8)
+    assert caught.value is error
+    sock.getsockopt.assert_not_called()
 
 
 def test_server_close_preserves_additional_unlink_failure_note(tmp_path: Path) -> None:
@@ -3523,6 +3979,30 @@ def test_server_close_preserves_additional_unlink_failure_note(tmp_path: Path) -
     assert caught.value is first
     assert first.__notes__ == ["additional cleanup failure: RuntimeError('unlink failed')"]
     assert vars(server)['_bound_identity'] is None
+
+
+def test_slow_socket_query_waits_for_the_offered_page() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def wait_for_drain() -> None:
+        entered.set()
+        release.wait()
+
+    query = _SlowSocketQuery(wait_for_drain)
+
+    def find() -> None:
+        assert query.find('EventLogEntry', []) == []
+        completed.set()
+
+    thread = threading.Thread(target=find)
+    thread.start()
+    entered.wait()
+    assert not completed.is_set()
+    release.set()
+    thread.join()
+    assert completed.is_set()
 
 
 def test_source_health_codec_round_trips_incarnation_and_rejects_omission() -> None:
@@ -3580,6 +4060,8 @@ def test_stalled_event_group_does_not_block_peer_and_eof_drops_bodies(
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
         live = EventClient(
             path=path,
@@ -3592,10 +4074,12 @@ def test_stalled_event_group_does_not_block_peer_and_eof_drops_bodies(
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
         stalled.connect()
         live.connect()
-        for _ in range(100):
+        while True:
             server.poll(0.001)
             if server._connected_groups == ('live', 'stalled'):
                 break
@@ -3622,20 +4106,24 @@ def test_stalled_event_group_does_not_block_peer_and_eof_drops_bodies(
                 )
             )
             publish_until_live_receives(message)
-            assert server._group_status('live')._connected
-            if server._group_status('stalled')._reason == 'queue-count-exhausted':
+            assert server._group_status('live').connected
+            if server._group_status('stalled').reason == 'queue-count-exhausted':
                 break
-        assert server._group_status('stalled')._reason == 'queue-count-exhausted'
+        assert server._group_status('stalled').reason == 'queue-count-exhausted'
         assert received_ids == sorted(received_ids)
         final = EventDelivery(EncodedEvent.from_event_frame(1_001, encode_event(_event(1_001))))
         publish_until_live_receives(final)
         assert 1_001 in received_ids
         live_remote.detach('source-eof')
-        for _ in range(10):
-            server.poll(0.01)
-            live.poll(0.01)
-            if not live.connected:
-                break
+
+        def receive_detach() -> None:
+            while live.connected:
+                server.poll(0.01)
+                live.poll(0.01)
+
+        with pytest.raises(LiveChannelDetachedError) as caught:
+            receive_detach()
+        assert caught.value.reason == 'source-eof'
         assert not live.connected
         assert live_channel.status.queued_count == 0
         assert live_channel.status.queued_bytes == 0
@@ -3644,6 +4132,54 @@ def test_stalled_event_group_does_not_block_peer_and_eof_drops_bodies(
         assert stalled_channel.status.queued_count == 0
         stalled.close()
         live.close()
+
+
+def test_strict_control_envelopes_keep_exact_fields_and_shared_values() -> None:
+    identity = LiveJoinIdentity(
+        site='main',
+        source='events',
+        group='group-a',
+        join_kind='strict',
+        source_generation='source-1',
+        group_generation=1,
+        boundary=20,
+        attempt_token=_ATTEMPT_ID,
+    )
+    control = StrictOrderingControl(
+        identity=identity, event_id=21, last_delivered_id=20, delivery_floor=20, action='halt'
+    )
+    frame = _encode_fanout_message(control)
+    fanout = cast('dict[str, object]', json.loads(frame.header)['metadata'])
+    acknowledge = {**fanout, 'control_kind': 'ordering', 'request_id': 1}
+    decode_ack = cast(
+        'Callable[[dict[str, object], LiveJoinIdentity], object]',
+        vars(ipc_module)['_decode_join_control'],
+    )
+    decode_fanout = cast(
+        'Callable[[dict[str, object]], object]', vars(ipc_module)['_decode_strict_ordering']
+    )
+    assert decode_ack(acknowledge, identity) == decode_fanout(fanout) == control
+    with pytest.raises(_FrameError, match='fields'):
+        decode_fanout(acknowledge)
+    with pytest.raises(_FrameError, match='kind conflicts'):
+        decode_ack(fanout, identity)
+    for key in ('request_id', 'control_kind'):
+        with pytest.raises(_FrameError, match='fields'):
+            decode_fanout({**fanout, key: acknowledge[key]})
+    invalid_fields = [
+        ('event_id', 0),
+        ('event_id', True),
+        ('delivery_floor', -1),
+        ('delivery_floor', True),
+        ('last_delivered_id', -1),
+        ('last_delivered_id', True),
+    ]
+    for field_name, invalid in invalid_fields:
+        with pytest.raises(_FrameError) as ack_error:
+            decode_ack({**acknowledge, field_name: invalid}, identity)
+        with pytest.raises(_FrameError) as fanout_error:
+            decode_fanout({**fanout, field_name: invalid})
+        assert str(ack_error.value) == str(fanout_error.value)
 
 
 def test_worker_assignment_round_trips_closed_group_and_source_assignment_unions() -> None:
@@ -3759,9 +4295,7 @@ def test_worker_available_batch_freezes_at_call_and_preserves_fifo() -> None:
     sender, receiver = socket.socketpair()
     with (
         sender,
-        closing(
-            WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1)
-        ) as control,
+        closing(WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES)) as control,
     ):
         first, second, later = (StopCommand(reason=name) for name in ('first', 'second', 'later'))
         sender.sendall(encode_control_message(first) + encode_control_message(second))
@@ -3778,9 +4312,7 @@ def test_worker_available_batch_retains_partial_frame(split: int) -> None:
     sender, receiver = socket.socketpair()
     with (
         sender,
-        closing(
-            WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1)
-        ) as control,
+        closing(WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES)) as control,
     ):
         message = StopCommand(reason='partial')
         frame = encode_control_message(message)
@@ -3796,9 +4328,7 @@ def test_worker_available_batch_preserves_message_before_terminal_error(malforme
     sender, receiver = socket.socketpair()
     with (
         sender,
-        closing(
-            WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1)
-        ) as control,
+        closing(WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES)) as control,
     ):
         message = StopCommand(reason='last-valid')
         sender.sendall(encode_control_message(message))
@@ -3899,6 +4429,8 @@ def test_event_client_authentication_deadline_closes_both_private_sockets(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=0.1,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
     try:
@@ -3985,6 +4517,8 @@ def test_event_client_later_connect_uses_remaining_startup_deadline(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=0.1,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
 
     with pytest.raises(ConnectionError, match='event endpoint connection failed'):
@@ -4034,9 +4568,11 @@ def test_event_endpoint_rejects_mismatched_authentication(
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
         client.connect()
-        for _ in range(100):
+        while True:
             server.poll(0.001)
             client.poll(0.001)
             if not client.connected:
@@ -4046,7 +4582,7 @@ def test_event_endpoint_rejects_mismatched_authentication(
         client.close()
 
 
-@pytest.mark.parametrize('source_status', ['range-query-page-cap', 'encoder-shutdown'])
+@pytest.mark.parametrize('source_status', ['range-query-page-cap', 'encoder-failed'])
 def test_health_frame_round_trips_all_record_fields(source_status: str) -> None:
     update = _complete_health_update()
     update = replace(
@@ -4055,9 +4591,6 @@ def test_health_frame_round_trips_all_record_fields(source_status: str) -> None:
             update.worker,
             monitor_alive=False,
             stuck_threads=('source:events',),
-            breaker_open=True,
-            breaker_reason='breaker opened',
-            source_outages=(('events', 'provider unavailable'),),
             heartbeat_age=2.5,
             watchdog_failure='watchdog expired',
         ),
@@ -4087,7 +4620,7 @@ def test_health_frame_round_trips_all_record_fields(source_status: str) -> None:
                 strict_buffer_event_count=10,
                 strict_buffer_byte_count=11,
                 strict_retention=(('editorial', 12, 13, 14),),
-                checkpoint_state='incomplete',
+                conditions=('checkpoint-stalled',),
                 stream_incarnation='stream-1',
                 audit_count=15,
                 database_size_bytes=16,
@@ -4117,6 +4650,8 @@ def test_health_frame_round_trips_all_record_fields(source_status: str) -> None:
                 failure_kind='callback',
                 failure_text='callback failed',
                 conditions=('parked', 'callback-failed'),
+                replay_required_from=12,
+                history_truncated_floor=10,
                 audit_count=9,
                 overdue_reason='callback overdue',
             ),
@@ -4149,7 +4684,7 @@ def test_join_client_releases_thread_when_start_fails(
     monkeypatch: pytest.MonkeyPatch,
     started: bool,
 ) -> None:
-    original_start = _SourceThreadHarness._start
+    original_start = _SourceThreadHarness.start
     harnesses: list[_SourceThreadHarness] = []
     initiating: list[AssertionError] = []
 
@@ -4159,7 +4694,7 @@ def test_join_client_releases_thread_when_start_fails(
             error = AssertionError('thread creation failed')
             initiating.append(error)
             raise error
-        ready = harness._started
+        ready = harness.started
         monkeypatch.setattr(ready, 'wait', Mock(return_value=False))
         try:
             original_start(harness)
@@ -4167,7 +4702,7 @@ def test_join_client_releases_thread_when_start_fails(
             initiating.append(error)
             raise
 
-    monkeypatch.setattr(_SourceThreadHarness, '_start', fail_start)
+    monkeypatch.setattr(_SourceThreadHarness, 'start', fail_start)
     path = _socket_path(tmp_path)
     with EventServer(
         path=path,
@@ -4182,13 +4717,13 @@ def test_join_client_releases_thread_when_start_fails(
             with pytest.raises(AssertionError) as caught:
                 _join_client(server, client)
             assert caught.value is initiating[0]
-            thread = cast('threading.Thread', vars(harnesses[0])['_thread'])
+            thread = cast('threading.Thread', vars(harnesses[0])['thread'])
             assert not thread.is_alive()
         finally:
             if harnesses:
-                thread = cast('threading.Thread', vars(harnesses[0])['_thread'])
+                thread = cast('threading.Thread', vars(harnesses[0])['thread'])
                 if thread.is_alive():
-                    harnesses[0]._close()
+                    harnesses[0].close()
             client.close()
 
 
@@ -4220,15 +4755,16 @@ def test_live_join_identity_ipc_round_trips_maximum_configured_values(
         _frame_bytes(
             encode_join_reply(
                 SimpleNamespace(
-                    _request_id=maximum,
-                    _result=Attached(identity),
-                    _error=None,
+                    request_id=maximum,
+                    result=Attached(identity),
+                    error=None,
+                    detach_reason=None,
                 )
             )
         )
     )
 
-    assert vars(decoded)['_result'] == Attached(identity)
+    assert vars(decoded)['result'] == Attached(identity)
 
 
 @pytest.mark.parametrize(
@@ -4258,6 +4794,8 @@ def test_event_join_rpc_rejects_another_group_identity(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     identity = LiveJoinIdentity(
         site='main',
@@ -4278,7 +4816,7 @@ def test_event_join_rpc_rejects_another_group_identity(
 
         def acknowledge_strict_control(
             self,
-            control: StrictCapacityControl | StrictOrderingControl,
+            control: StrictOrderingControl,
         ) -> None:
             del control
             dispatched.append('acknowledge')
@@ -4331,7 +4869,7 @@ def test_event_join_rpc_rejects_another_group_identity(
         finally:
             client.close()
             stop.set()
-            source_thread.join(1.0)
+            source_thread.join()
 
     assert dispatched == []
 
@@ -4371,6 +4909,8 @@ def test_event_server_normalizes_unix_stream_receive_disconnects(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     losses: list[tuple[str, str]] = []
 
@@ -4393,10 +4933,10 @@ def test_event_server_normalizes_unix_stream_receive_disconnects(
         server.dispatch_join_requests(_Source())
 
         status = server._group_status('group-a')
-        assert not status._connected
+        assert not status.connected
         assert status.queued_count == 0
         assert status.queued_bytes == 0
-        assert status._reason == 'peer-eof'
+        assert status.reason == 'peer-eof'
         assert losses == [('group-a', 'event-channel-lost')]
     client.close()
 
@@ -4424,8 +4964,8 @@ def test_event_server_preserves_pipelined_coordination_authentication_bytes(
     )
     expected = Attached(request.identity)
     call = vars(ipc_module)['_JoinCall'](
-        _request_id=1,
-        _value=request,
+        request_id=1,
+        value=request,
     )
     encode_join_call = cast(
         'Callable[[object], _OutboundFrame]',
@@ -4468,9 +5008,9 @@ def test_event_server_preserves_pipelined_coordination_authentication_bytes(
         _write_event_server_stream(server, client, first)
         _service_event_server_until(
             server,
-            lambda: vars(peer)['_role'] == 'coordination',
+            lambda: vars(peer)['role'] == 'coordination',
         )
-        assert vars(peer)['_role'] == 'coordination'
+        assert vars(peer)['role'] == 'coordination'
 
         if remaining:
             partial_reads = 1 if split == 'prefix' else 2
@@ -4697,43 +5237,6 @@ def test_group_recovery_ready_is_closed_versioned_and_identity_exact(
         _decode_control_message(struct.pack('!I', len(duplicate)) + duplicate)
 
 
-@pytest.mark.parametrize(
-    ('collection', 'index', 'field_name'),
-    [
-        ('watchdogs', 0, 'kind'),
-        ('watchdogs', 0, 'site'),
-        ('watchdogs', 0, 'source'),
-        ('watchdogs', 0, 'group'),
-        ('watchdogs', 0, 'worker_instance'),
-        ('watchdogs', 0, 'phase'),
-        ('watchdogs', 0, 'plugin_id'),
-        ('watchdogs', 0, 'callback_id'),
-        ('watchdogs', 0, 'operator_command'),
-        ('worker', None, 'watchdog_failure'),
-        ('sources', 0, 'overdue_reason'),
-        ('groups', 0, 'overdue_reason'),
-    ],
-)
-def test_health_update_rejects_malformed_new_text_fields(
-    collection: str,
-    index: int | None,
-    field_name: str,
-) -> None:
-    encoded = encode_control_message(_new_text_health_update())
-    envelope = cast('dict[str, object]', json.loads(encoded[4:]))
-    payload = cast('dict[str, object]', envelope['payload'])
-    if index is None:
-        record = cast('dict[str, object]', payload[collection])
-    else:
-        records = cast('list[dict[str, object]]', payload[collection])
-        record = records[index]
-    record[field_name] = 7
-    body = json.dumps(envelope, separators=(',', ':')).encode()
-
-    with pytest.raises(_FrameError, match=r'health.*invalid'):
-        _decode_control_message(struct.pack('!I', len(body)) + body)
-
-
 @pytest.mark.parametrize('ordering', ['eager', 'strict'])
 def test_joined_client_queue_pauses_and_resumes_socket_reads(
     ordering: Literal['eager', 'strict'],
@@ -4759,6 +5262,8 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=30.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     identity = LiveJoinIdentity(
         site='main',
@@ -4802,7 +5307,7 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
         '_modify_peer',
         _source_owner_guard(
             original_modify_peer,
-            source_thread._owner_ident,
+            source_thread.owner_ident,
         ),
     )
 
@@ -4810,7 +5315,7 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
     second = EventDelivery(EncodedEvent.from_event_frame(62, encode_event(_event(62))))
     with server:
         _install_grant(server, 'group-a')
-        source_thread._start()
+        source_thread.start()
         try:
             client.connect()
             channel = GroupChannel(
@@ -4828,7 +5333,7 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
                 attempt_token=_ATTEMPT_ID,
             )
             assert client.request(JoinRequest(attempt), channel) == JoinTarget(identity)
-            source_thread._call(
+            source_thread.call(
                 lambda: _offer_joined_messages(
                     remotes[0],
                     ordering,
@@ -4837,11 +5342,12 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
                 )
             )
 
-            for _ in range(100):
+            while True:
                 client.poll(0.001)
                 if channel.status.queued_count == 1:
                     break
             assert channel.status.queued_count == 1
+            # Negative observation: a full lane must remain attached at every speed.
             for _ in range(20):
                 assert client.poll(0.001) == 0
                 assert client.connected
@@ -4856,7 +5362,7 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
             assert channel.status.queued_bytes == first.byte_count
             assert channel.drain() == (first,)
 
-            for _ in range(100):
+            while True:
                 client.poll(0.001)
                 if channel.status.queued_count == 1:
                     break
@@ -4864,7 +5370,7 @@ def test_joined_client_queue_pauses_and_resumes_socket_reads(
             assert channel.drain() == (second,)
         finally:
             client.close()
-            source_thread._close()
+            source_thread.close()
 
 
 @pytest.mark.parametrize(
@@ -4889,15 +5395,15 @@ def test_raw_frame_reader_handoff_preserves_unread_next_frame(
     remaining = request_frame[split_at:]
     authentication_reader = factory(max_frame_bytes=_MAX_FRAME_BYTES)
 
-    assert authentication_reader._feed(
+    assert authentication_reader.feed(
         authentication_frame + unread,
         frame_limit=1,
     ) == (authentication,)
-    assert authentication_reader._handoff() == unread
-    assert authentication_reader._handoff() == b''
+    assert authentication_reader.handoff() == unread
+    assert authentication_reader.handoff() == b''
 
     normal_reader = factory(max_frame_bytes=_MAX_FRAME_BYTES)
-    decoded = normal_reader._feed(unread) + normal_reader._feed(remaining)
+    decoded = normal_reader.feed(unread) + normal_reader.feed(remaining)
     assert decoded == (request,)
 
 
@@ -4907,9 +5413,7 @@ def test_worker_available_batch_yields_buffered_frame_before_snapshot_error(
     sender, receiver = socket.socketpair()
     with (
         sender,
-        closing(
-            WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES, send_deadline_secs=1)
-        ) as control,
+        closing(WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES)) as control,
     ):
         first, second = StopCommand(reason='first'), StopCommand(reason='second')
         sender.sendall(encode_control_message(first) + encode_control_message(second))
@@ -4938,35 +5442,42 @@ def test_worker_control_concurrent_partial_sends_keep_complete_frames() -> None:
     parent = WorkerControl(
         parent_socket,
         max_frame_bytes=_MAX_FRAME_BYTES,
-        send_deadline_secs=1.0,
     )
     child = WorkerControl(
         child_socket,
         max_frame_bytes=_MAX_FRAME_BYTES,
-        send_deadline_secs=1.0,
     )
     vars(parent)['_socket'] = _SpuriousShortSendSocket(parent_socket, chunk_bytes=113)
+    send_lock = parent._send_lock
+
+    def acquire(*, timeout: float) -> bool:
+        del timeout
+        return send_lock.acquire()
+
+    # This test protects serialization; the deadline test separately checks lock budgets.
+    vars(parent)['_send_lock'] = SimpleNamespace(acquire=acquire, release=send_lock.release)
+
     received: list[StopCommand] = []
     failures: list[BaseException] = []
 
     def receive_messages() -> None:
         try:
-            received.extend(cast('StopCommand', child.receive(timeout=1.0)) for _ in range(2))
+            received.extend(cast('StopCommand', receive_control(child)) for _ in range(2))
         except (EOFError, _FrameError, TimeoutError, TypeError, ValueError) as error:
             failures.append(error)
 
     receiver = threading.Thread(target=receive_messages)
     senders = (
-        threading.Thread(target=parent.send, args=(first,)),
-        threading.Thread(target=parent.send, args=(second,)),
+        threading.Thread(target=parent.send, args=(first,), kwargs={'deadline_secs': 1.0}),
+        threading.Thread(target=parent.send, args=(second,), kwargs={'deadline_secs': 1.0}),
     )
     try:
         receiver.start()
         for sender in senders:
             sender.start()
         for sender in senders:
-            sender.join(2.0)
-        receiver.join(2.0)
+            sender.join()
+        receiver.join()
 
         assert not failures
         assert not receiver.is_alive()
@@ -4989,7 +5500,6 @@ def test_worker_control_honors_configured_limit_above_16_mib() -> None:
     control = WorkerControl(
         parent_socket,
         max_frame_bytes=max_frame_bytes,
-        send_deadline_secs=5.0,
     )
     errors: list[OSError] = []
 
@@ -5001,26 +5511,28 @@ def test_worker_control_honors_configured_limit_above_16_mib() -> None:
 
     sender = threading.Thread(target=send_frame)
     try:
-        child_socket.settimeout(5.0)
+        child_socket.settimeout(None)
         sender.start()
-        assert control.receive(timeout=5.0) == message
-        sender.join(5.0)
+        assert receive_control(control) == message
+        sender.join()
         assert not sender.is_alive()
         assert not errors
     finally:
         control.close()
         child_socket.close()
-        sender.join(5.0)
+        sender.join()
 
 
-def test_worker_control_partial_receive_survives_timeout_and_spurious_read() -> None:
+def test_worker_control_partial_receive_survives_timeout_and_spurious_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _advance_transport_waits(monkeypatch, step=0.001)
     message = StopCommand(reason='partial-receive')
     frame = encode_control_message(message)
     parent_socket, child_socket = socket.socketpair()
     control = WorkerControl(
         parent_socket,
         max_frame_bytes=_MAX_FRAME_BYTES,
-        send_deadline_secs=1.0,
     )
     vars(control)['_socket'] = _SpuriousRecvSocket(parent_socket)
     try:
@@ -5029,7 +5541,7 @@ def test_worker_control_partial_receive_survives_timeout_and_spurious_read() -> 
             control.receive(timeout=0.02)
 
         child_socket.sendall(frame[7:])
-        assert control.receive(timeout=1.0) == message
+        assert receive_control(control) == message
         assert parent_socket.getblocking() is False
     finally:
         control.close()
@@ -5039,44 +5551,25 @@ def test_worker_control_partial_receive_survives_timeout_and_spurious_read() -> 
 @pytest.mark.parametrize('operation', ['receive', 'send'])
 def test_worker_control_persistent_spurious_readiness_keeps_deadline(
     operation: Literal['receive', 'send'],
+    monkeypatch: pytest.MonkeyPatch,
+    stall_detectors: StallDetectors,
 ) -> None:
+    if operation == 'send':
+        stall_detectors.enable('control')
+    clock = _advance_transport_waits(monkeypatch)
     parent_socket, child_socket = socket.socketpair()
-    control = WorkerControl(
-        parent_socket,
-        max_frame_bytes=_MAX_FRAME_BYTES,
-        send_deadline_secs=0.05,
-    )
+    control = WorkerControl(parent_socket, max_frame_bytes=_MAX_FRAME_BYTES)
     if operation == 'receive':
         child_socket.sendall(b'x')
     vars(control)['_socket'] = _AlwaysBlockingSocket(parent_socket)
-    errors: list[Exception] = []
-    returned = threading.Event()
-
-    def operate() -> None:
-        try:
-            if operation == 'send':
-                control.send(StopCommand(reason='persistent-spurious-write'))
-            else:
-                control.receive(timeout=0.05)
-        except (EOFError, OSError, ValueError) as error:
-            errors.append(error)
-        else:
-            returned.set()
-
-    started = time.monotonic()
-    thread = threading.Thread(target=operate)
-    thread.start()
-    thread.join(0.55)
-    elapsed = time.monotonic() - started
-    if thread.is_alive():
-        control.close()
-        thread.join(1.0)
     try:
-        assert not thread.is_alive()
-        assert not returned.is_set()
-        assert len(errors) == 1
-        assert isinstance(errors[0], TimeoutError)
-        assert elapsed < 0.55
+        if operation == 'send':
+            with pytest.raises(TimeoutError):
+                control.send(StopCommand(reason='persistent-spurious-write'), deadline_secs=0.05)
+        else:
+            with pytest.raises(TimeoutError):
+                control.receive(timeout=0.05)
+        assert clock[0] == pytest.approx(10.05)
     finally:
         control.close()
         child_socket.close()
@@ -5089,11 +5582,11 @@ def test_client_close_attempts_all_detached_resources(tmp_path: Path, fault: int
 
     class Resource:
         def __init__(self, index: int) -> None:
-            self.index = index
+            self._index = index
 
         def close(self) -> None:
-            attempts.append(self.index)
-            if self.index == fault:
+            attempts.append(self._index)
+            if self._index == fault:
                 raise failure
 
     client = EventClient(
@@ -5107,6 +5600,8 @@ def test_client_close_attempts_all_detached_resources(tmp_path: Path, fault: int
         queue_max_bytes=262_144,
         coordination_deadline_secs=1.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     names = ('_selector', '_coordination_selector', '_socket', '_coordination_socket')
     vars(client).update(zip(names, (Resource(i) for i in range(4)), strict=True))
@@ -5201,18 +5696,20 @@ def test_server_close_attempts_siblings_after_peer_cleanup_failure(
         queue_max_bytes=_QUEUE_BYTES,
         coordination_deadline_secs=1.0,
         stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.1,
     )
     server.start()
     _install_grant(server, 'group-a')
     client.connect()
-    for _ in range(100):
+    while True:
         server.poll(0.001)
         if server._connected_groups:
             break
     assert server._connected_groups == ('group-a',)
     peers = tuple(vars(server)['_peers'].values())
     assert len(peers) == 2
-    sockets = tuple(peer._socket for peer in peers)
+    sockets = tuple(peer.socket for peer in peers)
     selector = vars(server)['_selector']
     failure = OSError('peer cleanup failed')
     attempts: list[str] = []
@@ -5233,7 +5730,7 @@ def test_server_close_attempts_siblings_after_peer_cleanup_failure(
     if fault == 'unregister':
         vars(server)['_selector'] = SimpleNamespace(unregister=unregister, close=selector.close)
     else:
-        peers[0]._socket = Socket()
+        peers[0].socket = Socket()
     try:
         with pytest.raises(OSError, match='peer cleanup failed') as caught:
             server.close()
@@ -5242,7 +5739,7 @@ def test_server_close_attempts_siblings_after_peer_cleanup_failure(
         assert not vars(server)['_peers']
         assert server._connected_groups == ()
         assert not path.exists()
-        assert vars(server)['_connection_fences']['group-a']._retired
+        assert vars(server)['_connection_fences']['group-a'].retired
         assert list(vars(server)['_lost_groups']) == ['group-a']
     finally:
         client.close()
@@ -5258,7 +5755,7 @@ def test_server_close_attempts_siblings_after_peer_cleanup_failure(
 @pytest.mark.parametrize(
     ('decoder', 'field_name', 'attribute_name'),
     [
-        ('_decode_auth_body', 'role', '_role'),
+        ('_decode_auth_body', 'role', 'role'),
         ('_decode_join_control', 'action', 'action'),
         ('_decode_attempt', 'join_kind', 'join_kind'),
         ('_decode_bootstrap_request', 'start_mode', 'start_mode'),
@@ -5306,10 +5803,14 @@ def test_event_server_rejects_malformed_auth_then_services_valid_peer(
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as malformed:
             malformed.connect(os.fspath(path))
             malformed.sendall(struct.pack('!I', len(body)) + body)
-            for _ in range(10):
+            malformed.settimeout(0.0)
+            while True:
                 server.poll(0.001)
-            malformed.settimeout(1.0)
-            assert malformed.recv(1) == b''
+                try:
+                    assert malformed.recv(1) == b''
+                except BlockingIOError:
+                    continue
+                break
         client = EventClient(
             path=path,
             source='events',
@@ -5321,6 +5822,8 @@ def test_event_server_rejects_malformed_auth_then_services_valid_peer(
             queue_max_bytes=_QUEUE_BYTES,
             coordination_deadline_secs=30.0,
             stop=threading.Event(),
+            wait_phase=nullcontext,
+            wait_slice_secs=0.1,
         )
         try:
             client.connect()
@@ -5329,9 +5832,7 @@ def test_event_server_rejects_malformed_auth_then_services_valid_peer(
             assert remote.offer(
                 EventDelivery(EncodedEvent.from_event_frame(21, encode_event(_event(21))))
             )
-            for _ in range(10):
-                server.poll(0.001)
-                client.poll(0.001)
+            _pump(server, (client,), (channel,))
             (delivered,) = channel.drain()
             assert isinstance(delivered, EventDelivery)
             assert delivered.encoded.event_id == 21
@@ -5339,72 +5840,13 @@ def test_event_server_rejects_malformed_auth_then_services_valid_peer(
             client.close()
 
 
-@pytest.mark.parametrize('kind', ['capacity', 'ordering'])
-def test_strict_control_envelopes_keep_exact_fields_and_shared_values(kind: str) -> None:
-    identity = LiveJoinIdentity(
-        site='main',
-        source='events',
-        group='group-a',
-        join_kind='strict',
-        source_generation='source-1',
-        group_generation=1,
-        boundary=20,
-        attempt_token=_ATTEMPT_ID,
-    )
-    control = (
-        StrictCapacityControl(identity=identity, abort_limit=4)
-        if kind == 'capacity'
-        else StrictOrderingControl(
-            identity=identity, event_id=21, last_delivered_id=20, delivery_floor=20, action='skip'
-        )
-    )
-    frame = _encode_fanout_message(control)
-    fanout = cast('dict[str, object]', json.loads(frame._header)['metadata'])
-    acknowledge = {**fanout, 'control_kind': kind, 'request_id': 1}
-    decode_ack = cast(
-        'Callable[[dict[str, object], LiveJoinIdentity], object]',
-        vars(ipc_module)['_decode_join_control'],
-    )
-    decode_fanout = cast(
-        'Callable[[dict[str, object]], object]', vars(ipc_module)[f'_decode_strict_{kind}']
-    )
-    assert decode_ack(acknowledge, identity) == decode_fanout(fanout) == control
-    with pytest.raises(_FrameError, match='fields'):
-        decode_fanout(acknowledge)
-    with pytest.raises(_FrameError, match='kind conflicts'):
-        decode_ack(fanout, identity)
-    for key in ('request_id', 'control_kind'):
-        with pytest.raises(_FrameError, match='fields'):
-            decode_fanout({**fanout, key: acknowledge[key]})
-    invalid_fields = (
-        [('abort_limit', 0), ('abort_limit', True)]
-        if kind == 'capacity'
-        else [
-            ('event_id', 0),
-            ('event_id', True),
-            ('delivery_floor', -1),
-            ('delivery_floor', True),
-            ('last_delivered_id', -1),
-            ('last_delivered_id', True),
-        ]
-    )
-    for field_name, invalid in invalid_fields:
-        with pytest.raises(_FrameError) as ack_error:
-            decode_ack({**acknowledge, field_name: invalid}, identity)
-        with pytest.raises(_FrameError) as fanout_error:
-            decode_fanout({**fanout, field_name: invalid})
-        assert str(ack_error.value) == str(fanout_error.value)
-
-
 @pytest.mark.parametrize(
     ('component', 'field_name', 'invalid'),
     [
         ('worker', 'monitor_alive', 'false'),
-        ('worker', 'breaker_open', 'false'),
         ('worker', 'site', 1),
         ('worker', 'worker_id', []),
         ('worker', 'spawn_instance', {}),
-        ('worker', 'breaker_reason', 1),
         ('worker', 'watchdog_failure', False),
         ('worker', 'heartbeat_at', True),
         ('worker', 'heartbeat_age', '10'),
@@ -5414,11 +5856,6 @@ def test_strict_control_envelopes_keep_exact_fields_and_shared_values(kind: str)
         ('worker', 'thread_names', 'thread'),
         ('worker', 'thread_names', [1]),
         ('worker', 'stuck_threads', [dict[str, object]()]),
-        ('worker', 'source_outages', [['events']]),
-        ('worker', 'source_outages', [['events', 'failed', 'extra']]),
-        ('worker', 'source_outages', ['xy']),
-        ('worker', 'source_outages', [[1, 'failed']]),
-        ('worker', 'source_outages', [['events', None]]),
         ('watchdogs', 'kind', []),
         ('watchdogs', 'kind', {}),
         ('watchdogs', 'kind', 'invalid'),
@@ -5446,6 +5883,7 @@ def test_strict_control_envelopes_keep_exact_fields_and_shared_values(kind: str)
         ('sources', 'source', 1),
         ('sources', 'stream_incarnation', False),
         ('sources', 'last_error', 1),
+        ('sources', 'overdue_reason', 7),
         ('sources', 'frontier', True),
         ('sources', 'retry_attempt', True),
         ('sources', 'audit_count', True),
@@ -5474,6 +5912,7 @@ def test_strict_control_envelopes_keep_exact_fields_and_shared_values(kind: str)
         ('groups', 'group', 1),
         ('groups', 'status', []),
         ('groups', 'failure_text', 1),
+        ('groups', 'overdue_reason', 7),
         ('groups', 'cursor', True),
         ('groups', 'current_event_id', True),
         ('groups', 'delivery_attempt', 1.5),
@@ -5565,17 +6004,17 @@ def test_connected_group_health_statuses_visit_each_peer_once(
             _channel, remote = _join_client(server, clients[0], group=groups[0])
             remote.detach('source-disconnected')
             statuses = server.connected_group_statuses()
-            detached = next(item for item in statuses if item._group == groups[0])
-            assert not detached._connected
+            detached = next(item for item in statuses if item.group == groups[0])
+            assert not detached.connected
             assert len(statuses) == group_count
 
             clients[0].close()
             _service_event_server_until(
                 server,
-                lambda: not server._group_status(groups[0])._connected,
+                lambda: not server._group_status(groups[0]).connected,
             )
             statuses = server.connected_group_statuses()
-            assert groups[0] not in tuple(item._group for item in statuses)
+            assert groups[0] not in tuple(item.group for item in statuses)
             server.install_grant(
                 ipc_module.EventPeerGrant(
                     source='events',
@@ -5585,11 +6024,523 @@ def test_connected_group_health_statuses_visit_each_peer_once(
                 )
             )
             statuses = server.connected_group_statuses()
-            assert tuple(item._group for item in statuses) == tuple(sorted(groups[2:]))
-            assert all(item._connected for item in statuses)
+            assert tuple(item.group for item in statuses) == tuple(sorted(groups[2:]))
+            assert all(item.connected for item in statuses)
         finally:
             for client in clients:
                 client.close()
+
+
+@pytest.mark.parametrize('reason', ['queue-count-exhausted', 'channel-closed'])
+def test_peer_detach_frame_raises_detached_with_its_reason(tmp_path: Path, reason: str) -> None:
+    client = _event_client(tmp_path / 'event.sock')
+    channel = GroupChannel(group='group-a', ordering='eager', max_events=2, max_bytes=10000)
+    channel.activate(provisional=True)
+    client._join_channel = channel
+    try:
+        with pytest.raises(JoinProtocolError) as caught:
+            client._queue_reply((ipc_module._PeerDetach(reason),))
+        assert type(caught.value).__name__ == 'LiveChannelDetachedError'
+        assert getattr(caught.value, 'reason', None) == reason
+        assert channel.status.reason == reason
+        assert not client.connected
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('peer_state', ['live', 'empty-eof', 'buffered-eof'])
+def test_accepted_peer_setup_error_closes_socket_and_only_discards_dead_peers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    peer_state: str,
+) -> None:
+    path = _socket_path(tmp_path)
+    accepted: list[socket.socket] = []
+    error = OSError(errno.EINVAL, 'accepted peer buffer setup failed')
+
+    def failed_buffers(sock: socket.socket, _requested: int) -> SocketBufferSizes:
+        accepted.append(sock)
+        raise error
+
+    with (
+        EventServer(
+            path=path,
+            source='events',
+            max_frame_bytes=_MAX_FRAME_BYTES,
+            queue_max_entries=2,
+            queue_max_bytes=_QUEUE_BYTES,
+        ) as server,
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client,
+    ):
+        client.connect(str(path))
+        if peer_state == 'buffered-eof':
+            client.sendall(b'\x00\x00\x00\x02{}')
+        if peer_state != 'live':
+            client.close()
+        monkeypatch.setattr(ipc_module, '_request_socket_buffers', failed_buffers)
+        try:
+            if peer_state != 'live':
+                server.poll(0)
+            else:
+                with pytest.raises(OSError, match='accepted peer buffer setup failed') as caught:
+                    server.poll(0)
+                assert caught.value is error
+            assert len(accepted) == 1
+            assert accepted[0].fileno() == -1
+            assert not server._peers
+        finally:
+            for sock in accepted:
+                sock.close()
+
+
+@pytest.mark.parametrize('probe_error', [None, OSError(errno.ENOBUFS, 'probe failed')])
+def test_accepted_peer_probe_preserves_original_setup_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_error: OSError | None,
+) -> None:
+    original = OSError(errno.EINVAL, 'original setup error')
+    connected = Mock()
+    connected.send.side_effect = probe_error
+    server = EventServer(
+        path=_socket_path(tmp_path),
+        source='events',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+    )
+    server._listener = cast('socket.socket', SimpleNamespace(accept=lambda: (connected, '')))
+    server._selector = Mock()
+
+    def failed_buffers(_sock: socket.socket, _requested: int) -> SocketBufferSizes:
+        raise original
+
+    monkeypatch.setattr(ipc_module, '_request_socket_buffers', failed_buffers)
+    with pytest.raises(OSError, match='original setup error') as caught:
+        server._accept()
+    assert caught.value is original
+    connected.close.assert_called_once_with()
+    assert not server._peers
+
+
+@pytest.mark.parametrize(('health_interval', 'shutdown'), [(0.01, 0.25), (0.05, 0.008)])
+def test_rpc_poll_keeps_real_watchdog_fresh_and_obeys_shutdown_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    health_interval: float,
+    shutdown: float,
+) -> None:
+    now = [10.0]
+    polls: list[float] = []
+    expired: list[bool] = []
+    detached: list[str] = []
+    phase_identity = 'rpc-phase'
+    watchdog = ComponentWatchdog(
+        kind='lane',
+        identity='group-a',
+        worker_instance='dependent-1',
+        registration_token=phase_identity,
+        startup_deadline_secs=1.0,
+        clock=lambda: now[0],
+    )
+
+    @contextmanager
+    def wait_phase() -> Generator[None]:
+        with watchdog.watch(
+            'idle', deadline_at=now[0] + health_interval + watchdog_grace_secs(health_interval)
+        ):
+            yield
+
+    client = EventClient(
+        path=tmp_path / 'event.sock',
+        source='events',
+        group='group-a',
+        spawn_instance='dependent-1',
+        capability='secret',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+        coordination_deadline_secs=0.235,
+        stop=threading.Event(),
+        wait_phase=wait_phase,
+        wait_slice_secs=min(health_interval, shutdown_slice_secs(shutdown)),
+    )
+    client._coordination_socket = cast('socket.socket', object())
+
+    def poll(timeout: float) -> None:
+        sample = watchdog.sample()
+        assert sample.phase == 'idle'
+        assert sample.deadline_at is not None
+        polls.append(timeout)
+        now[0] += timeout
+        expired.append(now[0] >= sample.deadline_at)
+
+    def detach(reason: str) -> None:
+        detached.append(reason)
+        client._coordination_socket = None
+
+    monkeypatch.setattr(client, '_poll_coordination', poll)
+    monkeypatch.setattr(client, '_set_coordination_interest', lambda: None)
+    monkeypatch.setattr(client, '_detach', detach)
+    monkeypatch.setattr(ipc_module.time, 'monotonic', lambda: now[0])
+    with watchdog.watch('internal', deadline_at=10.1):
+        with pytest.raises(ConnectionError, match='event coordination reply timed out'):
+            client.observe_group(
+                GroupBootstrapRequest(
+                    source='events', group='group-a', group_generation=7, start_mode='initialize'
+                )
+            )
+        assert watchdog.sample().deadline_at == pytest.approx(10.335)
+    assert not any(expired)
+    assert max(polls) <= min(health_interval, shutdown_slice_secs(shutdown))
+    assert now[0] == pytest.approx(10.235)
+    assert detached == ['coordination-reply-timeout']
+
+
+@pytest.mark.parametrize('dead_peer', [False, True])
+def test_accepted_peer_close_failure_preserves_setup_error_and_is_not_discarded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dead_peer: bool,
+) -> None:
+    original = OSError(errno.EINVAL, 'original setup error')
+    cleanup = OSError(errno.EBADF, 'accepted socket close failed')
+    connected = Mock()
+    connected.send.side_effect = BrokenPipeError() if dead_peer else None
+    connected.close.side_effect = cleanup
+    server = EventServer(
+        path=_socket_path(tmp_path),
+        source='events',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+    )
+    server._listener = cast('socket.socket', SimpleNamespace(accept=lambda: (connected, '')))
+    server._selector = Mock()
+
+    def failed_buffers(_sock: socket.socket, _requested: int) -> SocketBufferSizes:
+        raise original
+
+    monkeypatch.setattr(ipc_module, '_request_socket_buffers', failed_buffers)
+    with pytest.raises(OSError, match='original setup error') as caught:
+        server._accept()
+    assert caught.value is original
+    assert caught.value.__notes__ == [f'accepted socket cleanup failure: {cleanup!r}']
+    connected.close.assert_called_once_with()
+    assert not server._peers
+
+
+@pytest.mark.parametrize('operation', ['connect-timeout', 'connect-backlog', 'authentication'])
+def test_event_client_connection_retries_slices_without_repeating_sent_authentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    clock = [10.0]
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    attempts = 0
+    writes: list[bytes] = []
+
+    def connect(timeout: float | None) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1 and operation.startswith('connect'):
+            assert timeout is not None
+            if operation == 'connect-backlog':
+                raise BlockingIOError(errno.EAGAIN, 'backlog full')
+            clock[0] += timeout
+            raise TimeoutError
+
+    def send(data: memoryview, timeout: float | None) -> int:
+        writes.append(bytes(data))
+        if operation == 'authentication':
+            if len(writes) == 1:
+                return 7
+            if len(writes) == 2:
+                assert timeout is not None
+                clock[0] += timeout
+                raise TimeoutError
+        return len(data)
+
+    sockets = (
+        _ScriptedStartupSocket(
+            socket.socket(socket.AF_UNIX), connect_action=connect, send_action=send
+        ),
+        _ScriptedStartupSocket(socket.socket(socket.AF_UNIX)),
+    )
+    scripted = deque(sockets)
+
+    def socket_factory(*_args: object) -> _ScriptedStartupSocket:
+        return scripted.popleft()
+
+    monkeypatch.setattr(ipc_module.socket, 'socket', socket_factory)
+    client = EventClient(
+        path=_socket_path(tmp_path),
+        source='events',
+        group='group',
+        spawn_instance='spawn',
+        capability='cap',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+        coordination_deadline_secs=0.2,
+        stop=threading.Event(),
+        wait_phase=nullcontext,
+        wait_slice_secs=0.01,
+    )
+    try:
+        client.connect()
+        assert client.connected
+        if operation == 'authentication':
+            assert writes[1:] == [writes[0][7:], writes[0][7:]]
+        else:
+            assert attempts == 2
+    finally:
+        client.close()
+        sockets[0].close()
+        sockets[1].close()
+
+
+@contextmanager
+def _outbox_pair() -> Generator[tuple[WorkerControlOutbox, WorkerControl, socket.socket]]:
+    sender, receiver = socket.socketpair()
+    with (
+        closing(WorkerControl(sender, max_frame_bytes=_MAX_FRAME_BYTES)) as control,
+        closing(WorkerControl(receiver, max_frame_bytes=_MAX_FRAME_BYTES)) as peer,
+    ):
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        yield ipc_module.WorkerControlOutbox(control), peer, sender
+
+
+def test_outbox_abandons_a_started_frame_at_the_shutdown_deadline() -> None:
+    with _outbox_pair() as (outbox, peer, _sender):
+        transport = Mock(wraps=outbox._control.open_socket())
+        vars(outbox._control)['_socket'] = transport
+        outbox.offer_health(_large_outbox_health(1))
+        outbox.write_available()
+        assert not list(peer.receive_available())
+        outbox.abandon()
+        transport.send.reset_mock()
+        outbox.enqueue(StopCommand(reason='must-not-write'))
+        outbox.offer_health(_large_outbox_health(2))
+        outbox.write_available()
+        transport.send.assert_not_called()
+        assert not list(peer.receive_available())
+
+
+def test_outbox_delivers_only_the_newest_of_three_samples_under_backpressure() -> None:
+    with _outbox_pair() as (outbox, peer, _sender):
+        first = _large_outbox_health(1)
+        outbox.offer_health(first)
+        outbox.write_available()
+        assert not list(peer.receive_available())
+        for sample in (2, 3, 4):
+            outbox.offer_health(_large_outbox_health(sample))
+        assert _drain_outbox(outbox, peer, 2) == [first, _large_outbox_health(4)]
+
+
+def test_outbox_replaces_a_sample_when_no_byte_could_start() -> None:
+    with _outbox_pair() as (outbox, peer, sender):
+        with suppress(BlockingIOError):
+            while True:
+                sender.send(b'x' * 4096)
+        outbox.offer_health(_large_outbox_health(1))
+        outbox.write_available()
+        ready = ipc_module.SourceEndpointReady(
+            source='events', source_generation='generation-1', path='/source.sock'
+        )
+        outbox.enqueue(ready)
+        outbox.offer_health(_large_outbox_health(2))
+        receiver = peer.open_socket()
+        with suppress(BlockingIOError):
+            while receiver.recv(65536):
+                pass
+        assert _drain_outbox(outbox, peer, 2) == [ready, _large_outbox_health(2)]
+
+
+def test_outbox_writes_queued_messages_before_the_pending_health_frame() -> None:
+    with _outbox_pair() as (outbox, peer, _sender):
+        first = _large_outbox_health(1)
+        pending = _large_outbox_health(2)
+        ready = ipc_module.SourceEndpointReady(
+            source='events', source_generation='generation-1', path='/source.sock'
+        )
+        outbox.offer_health(first)
+        outbox.write_available()
+        outbox.enqueue(ready)
+        outbox.offer_health(pending)
+        assert _drain_outbox(outbox, peer, 3) == [first, ready, pending]
+
+
+@pytest.mark.parametrize('waiting', ['empty', 'frame', 'byte', 'queued', 'consumed-partial'])
+def test_worker_control_pending_input_does_not_consume(waiting: str) -> None:
+    parent_socket, child_socket = socket.socketpair()
+    control = WorkerControl(parent_socket, max_frame_bytes=_MAX_FRAME_BYTES)
+    message = StopCommand(reason='pending')
+    frame = encode_control_message(message)
+    try:
+        if waiting == 'queued':
+            child_socket.sendall(frame + frame)
+            assert control.receive(timeout=0) == message
+        elif waiting == 'consumed-partial':
+            child_socket.sendall(frame[:1])
+            assert list(control.receive_available()) == []
+        elif waiting != 'empty':
+            child_socket.sendall(frame if waiting == 'frame' else frame[:1])
+        before = (
+            control.last_arrival_at,
+            bytes(vars(control._reader)['_buffer']),
+            tuple(control._messages),
+        )
+        transport = Mock(wraps=parent_socket)
+        vars(control)['_socket'] = transport
+        assert control.has_pending_input() is (waiting in {'frame', 'byte', 'queued'})
+        assert transport.recv.call_args_list == (
+            [] if waiting == 'queued' else [((1, socket.MSG_PEEK),)]
+        )
+        assert (
+            control.last_arrival_at,
+            bytes(vars(control._reader)['_buffer']),
+            tuple(control._messages),
+        ) == before
+        assert parent_socket.getblocking() is False
+        if waiting in {'frame', 'queued'}:
+            assert control.receive(timeout=0) == message
+        elif waiting == 'byte':
+            assert list(control.receive_available()) == []
+            assert control.last_arrival_at is not None
+            assert not control.has_pending_input()
+            child_socket.sendall(frame[1:])
+            assert control.receive(timeout=0) == message
+        assert not control.has_pending_input()
+    finally:
+        control.close()
+        child_socket.close()
+
+
+@pytest.mark.parametrize('failure', ['eof', 'closed', 'poisoned', 'oserror', 'valueerror'])
+def test_worker_control_pending_input_preserves_transport_failure(failure: str) -> None:
+    parent_socket, child_socket = socket.socketpair()
+    control = WorkerControl(parent_socket, max_frame_bytes=_MAX_FRAME_BYTES)
+    try:
+        if failure == 'eof':
+            child_socket.close()
+        elif failure == 'closed':
+            control.close()
+        elif failure == 'poisoned':
+            control.poison()
+        else:
+            transport = Mock(wraps=parent_socket)
+            transport.recv.side_effect = (
+                OSError('peek failed') if failure == 'oserror' else ValueError('peek failed')
+            )
+            vars(control)['_socket'] = transport
+        with pytest.raises(EOFError):
+            control.has_pending_input()
+        assert control.last_arrival_at is None
+        assert control._socket is None
+        with pytest.raises(EOFError):
+            control.receive(timeout=0)
+    finally:
+        control.close()
+        child_socket.close()
+
+
+@pytest.mark.parametrize('exhaustion', ['connect', 'authentication'])
+def test_connect_cap_with_short_health_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exhaustion: str
+) -> None:
+    now = [10.0]
+    health_interval, shutdown = 0.01, 0.25
+    slices: list[float] = []
+    phases: list[float] = []
+    watchdog = ComponentWatchdog(
+        kind='lane',
+        identity='group-a',
+        worker_instance='dependent-1',
+        registration_token=_ATTEMPT_ID,
+        startup_deadline_secs=1.0,
+        clock=lambda: now[0],
+    )
+
+    @contextmanager
+    def wait_phase() -> Generator[None]:
+        with watchdog.watch(
+            'idle', deadline_at=now[0] + health_interval + watchdog_grace_secs(health_interval)
+        ):
+            yield
+
+    def wait(timeout: float | None) -> None:
+        assert timeout is not None
+        assert now[0] < 11.0
+        assert 0 < timeout <= min(health_interval, shutdown_slice_secs(shutdown), 11.0 - now[0])
+        sample = watchdog.sample()
+        assert sample.phase == 'idle'
+        assert sample.deadline_at is not None
+        phases.append(sample.deadline_at)
+        slices.append(timeout)
+        now[0] = min(11.0, now[0] + timeout)
+        assert now[0] < sample.deadline_at
+
+    def connect_wait(timeout: float | None) -> None:
+        wait(timeout)
+        if exhaustion == 'connect':
+            raise TimeoutError
+
+    def auth_wait(value: memoryview, timeout: float | None) -> int:
+        wait(timeout)
+        if exhaustion == 'authentication':
+            raise TimeoutError
+        return len(value)
+
+    sockets = (
+        _ScriptedStartupSocket(
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM),
+            connect_action=wait,
+            send_action=lambda value, timeout: (wait(timeout), len(value))[1],
+        ),
+        _ScriptedStartupSocket(
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM),
+            connect_action=connect_wait,
+            send_action=auth_wait,
+        ),
+    )
+    scripted = deque(sockets)
+    monkeypatch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: now[0]))
+
+    def socket_factory(_family: int, _kind: int) -> _ScriptedStartupSocket:
+        return scripted.popleft()
+
+    monkeypatch.setattr(ipc_module.socket, 'socket', socket_factory)
+    client = EventClient(
+        path=_socket_path(tmp_path),
+        source='events',
+        group='group-a',
+        spawn_instance='dependent-1',
+        capability='capability-1',
+        max_frame_bytes=_MAX_FRAME_BYTES,
+        queue_max_entries=2,
+        queue_max_bytes=_QUEUE_BYTES,
+        coordination_deadline_secs=0.8,
+        stop=threading.Event(),
+        wait_phase=wait_phase,
+        wait_slice_secs=min(health_interval, shutdown_slice_secs(shutdown)),
+    )
+    now[0] = 10.2
+    try:
+        with pytest.raises(ConnectionError, match='event endpoint connection failed'):
+            client.connect()
+        assert now[0] == 11.0
+        assert sum(slices) == pytest.approx(0.8)
+        assert len(slices) > 2
+        assert all(later > earlier for earlier, later in pairwise(phases))
+        assert not scripted
+        assert all(sock.fileno() == -1 for sock in sockets)
+        assert client._socket is client._coordination_socket is None
+        assert client._selector is client._coordination_selector is None
+        assert not client.connected
+    finally:
+        for sock in sockets:
+            sock.close()
 
 
 def test_worker_control_pretransport_failures_keep_channel_usable() -> None:
@@ -5597,22 +6548,20 @@ def test_worker_control_pretransport_failures_keep_channel_usable() -> None:
     parent = WorkerControl(
         parent_socket,
         max_frame_bytes=256,
-        send_deadline_secs=1.0,
     )
     child = WorkerControl(
         child_socket,
         max_frame_bytes=256,
-        send_deadline_secs=1.0,
     )
     try:
         with pytest.raises(_FrameError, match='exceeds'):
-            parent.send(StopCommand(reason='x' * 512))
+            parent.send(StopCommand(reason='x' * 512), deadline_secs=1.0)
         with pytest.raises((AttributeError, TypeError, ValueError)):
-            parent.send(cast('StopCommand', object()))
+            parent.send(cast('StopCommand', object()), deadline_secs=1.0)
 
         message = StopCommand(reason='still-usable')
-        parent.send(message)
-        assert child.receive(timeout=1.0) == message
+        parent.send(message, deadline_secs=1.0)
+        assert receive_control(child) == message
     finally:
         parent.close()
         child.close()
@@ -5623,12 +6572,11 @@ def test_worker_control_receive_eof_permanently_poisons_channel() -> None:
     parent = WorkerControl(
         parent_socket,
         max_frame_bytes=4_096,
-        send_deadline_secs=1.0,
     )
     child_socket.close()
     try:
         with pytest.raises(EOFError, match='worker control peer closed'):
-            parent.receive(timeout=1.0)
+            receive_control(parent)
         with pytest.raises(EOFError, match='worker control is closed'):
             parent.receive(timeout=0.0)
     finally:
@@ -5641,13 +6589,12 @@ def test_worker_control_rejects_oversized_length_before_body_allocation() -> Non
     control = WorkerControl(
         parent_socket,
         max_frame_bytes=max_frame_bytes,
-        send_deadline_secs=1.0,
     )
     header = struct.pack('!I', max_frame_bytes + 1)
     try:
         child_socket.sendall(header)
         with pytest.raises(_FrameError, match='exceeds configured maximum'):
-            control.receive(timeout=1.0)
+            receive_control(control)
         # A length-only peer is rejected without reserving its advertised body.
         assert vars(vars(control)['_reader'])['_buffer'] == bytearray(header)
     finally:
@@ -5702,7 +6649,7 @@ def test_worker_control_rejects_unrepresentable_conditional_park_timestamp() -> 
     body = json.dumps(envelope, separators=(',', ':')).encode()
     frame = struct.pack('!I', len(body)) + body
     parent_socket, child_socket = socket.socketpair()
-    parent = WorkerControl(parent_socket, max_frame_bytes=4096, send_deadline_secs=1.0)
+    parent = WorkerControl(parent_socket, max_frame_bytes=4096)
     try:
         child_socket.sendall(frame)
 
@@ -5710,33 +6657,36 @@ def test_worker_control_rejects_unrepresentable_conditional_park_timestamp() -> 
             _FrameError,
             match='conditional park directive observation time is invalid',
         ):
-            parent.receive(timeout=1.0)
+            receive_control(parent)
 
         assert vars(parent)['_messages'] == deque()
         child_socket.sendall(encode_control_message(StopCommand(reason='still-closed')))
-        assert parent.receive(timeout=1.0) == StopCommand(reason='still-closed')
+        assert receive_control(parent) == StopCommand(reason='still-closed')
     finally:
         child_socket.close()
         parent.close()
 
 
-def test_worker_control_send_deadline_closes_saturated_channel() -> None:
+def test_worker_control_send_deadline_closes_saturated_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    stall_detectors: StallDetectors,
+) -> None:
+    stall_detectors.enable('control')
+    clock = _advance_transport_waits(monkeypatch)
     message = StopCommand(reason='saturated-' + 'x' * _MAX_FRAME_BYTES)
     frame = encode_control_message(message)
     parent_socket, child_socket = socket.socketpair()
     control = WorkerControl(
         parent_socket,
         max_frame_bytes=len(frame) - 4,
-        send_deadline_secs=0.05,
     )
     parent_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4_096)
     try:
-        started = time.monotonic()
         with pytest.raises(TimeoutError, match='worker control send timed out'):
-            control.send(message)
-        assert time.monotonic() - started < 0.55
+            control.send(message, deadline_secs=0.05)
+        assert clock[0] == pytest.approx(10.05)
         with pytest.raises(EOFError, match='worker control is closed'):
-            control.send(StopCommand(reason='must-not-resume-partial-frame'))
+            control.send(StopCommand(reason='must-not-resume-partial-frame'), deadline_secs=0.05)
         with pytest.raises(EOFError, match='worker control is closed'):
             control.receive(timeout=0.0)
     finally:
@@ -5744,22 +6694,31 @@ def test_worker_control_send_deadline_closes_saturated_channel() -> None:
         child_socket.close()
 
 
-def test_worker_control_send_deadline_includes_lock_contention() -> None:
+def test_worker_control_send_deadline_includes_lock_contention(
+    monkeypatch: pytest.MonkeyPatch,
+    stall_detectors: StallDetectors,
+) -> None:
+    stall_detectors.enable('control')
     parent_socket, child_socket = socket.socketpair()
-    control = WorkerControl(
-        parent_socket,
-        max_frame_bytes=_MAX_FRAME_BYTES,
-        send_deadline_secs=0.05,
-    )
-    send_lock = cast('threading.Lock', vars(control)['_send_lock'])
-    send_lock.acquire()
+    control = WorkerControl(parent_socket, max_frame_bytes=_MAX_FRAME_BYTES)
+    readings = iter((10.0, 10.02))
+    lock = Mock()
+
+    def acquire(*, timeout: float) -> bool:
+        assert timeout == pytest.approx(0.03)
+        return False
+
+    lock.acquire.side_effect = acquire
     try:
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match='worker control send timed out'):
-            control.send(StopCommand(reason='lock-contention'))
-        assert time.monotonic() - started < 0.55
+        with monkeypatch.context() as patch:
+            patch.setattr(ipc_module, 'time', SimpleNamespace(monotonic=lambda: next(readings)))
+            patch.setattr(control, '_send_lock', lock)
+            with pytest.raises(TimeoutError, match='worker control send timed out'):
+                control.send(StopCommand(reason='lock-contention'), deadline_secs=0.05)
+        lock.acquire.assert_called_once()
+        lock.release.assert_not_called()
+        with pytest.raises(EOFError, match='worker control is closed'):
+            control.send(StopCommand(reason='closed-after-contention'), deadline_secs=0.05)
     finally:
-        send_lock.release()
         child_socket.close()
-    with pytest.raises(EOFError, match='worker control is closed'):
-        control.send(StopCommand(reason='closed-after-contention'))
+        control.close()

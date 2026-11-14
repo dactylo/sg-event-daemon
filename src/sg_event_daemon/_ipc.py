@@ -1,11 +1,9 @@
 """Closed local worker-control and event IPC protocols."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import errno
-import json
+import logging
 import os
 import selectors
 import socket
@@ -16,7 +14,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from math import isfinite
@@ -36,6 +34,7 @@ from typing import (
 from ._event_frame import (
     EVENT_SCHEMA,
     EVENT_VERSION,
+    IPC_LENGTH_BYTES,
     encode_event_header,
     event_frame_bytes,
 )
@@ -47,7 +46,6 @@ from ._fanout import (
     FanoutStatus,
     GroupChannelInterface,
     RangeChanged,
-    StrictCapacityControl,
     StrictOrderingControl,
     strict_control_metadata,
 )
@@ -68,6 +66,7 @@ from ._health import (
     looks_secret,
 )
 from ._identity import canonical_bytes
+from ._json import decode_json
 from ._platform import (
     FILE_MODE,
     SecurityError,
@@ -88,6 +87,7 @@ from ._source import (
     JoinRequest,
     JoinRetry,
     JoinTarget,
+    LiveChannelDetachedError,
     SourceHealth,
 )
 from ._watchdog import GROUP_PHASES, SOURCE_WATCHDOG_PHASES, WATCHDOG_KINDS, WATCHDOG_PHASES
@@ -102,7 +102,7 @@ if TYPE_CHECKING:
 _JoinValue: TypeAlias = """(
     GroupBootstrapRequest | JoinAbort | JoinConfirm |
     JoinFinalize | JoinRequest |
-    StrictCapacityControl | StrictOrderingControl
+    StrictOrderingControl
 )"""
 
 _AUTH_SCHEMA = 'sg-event-daemon-event-auth'
@@ -137,18 +137,18 @@ _EVENT_KINDS = frozenset(
         'join-reply',
         'join-request',
         'range-changed',
-        'strict-capacity',
         'strict-ordering',
     }
 )
 _EVENT_SOCKET_UMASK_LOCK = threading.Lock()
-_LENGTH_BYTES = 4
 _MAX_AUTH_FRAME_BYTES = 65_536
 _MAX_BOOTSTRAP_RETRY_SECS = 60.0
 _PAIR_LENGTH = 2
 
 # IPC matches affixes in structured health keys and includes capability;
 # logging and control reject exact names, including auth and plural forms.
+OUTCOME_KEY = 'outcome'
+OUTCOME_UNKNOWN = 'unknown'
 _SECRET_KEY_TERMS = frozenset(
     {'api_key', 'apikey', 'capability', 'credential', 'password', 'secret', 'token'}
 )
@@ -196,12 +196,13 @@ class ActiveSourceGroupAssignment:
                 not an exact nonnegative integer, or `start_mode` is neither
                 `initialize` nor `resume`.
         """
-        if not self.source or not self.group:
-            raise ValueError('source group assignment identity must not be empty')
-        if type(self.group_generation) is not int or self.group_generation < 0:
-            raise ValueError('source group assignment generation is invalid')
-        if not is_start_mode(self.start_mode):
-            raise ValueError('source group assignment start mode is invalid')
+        _validate_group_identity(
+            self.source,
+            self.group,
+            self.group_generation,
+            self.start_mode,
+            context='source group assignment',
+        )
 
 
 @dataclass(frozen=True)
@@ -220,7 +221,7 @@ class CommandResult:
     result: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        """Validate fields and redact secret-looking result text.
+        """Validate fields, redact secret-looking messages, and reject secret-looking results.
 
         Raises:
             TypeError: `ok` is not an exact boolean, a result mapping has
@@ -284,12 +285,13 @@ class DeliveryGroupAssignment:
                 `initialize` nor `resume`, or the directive conflicts with the
                 assigned group or generation.
         """
-        if not self.source or not self.group:
-            raise ValueError('group assignment identity must not be empty')
-        if type(self.group_generation) is not int or self.group_generation < 0:
-            raise ValueError('group assignment generation is invalid')
-        if not is_start_mode(self.start_mode):
-            raise ValueError('group assignment start mode is invalid')
+        _validate_group_identity(
+            self.source,
+            self.group,
+            self.group_generation,
+            self.start_mode,
+            context='group assignment',
+        )
         directive = cast('object', self.conditional_park)
         if directive is None:
             return
@@ -300,19 +302,14 @@ class DeliveryGroupAssignment:
 
 
 @dataclass(frozen=True)
-class EventConnectionStatus:
-    """Describe one authenticated event peer without retaining bodies.
+class _EventConnectionStatus:
+    """Describe one authenticated event peer without retaining bodies."""
 
-    Attributes:
-        queued_count: Number of queued event frames.
-        queued_bytes: Total bytes in queued event frames.
-    """
-
-    _group: str
-    _connected: bool
+    group: str
+    connected: bool
     queued_count: int
     queued_bytes: int
-    _reason: str | None
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -325,7 +322,12 @@ class EventPeerGrant:
     capability: str
 
     def __post_init__(self) -> None:
-        """Validate complete nonempty grant identity."""
+        """Validate complete nonempty grant identity.
+
+        Raises:
+            ValueError: The source, group, dependent spawn, or capability is
+                empty.
+        """
         if not all(
             (
                 self.source,
@@ -346,7 +348,12 @@ class EventPeerReady:
     dependent_spawn_instance: str
 
     def __post_init__(self) -> None:
-        """Validate complete nonempty acknowledgement identity."""
+        """Validate complete nonempty acknowledgement identity.
+
+        Raises:
+            ValueError: The source, group, or dependent spawn identity is
+                empty.
+        """
         if not all((self.source, self.group, self.dependent_spawn_instance)):
             raise ValueError('event peer ready fields must not be empty')
 
@@ -444,12 +451,13 @@ class GroupBootstrapRequest:
                 not an exact nonnegative integer, or `start_mode` is neither
                 `initialize` nor `resume`.
         """
-        if not self.source or not self.group:
-            raise ValueError('group bootstrap identity must not be empty')
-        if type(self.group_generation) is not int or self.group_generation < 0:
-            raise ValueError('group bootstrap generation is invalid')
-        if not is_start_mode(self.start_mode):
-            raise ValueError('group bootstrap start mode is invalid')
+        _validate_group_identity(
+            self.source,
+            self.group,
+            self.group_generation,
+            self.start_mode,
+            context='group bootstrap',
+        )
 
 
 @dataclass(frozen=True)
@@ -482,14 +490,13 @@ class GroupRecoveryReady:
         if type(self.resulting_revision) is not int or self.resulting_revision < 0:
             raise ValueError('group recovery ready revision is invalid')
         if any(
-            term in value.casefold()
+            looks_secret(value)
             for value in (
                 self.spawn_instance,
                 self.evidence_id,
                 self.site,
                 self.group,
             )
-            for term in _SECRET_VALUE_TERMS
         ):
             raise ValueError('group recovery ready contains secret-looking text')
 
@@ -598,7 +605,12 @@ class SourceEndpointReady:
     path: str
 
     def __post_init__(self) -> None:
-        """Validate complete endpoint bootstrap data."""
+        """Validate complete endpoint bootstrap data.
+
+        Raises:
+            ValueError: The source, source generation, or endpoint path is
+                empty.
+        """
         if not self.source or not self.source_generation or not self.path:
             raise ValueError('source endpoint fields must not be empty')
 
@@ -610,7 +622,11 @@ class StopCommand:
     reason: str
 
     def __post_init__(self) -> None:
-        """Validate the body-free stop reason."""
+        """Validate the body-free stop reason.
+
+        Raises:
+            ValueError: The reason is empty.
+        """
         if not self.reason:
             raise ValueError('stop reason must not be empty')
 
@@ -721,45 +737,45 @@ class WorkerControl:
         sock: socket.socket,
         *,
         max_frame_bytes: int,
-        send_deadline_secs: float,
     ) -> None:
         """Own one permanently nonblocking shared control channel.
 
         Args:
             sock: Connected inherited control socket.
             max_frame_bytes: Positive maximum control frame body bytes.
-            send_deadline_secs: Finite positive complete-operation send
-                deadline in seconds.
 
         Raises:
             ValueError: The socket is not Unix-domain or a bound is invalid.
+            OSError: Configuring the inherited socket or its buffers fails.
         """
         if sock.family != socket.AF_UNIX:
             raise ValueError('worker control requires a Unix socket')
         if max_frame_bytes <= 0:
             raise ValueError('maximum frame bytes must be positive')
-        if not isfinite(send_deadline_secs) or send_deadline_secs <= 0:
-            raise ValueError('worker control send deadline must be finite and positive')
         sock.settimeout(0.0)
-        self._max_frame_bytes = max_frame_bytes
+        self.max_frame_bytes = max_frame_bytes
         self._messages: deque[ControlMessage] = deque()
         self._reader = _RawFrameReader(max_frame_bytes=max_frame_bytes)
         self._send_lock = threading.Lock()
-        self._send_deadline_secs = send_deadline_secs
+        self._last_arrival_at: float | None = None
         self._send_error: OSError | None = None
         self._state_lock = threading.Lock()
         self._socket: socket.socket | None = sock
         self._socket_buffers = _request_socket_buffers(sock, max_frame_bytes)
 
-    def _open_socket(self) -> socket.socket:
-        """Return the open descriptor or fail the poisoned channel."""
+    def open_socket(self) -> socket.socket:
+        """Return the open descriptor or fail the poisoned channel.
+
+        Raises:
+            EOFError: The channel has been closed or poisoned.
+        """
         with self._state_lock:
             sock = self._socket
         if sock is None:
             raise EOFError('worker control is closed')
         return sock
 
-    def _poison(self, *, send_error: OSError | None = None) -> None:
+    def poison(self, *, send_error: OSError | None = None) -> None:
         """Atomically make the channel unusable and close it exactly once."""
         with self._state_lock:
             sock = self._socket
@@ -781,31 +797,32 @@ class WorkerControl:
         for _ in range(queued):
             yield self._messages.popleft()
         if snapshot_error is not None:
-            self._poison()
+            self.poison()
             raise EOFError('worker control is closed') from snapshot_error
         while remaining:
             try:
                 data = sock.recv(min(65_536, remaining))
             except (OSError, ValueError) as error:
-                self._poison()
+                self.poison()
                 raise EOFError('worker control is closed') from error
             if not data:
-                self._poison()
+                self.poison()
                 raise EOFError('worker control peer closed')
+            self._last_arrival_at = time.monotonic()
             remaining -= len(data)
-            bodies = self._reader._feed(data, frame_limit=1)
+            bodies = self._reader.feed(data, frame_limit=1)
             while bodies:
                 yield _decode_control_body(bodies[0])
-                bodies = self._reader._feed(b'', frame_limit=1)
+                bodies = self._reader.feed(b'', frame_limit=1)
         try:
             data = sock.recv(1, socket.MSG_PEEK)
         except BlockingIOError:
             return
         except (OSError, ValueError) as error:
-            self._poison()
+            self.poison()
             raise EOFError('worker control is closed') from error
         if not data:
-            self._poison()
+            self.poison()
             raise EOFError('worker control peer closed')
 
     @staticmethod
@@ -819,7 +836,7 @@ class WorkerControl:
     ) -> None:
         """Wait for advisory readiness within one absolute deadline."""
         timeout_error = (
-            WorkerControlSendTimeoutError if event == selectors.EVENT_WRITE else TimeoutError
+            _WorkerControlSendTimeoutError if event == selectors.EVENT_WRITE else TimeoutError
         )
         while True:
             now = time.monotonic()
@@ -857,7 +874,7 @@ class WorkerControl:
 
     def close(self) -> None:
         """Close the control descriptor idempotently."""
-        self._poison()
+        self.poison()
 
     @classmethod
     def from_fd(
@@ -865,15 +882,12 @@ class WorkerControl:
         fd: int,
         *,
         max_frame_bytes: int,
-        send_deadline_secs: float,
     ) -> Self:
         """Take ownership of one inherited control descriptor.
 
         Args:
             fd: Nonnegative inherited connected Unix socket descriptor.
             max_frame_bytes: Positive maximum control frame body bytes.
-            send_deadline_secs: Finite positive complete-operation send
-                deadline in seconds.
 
         Returns:
             A control channel owning `fd`.
@@ -881,20 +895,52 @@ class WorkerControl:
         Raises:
             ValueError: The descriptor, socket family, or channel bound is
                 invalid.
+            OSError: Opening or configuring the inherited socket or its buffers
+                fails.
         """
         if type(fd) is not int or fd < 0:
             raise ValueError('control descriptor must be nonnegative')
         return cls(
             socket.socket(fileno=fd),
             max_frame_bytes=max_frame_bytes,
-            send_deadline_secs=send_deadline_secs,
         )
+
+    def has_pending_input(self) -> bool:
+        """Check waiting messages or bytes without consuming or refreshing arrival.
+
+        A partial frame already consumed into the decoder is not waiting input.
+        The sole reader may call this between finite receive batches; the probe
+        never waits or changes the socket's permanently nonblocking mode.
+
+        Raises:
+            EOFError: The channel is closed or its receive transport fails.
+        """
+        sock = self.open_socket()
+        if self._messages:
+            return True
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            return False
+        except (OSError, ValueError) as error:
+            self.poison()
+            raise EOFError('worker control is closed') from error
+        if not data:
+            self.poison()
+            raise EOFError('worker control peer closed')
+        return True
+
+    @property
+    def last_arrival_at(self) -> float | None:
+        """Return the monotonic time of the latest receive that consumed bytes."""
+        return self._last_arrival_at
 
     def receive(self, *, timeout: float) -> ControlMessage:
         """Receive one message within one complete-operation deadline.
 
         Args:
-            timeout: Finite nonnegative complete-operation deadline.
+            timeout: Finite nonnegative timeout in seconds for the complete
+                operation.
 
         Returns:
             The next typed control message.
@@ -906,7 +952,7 @@ class WorkerControl:
         """
         if not isfinite(timeout) or timeout < 0:
             raise ValueError('worker control receive timeout must be finite and nonnegative')
-        sock = self._open_socket()
+        sock = self.open_socket()
         if self._messages:
             return self._messages.popleft()
         deadline = time.monotonic() + timeout
@@ -922,18 +968,19 @@ class WorkerControl:
                 )
                 allow_expired_ready = False
                 try:
-                    data = sock.recv(min(65_536, self._max_frame_bytes + _LENGTH_BYTES))
+                    data = sock.recv(min(65_536, self.max_frame_bytes + IPC_LENGTH_BYTES))
                 except BlockingIOError:
                     continue
             except TimeoutError:
                 raise
             except (OSError, ValueError) as error:
-                self._poison()
+                self.poison()
                 raise EOFError('worker control is closed') from error
             if not data:
-                self._poison(send_error=BrokenPipeError('worker control peer closed'))
+                self.poison(send_error=BrokenPipeError('worker control peer closed'))
                 raise EOFError('worker control peer closed')
-            for body in self._reader._feed(data):
+            self._last_arrival_at = time.monotonic()
+            for body in self._reader.feed(data):
                 self._messages.append(_decode_control_body(body))
         return self._messages.popleft()
 
@@ -954,7 +1001,7 @@ class WorkerControl:
             EOFError: The channel is closed or its transport inspection fails.
             ValueError: A received frame is invalid.
         """
-        sock = self._open_socket()
+        sock = self.open_socket()
         snapshot_error = None
         try:
             remaining = pending_socket_bytes(sock)
@@ -963,8 +1010,8 @@ class WorkerControl:
             snapshot_error = error
         return self._receive_available(sock, len(self._messages), remaining, snapshot_error)
 
-    def send(self, message: ControlMessage) -> None:
-        """Send one complete typed control message within its channel deadline.
+    def send(self, message: ControlMessage, *, deadline_secs: float) -> None:
+        """Send one complete typed control message within the supplied deadline.
 
         The deadline includes time waiting for the writer lock. A timeout or
         transport failure permanently closes and poisons this channel, so a
@@ -972,27 +1019,31 @@ class WorkerControl:
 
         Args:
             message: Closed internal control value.
+            deadline_secs: Finite positive complete-operation deadline in
+                seconds.
 
         Raises:
-            WorkerControlSendTimeoutError: The send deadline expires while
-                waiting for the writer lock or writing the frame.
-            ValueError: The encoded control frame body exceeds the configured
-                bound.
+            TimeoutError: The send deadline expires while waiting for the
+                writer lock or writing the frame.
+            ValueError: The message cannot be encoded, or the encoded frame
+                body exceeds the configured bound.
             EOFError: The channel or its peer is closed.
             OSError: The socket transport fails; the same failure is propagated
                 to a concurrent writer after the channel is poisoned.
         """
+        if not isfinite(deadline_secs) or deadline_secs <= 0:
+            raise ValueError('worker control send deadline must be finite and positive')
         frame = encode_control_message(message)
-        if len(frame) - _LENGTH_BYTES > self._max_frame_bytes:
+        if len(frame) - IPC_LENGTH_BYTES > self.max_frame_bytes:
             raise _FrameError('control frame body exceeds configured maximum')
-        deadline = time.monotonic() + self._send_deadline_secs
+        deadline = time.monotonic() + deadline_secs
         remaining = max(0.0, deadline - time.monotonic())
         if not self._send_lock.acquire(timeout=remaining):
-            self._poison()
-            raise WorkerControlSendTimeoutError('worker control send timed out')
+            self.poison()
+            raise _WorkerControlSendTimeoutError('worker control send timed out')
         try:
             try:
-                sock = self._open_socket()
+                sock = self.open_socket()
             except EOFError:
                 with self._state_lock:
                     send_error = self._send_error
@@ -1001,16 +1052,16 @@ class WorkerControl:
                 raise
             self._send_frame(sock, frame, deadline)
         except TimeoutError:
-            self._poison()
+            self.poison()
             raise
         except EOFError:
-            self._poison()
+            self.poison()
             raise
         except OSError as error:
-            self._poison(send_error=error)
+            self.poison(send_error=error)
             raise
         except ValueError:
-            self._poison()
+            self.poison()
             raise
         finally:
             self._send_lock.release()
@@ -1025,7 +1076,116 @@ class WorkerControl:
         return self._socket_buffers
 
 
-class WorkerControlSendTimeoutError(TimeoutError):
+class WorkerControlOutbox:
+    """Queue worker control traffic for one nonblocking monitor writer.
+
+    Producers enqueue lifecycle and command results without a capacity bound.
+    An unstarted health sample is replaceable; started frames are indivisible.
+    Only the monitor calls `write_available`, `wait`, and `abandon`.
+    """
+
+    def __init__(self, control: WorkerControl) -> None:
+        """Borrow the runtime's control transport without acquiring its ownership."""
+        self._control = control
+        self._lock = threading.Lock()
+        self._messages: deque[ControlMessage] = deque()
+        self._health: HealthUpdate | None = None
+        self._unsent = memoryview(b'')
+        self._selected_health: HealthUpdate | None = None
+        self._abandoned = False
+
+    def _next_frame(self) -> bool:
+        """Select ordered traffic before the latest unstarted health sample."""
+        if self._unsent:
+            return True
+        with self._lock:
+            if self._abandoned:
+                return False
+            if self._messages:
+                message = self._messages.popleft()
+            elif self._health is not None:
+                message = self._health
+                self._selected_health = message
+                self._health = None
+            else:
+                return False
+        frame = encode_control_message(message)
+        if len(frame) - IPC_LENGTH_BYTES > self._control.max_frame_bytes:
+            raise _FrameError('control frame body exceeds configured maximum')
+        self._unsent = memoryview(frame)
+        return True
+
+    def abandon(self) -> None:
+        """Drop pending frames at shutdown and permanently stop further writes."""
+        with self._lock:
+            self._abandoned = True
+            self._messages.clear()
+            self._health = None
+            self._selected_health = None
+            self._unsent = memoryview(b'')
+
+    def enqueue(self, message: ControlMessage) -> None:
+        """Append one result or lifecycle message in producer lock order."""
+        with self._lock:
+            if not self._abandoned:
+                self._messages.append(message)
+
+    def offer_health(self, update: HealthUpdate) -> None:
+        """Replace the latest sample that has not started writing."""
+        with self._lock:
+            if not self._abandoned:
+                self._health = update
+
+    def wait(self, timeout: float) -> None:
+        """Wait for receive work or pending write progress for at most `timeout` seconds.
+
+        Raises:
+            EOFError: The transport closes or its readiness check fails.
+        """
+        with self._lock:
+            pending = bool(self._unsent or self._messages or self._health)
+        events = selectors.EVENT_READ | (selectors.EVENT_WRITE if pending else 0)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(self._control.open_socket(), events)
+                selector.select(timeout)
+        except (OSError, ValueError) as error:
+            self._control.poison()
+            raise EOFError('worker control is closed') from error
+
+    def write_available(self) -> None:
+        """Write complete ordered frames or retain the first blocked remainder.
+
+        Raises:
+            EOFError: The transport closes or fails.
+            ValueError: A queued frame exceeds the configured frame bound.
+        """
+        try:
+            while self._next_frame():
+                try:
+                    sent = self._control.open_socket().send(self._unsent)
+                except BlockingIOError:
+                    # Selecting a sample is not starting it: until one byte
+                    # is accepted a newer offered sample can still replace it.
+                    with self._lock:
+                        if self._selected_health is not None:
+                            if self._health is None:
+                                self._health = self._selected_health
+                            self._selected_health = None
+                            self._unsent = memoryview(b'')
+                    return
+                if sent == 0:
+                    raise EOFError('worker control peer closed')
+                self._selected_health = None
+                self._unsent = self._unsent[sent:]
+        except _FrameError:
+            raise
+        except (OSError, ValueError) as error:
+            self._control.poison()
+            raise EOFError('worker control is closed') from error
+
+
+class _WorkerControlSendTimeoutError(TimeoutError):
     """Identify a bounded worker-control send deadline."""
 
 
@@ -1041,50 +1201,50 @@ class _IPCAuthenticationError(PermissionError):
 class _OutboundFrame:
     """Hold one immutable segmented length-prefixed event frame."""
 
-    _header: bytes
-    _payload: bytes
-    _charge_bytes: int
+    header: bytes
+    payload: bytes
+    charge_bytes: int
     _prefix: bytes = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate and cache the complete wire length prefix."""
-        if type(self._header) is not bytes or type(self._payload) is not bytes:
+        if type(self.header) is not bytes or type(self.payload) is not bytes:
             raise TypeError('outbound frame segments must be bytes')
-        if type(self._charge_bytes) is not int or self._charge_bytes <= 0:
+        if type(self.charge_bytes) is not int or self.charge_bytes <= 0:
             raise ValueError('outbound frame charge must be positive')
-        frame_length = _LENGTH_BYTES + len(self._header) + len(self._payload)
-        object.__setattr__(self, '_prefix', struct.pack('!II', frame_length, len(self._header)))
+        frame_length = IPC_LENGTH_BYTES + len(self.header) + len(self.payload)
+        object.__setattr__(self, '_prefix', struct.pack('!II', frame_length, len(self.header)))
 
     @property
-    def _parts(self) -> tuple[bytes, bytes, bytes]:
+    def parts(self) -> tuple[bytes, bytes, bytes]:
         """Return immutable wire segments without copying the event body."""
-        return self._prefix, self._header, self._payload
+        return self._prefix, self.header, self.payload
 
     @property
-    def _wire_bytes(self) -> int:
+    def wire_bytes(self) -> int:
         """Return complete bytes written to the stream."""
-        return sum(len(part) for part in self._parts)
+        return sum(len(part) for part in self.parts)
 
 
 @dataclass
 class _ConnectionFence:
     """Fence stale roles with one server-ordered group attempt."""
 
-    _accepted_sequence: int
-    _connection_id: str
-    _retired: bool = False
+    accepted_sequence: int
+    connection_id: str
+    retired: bool = False
 
 
 @dataclass(frozen=True)
 class _EventAuthentication:
     """Carry the closed event-channel handshake."""
 
-    _capability: str
-    _connection_id: str
-    _group: str
-    _role: Literal['coordination', 'event']
-    _source: str
-    _spawn_instance: str
+    capability: str
+    connection_id: str
+    group: str
+    role: Literal['coordination', 'event']
+    source: str
+    spawn_instance: str
 
 
 class _EventClientOptions(TypedDict):
@@ -1100,6 +1260,8 @@ class _EventClientOptions(TypedDict):
     queue_max_bytes: int
     coordination_deadline_secs: float
     stop: threading.Event
+    wait_phase: Callable[[], AbstractContextManager[None]]
+    wait_slice_secs: float
 
 
 class _EventServerOptions(TypedDict):
@@ -1112,23 +1274,38 @@ class _EventServerOptions(TypedDict):
     queue_max_bytes: int
     expected_uid: NotRequired[int | None]
     frame_encoder: NotRequired[Callable[[FanoutMessage], _OutboundFrame]]
+    socket_probe_timeout_secs: NotRequired[float]
 
 
 @dataclass(frozen=True)
 class _JoinCall:
     """Carry one decoded lane-to-source RPC for source-thread dispatch."""
 
-    _request_id: int
-    _value: _JoinValue
+    request_id: int
+    value: _JoinValue
 
 
 @dataclass(frozen=True)
 class _JoinReply:
     """Carry one request-correlated source RPC result."""
 
-    _request_id: int
-    _result: _JoinResult
-    _error: str | None = None
+    request_id: int
+    result: _JoinResult
+    error: str | None = None
+    detach_reason: str | None = None
+
+    def unwrap(self) -> _JoinResult:
+        """Return the reply result or raise its reported protocol failure.
+
+        Raises:
+            JoinProtocolError: The reply reports a remote error.
+            LiveChannelDetachedError: The reply reports a detached channel.
+        """
+        if self.error is not None:
+            raise JoinProtocolError(self.error)
+        if self.detach_reason is not None:
+            raise LiveChannelDetachedError(self.detach_reason)
+        return self.result
 
 
 class _JoinSource(Protocol):
@@ -1144,12 +1321,12 @@ class _JoinSource(Protocol):
 
     def acknowledge_strict_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Acknowledge one lane-committed strict control remotely.
 
         Args:
-            control: Capacity or ordering control committed by the lane.
+            control: Ordering halt committed by the lane.
         """
         ...
 
@@ -1219,7 +1396,7 @@ class _JoinSource(Protocol):
 class _PeerDetach:
     """Carry one body-free event-channel detach reason."""
 
-    _reason: str
+    reason: str
 
 
 class _FrameReader:
@@ -1239,11 +1416,16 @@ class _FrameReader:
         self._expected: int | None = None
         self._max_frame_bytes = max_frame_bytes
 
-    def _feed(
+    def feed(
         self,
         data: bytes,
     ) -> tuple[FanoutMessage | _JoinReply | _PeerDetach, ...]:
-        """Consume bytes and return every newly complete message."""
+        """Consume bytes and return every newly complete message.
+
+        Raises:
+            ValueError: A completed prefix exceeds the configured frame bound,
+                or a received frame is malformed or unsupported.
+        """
         if data:
             self._buffer.extend(data)
         decoded: list[FanoutMessage | _JoinReply | _PeerDetach] = []
@@ -1254,7 +1436,7 @@ class _FrameReader:
                 if expected is None:
                     break
                 self._expected = expected
-            total = _LENGTH_BYTES + expected
+            total = IPC_LENGTH_BYTES + expected
             if len(self._buffer) < total:
                 break
             complete = bytes(self._buffer[:total])
@@ -1264,18 +1446,18 @@ class _FrameReader:
         return tuple(decoded)
 
     @property
-    def _pending_wire_bytes(self) -> int | None:
+    def pending_wire_bytes(self) -> int | None:
         """Return the complete current-frame charge after its prefix."""
         if self._expected is None:
             return None
-        return _LENGTH_BYTES + self._expected
+        return IPC_LENGTH_BYTES + self._expected
 
     @property
-    def _read_size(self) -> int:
+    def read_size(self) -> int:
         """Return bytes needed to finish at most one current frame."""
         if self._expected is None:
-            return max(1, _LENGTH_BYTES - len(self._buffer))
-        return max(1, _LENGTH_BYTES + self._expected - len(self._buffer))
+            return max(1, IPC_LENGTH_BYTES - len(self._buffer))
+        return max(1, IPC_LENGTH_BYTES + self._expected - len(self._buffer))
 
 
 class _RawFrameReader:
@@ -1286,39 +1468,49 @@ class _RawFrameReader:
         self._buffer = bytearray()
         self._max_frame_bytes = max_frame_bytes
 
-    def _feed(
+    def feed(
         self,
         data: bytes,
         *,
         frame_limit: int | None = None,
     ) -> tuple[bytes, ...]:
-        """Consume bytes and return complete bodies without length prefixes."""
+        """Consume bytes and return complete bodies without length prefixes.
+
+        Args:
+            data: Bytes appended to any incomplete or unconsumed input.
+            frame_limit: Maximum bodies returned by this call; `None` decodes
+                every complete body. Remaining bytes stay buffered.
+
+        Raises:
+            ValueError: A completed length prefix is zero or exceeds the
+                configured frame bound.
+        """
         self._buffer.extend(data)
         decoded: list[bytes] = []
         while frame_limit is None or len(decoded) < frame_limit:
             length = _frame_length(self._buffer, max_frame_bytes=self._max_frame_bytes)
             if length is None:
                 break
-            total = _LENGTH_BYTES + length
+            total = IPC_LENGTH_BYTES + length
             if len(self._buffer) < total:
                 break
-            decoded.append(bytes(self._buffer[_LENGTH_BYTES:total]))
+            decoded.append(bytes(self._buffer[IPC_LENGTH_BYTES:total]))
             del self._buffer[:total]
         return tuple(decoded)
 
-    def _handoff(self) -> bytes:
+    def handoff(self) -> bytes:
         """Release every unread byte to a replacement reader."""
         unread = bytes(self._buffer)
         self._buffer.clear()
         return unread
 
     @property
-    def _read_size(self) -> int:
+    def read_size(self) -> int:
         """Return bytes needed to finish at most one current frame."""
-        if len(self._buffer) < _LENGTH_BYTES:
-            return _LENGTH_BYTES - len(self._buffer)
-        (length,) = struct.unpack('!I', self._buffer[:_LENGTH_BYTES])
-        return max(1, _LENGTH_BYTES + length - len(self._buffer))
+        if len(self._buffer) < IPC_LENGTH_BYTES:
+            return IPC_LENGTH_BYTES - len(self._buffer)
+        (length,) = struct.unpack('!I', self._buffer[:IPC_LENGTH_BYTES])
+        return max(1, IPC_LENGTH_BYTES + length - len(self._buffer))
 
 
 class _RemoteGroupChannel:
@@ -1362,7 +1554,7 @@ class _RemoteGroupChannel:
         self._attached = False
         self._provisional = False
         self._reason = reason
-        self._server._close_connection(
+        self._server.close_connection(
             self._group,
             self._connection_id,
             reason=reason,
@@ -1401,12 +1593,12 @@ class _RemoteGroupChannel:
         Raises:
             ValueError: The frame body exceeds the configured limit.
         """
-        status = self._server._publish_connection(
+        status = self._server.publish_connection(
             self._group,
             self._connection_id,
             message,
         )
-        return status._connected
+        return status.connected
 
     def offer_hint(self, message: RangeChanged) -> bool:
         """Offer one coalesced hint without closing a saturated peer.
@@ -1418,7 +1610,7 @@ class _RemoteGroupChannel:
         Raises:
             ValueError: The frame body exceeds the configured limit.
         """
-        return self._server._offer_hint_connection(
+        return self._server.offer_hint_connection(
             self._group,
             self._connection_id,
             message,
@@ -1437,7 +1629,7 @@ class _RemoteGroupChannel:
             ValueError: The frame body exceeds the configured limit.
         """
         try:
-            return self._server._offer_paced_connection(
+            return self._server.offer_paced_connection(
                 self._group,
                 self._connection_id,
                 message,
@@ -1471,18 +1663,18 @@ class _RemoteGroupChannel:
         Returns:
             Current attachment, ordering, queue, and detach state.
         """
-        status = self._server._connection_status(
+        status = self._server.connection_status(
             self._group,
             self._connection_id,
         )
         return FanoutStatus(
             group=self._group,
             ordering=self._ordering,
-            attached=self._attached and status._connected,
+            attached=self._attached and status.connected,
             provisional=self._provisional,
             queued_count=status.queued_count,
             queued_bytes=status.queued_bytes,
-            reason=self._reason if self._reason is not None else status._reason,
+            reason=self._reason if self._reason is not None else status.reason,
         )
 
 
@@ -1521,25 +1713,45 @@ class _PartialWriter:
         self._pending_byte_count = 0
         self._last_rejection_reason: str | None = None
 
-    def _append(self, frame: _OutboundFrame) -> bool:
-        """Append one immutable frame within count and byte limits."""
+    def _finish_frame(self, frame: _OutboundFrame) -> None:
+        """Retire one completed frame from its own accounting domain."""
+        self._frames.popleft()
+        if frame is self._hint_frame:
+            self._hint_frame = None
+        else:
+            self._charged_count -= 1
+            self._pending_byte_count -= frame.charge_bytes
+
+    def append(self, frame: _OutboundFrame) -> bool:
+        """Append one immutable frame within count and byte limits.
+
+        Returns:
+            `True` when queued. Returns `False` without queueing when the count
+            or byte limit would be exceeded, retaining that rejection reason.
+        """
         self._last_rejection_reason = None
         if self._max_entries is not None and self._charged_count + 1 > self._max_entries:
             self._last_rejection_reason = 'queue-count-exhausted'
             return False
         if (
             self._max_bytes is not None
-            and self._pending_byte_count + frame._charge_bytes > self._max_bytes
+            and self._pending_byte_count + frame.charge_bytes > self._max_bytes
         ):
             self._last_rejection_reason = 'queue-byte-exhausted'
             return False
         self._frames.append(frame)
         self._charged_count += 1
-        self._pending_byte_count += frame._charge_bytes
+        self._pending_byte_count += frame.charge_bytes
         return True
 
-    def _append_hint(self, frame: _OutboundFrame) -> bool:
-        """Coalesce one advisory frame outside charged writer capacity."""
+    def append_hint(self, frame: _OutboundFrame) -> bool:
+        """Coalesce one advisory frame outside charged writer capacity.
+
+        Returns:
+            `True` when the hint is queued or an earlier hint is already
+            pending. Returns `False` when no hint is pending and the charged
+            queue has reached its count or byte limit.
+        """
         if self._hint_frame is not None:
             return True
         if (self._max_entries is not None and self._charged_count >= self._max_entries) or (
@@ -1550,7 +1762,7 @@ class _PartialWriter:
         self._hint_frame = frame
         return True
 
-    def _clear(self) -> None:
+    def clear(self) -> None:
         """Discard every queued frame and reset partial-write state."""
         self._frames.clear()
         self._hint_frame = None
@@ -1560,20 +1772,17 @@ class _PartialWriter:
         self._pending_byte_count = 0
         self._last_rejection_reason = None
 
-    def _finish_frame(self, frame: _OutboundFrame) -> None:
-        """Retire one completed frame from its own accounting domain."""
-        self._frames.popleft()
-        if frame is self._hint_frame:
-            self._hint_frame = None
-        else:
-            self._charged_count -= 1
-            self._pending_byte_count -= frame._charge_bytes
+    def flush(self, sock: _SendSocket) -> None:
+        """Advance queued frames until complete or the socket would block.
 
-    def _flush(self, sock: _SendSocket) -> None:
-        """Advance queued frames until complete or the socket would block."""
+        Raises:
+            ConnectionError: A send accepts no bytes.
+            OSError: The socket send fails for a reason other than temporary
+                blocking or interruption.
+        """
         while self._frames:
             frame = self._frames[0]
-            parts = frame._parts
+            parts = frame.parts
             while self._part < len(parts) and self._offset == 0 and not parts[self._part]:
                 self._part += 1
             if self._part == len(parts):
@@ -1598,27 +1807,27 @@ class _PartialWriter:
             self._finish_frame(frame)
 
     @property
-    def _pending_bytes(self) -> int:
+    def pending_bytes(self) -> int:
         """Return charged bytes retained by queued frames."""
         return self._pending_byte_count
 
     @property
-    def _pending_count(self) -> int:
+    def pending_count(self) -> int:
         """Return the queued charged-frame count, excluding the advisory hint."""
         return self._charged_count
 
     @property
-    def _has_pending(self) -> bool:
+    def has_pending(self) -> bool:
         """Return whether any charged or advisory frame awaits writing."""
         return bool(self._frames)
 
     @property
-    def _rejection_reason(self) -> str | None:
+    def rejection_reason(self) -> str | None:
         """Return the last body-free capacity rejection reason."""
         return self._last_rejection_reason
 
     @property
-    def _started(self) -> bool:
+    def started(self) -> bool:
         """Return whether any queued frame has been partially written."""
         return self._part != 0 or self._offset != 0
 
@@ -1627,17 +1836,18 @@ class _PartialWriter:
 class _ServerPeer:
     """Hold one accepted event socket and bounded writer."""
 
-    _socket: socket.socket
-    _buffers: SocketBufferSizes
-    _reader: _RawFrameReader
-    _writer: _PartialWriter
-    _accepted_sequence: int
-    _active_request_id: int | None = None
-    _grant: EventPeerGrant | None = None
-    _connection_id: str | None = None
-    _group: str | None = None
-    _role: Literal['coordination', 'event'] | None = None
-    _close_after_flush: str | None = None
+    socket: socket.socket
+    buffers: SocketBufferSizes
+    reader: _RawFrameReader
+    writer: _PartialWriter
+    accepted_sequence: int
+    active_request_id: int | None = None
+    grant: EventPeerGrant | None = None
+    connection_id: str | None = None
+    group: str | None = None
+    role: Literal['coordination', 'event'] | None = None
+    close_after_flush: str | None = None
+    detach_logged: bool = False
 
 
 class EventClient:
@@ -1669,6 +1879,9 @@ class EventClient:
             coordination_deadline_secs: Maximum duration of one coordination
                 call.
             stop: Owning caller's shutdown signal.
+            wait_phase: Renewable bounded phase of the waiting lane.
+            wait_slice_secs: Maximum reply-poll duration, bounded by the owning
+                lane's health interval and shutdown slice.
 
         Raises:
             ValueError: An identity is empty or a frame or queue bound is not
@@ -1684,6 +1897,8 @@ class EventClient:
         queue_max_bytes = options['queue_max_bytes']
         coordination_deadline_secs = options['coordination_deadline_secs']
         stop = options['stop']
+        self._wait_phase = options['wait_phase']
+        self._wait_slice_secs = options['wait_slice_secs']
         if not source or not group or not spawn_instance or not capability:
             raise ValueError('event client identity must not be empty')
         if max_frame_bytes <= 0 or queue_max_entries <= 0 or queue_max_bytes <= 0:
@@ -1740,7 +1955,7 @@ class EventClient:
             close_resources(resources)
         except BaseException as error:  # noqa: BLE001
             first_error = error
-        self._coordination_writer._clear()
+        self._coordination_writer.clear()
         self._in_flight_request_id = None
         self._reply = None
         self._coordination_reader = _FrameReader(
@@ -1795,8 +2010,8 @@ class EventClient:
         """Retain one exact reply or fail closed on coordination input."""
         for message in decoded:
             if isinstance(message, _PeerDetach):
-                self._detach(message._reason)
-                raise ConnectionError('event coordination channel disconnected')
+                self._detach(message.reason)
+                raise LiveChannelDetachedError(message.reason)
             if not isinstance(message, _JoinReply):
                 self._detach('unexpected-coordination-frame')
                 raise JoinProtocolError('coordination stream received a fanout frame')
@@ -1804,7 +2019,7 @@ class EventClient:
             if request_id is None:
                 self._detach('unsolicited-join-reply')
                 raise JoinProtocolError('unsolicited join reply')
-            if message._request_id != request_id:
+            if message.request_id != request_id:
                 self._detach('wrong-id-join-reply')
                 raise JoinProtocolError('join reply request id conflicts')
             if self._reply is not None:
@@ -1818,7 +2033,7 @@ class EventClient:
         status = channel.status if channel is not None else None
         queued_count = status.queued_count if status is not None else 0
         queued_bytes = status.queued_bytes if status is not None else 0
-        pending_wire_bytes = self._reader._pending_wire_bytes
+        pending_wire_bytes = self._reader.pending_wire_bytes
         return (
             queued_count >= self._queue_max_entries
             or queued_bytes >= self._queue_max_bytes
@@ -1831,16 +2046,37 @@ class EventClient:
             )
         )
 
-    @staticmethod
-    def _remaining_connection_timeout(deadline: float) -> float:
+    def _remaining_connection_timeout(self, deadline: float) -> float:
         """Return the positive time left for the private startup sockets."""
+        if self._stop.is_set():
+            raise ConnectionError('event endpoint stopped during connection')
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError('event endpoint connection timed out')
-        return remaining
+        return min(remaining, self._wait_slice_secs)
 
-    @staticmethod
+    def _connect_socket(self, sock: socket.socket, deadline: float) -> None:
+        """Connect in renewed stop-aware slices under the shared response cap."""
+        while True:
+            timeout = self._remaining_connection_timeout(deadline)
+            with self._wait_phase():
+                sock.settimeout(timeout)
+                try:
+                    sock.connect(os.fspath(self._path))
+                except TimeoutError:
+                    continue
+                except OSError as error:
+                    if error.errno == errno.EISCONN:
+                        return
+                    if error.errno not in {errno.EAGAIN, errno.EINPROGRESS, errno.EALREADY}:
+                        raise
+                    # Unix backlogs can refuse immediately even with a timeout.
+                    self._stop.wait(self._remaining_connection_timeout(deadline))
+                else:
+                    return
+
     def _send_authentication(
+        self,
         sock: socket.socket,
         frame: bytes,
         deadline: float,
@@ -1848,8 +2084,13 @@ class EventClient:
         """Write one complete authentication frame within the shared deadline."""
         pending = memoryview(frame)
         while pending:
-            sock.settimeout(EventClient._remaining_connection_timeout(deadline))
-            written = sock.send(pending)
+            timeout = self._remaining_connection_timeout(deadline)
+            with self._wait_phase():
+                sock.settimeout(timeout)
+                try:
+                    written = sock.send(pending)
+                except TimeoutError:
+                    continue
             if written == 0:
                 raise ConnectionError('event endpoint closed during authentication')
             pending = pending[written:]
@@ -1861,7 +2102,7 @@ class EventClient:
         if selector is None or sock is None:
             return
         events = selectors.EVENT_READ
-        if self._coordination_writer._pending_count:
+        if self._coordination_writer.pending_count:
             events |= selectors.EVENT_WRITE
         selector.modify(sock, events)
 
@@ -1874,7 +2115,7 @@ class EventClient:
         for _key, mask in selector.select(timeout):
             if mask & selectors.EVENT_WRITE:
                 try:
-                    self._coordination_writer._flush(sock)
+                    self._coordination_writer.flush(sock)
                 except (ConnectionError, OSError) as error:
                     self._detach('coordination-write-failed')
                     raise ConnectionError('event coordination channel write failed') from error
@@ -1882,7 +2123,7 @@ class EventClient:
             if not mask & selectors.EVENT_READ:
                 continue
             try:
-                data = sock.recv(min(65_536, self._coordination_reader._read_size))
+                data = sock.recv(min(65_536, self._coordination_reader.read_size))
             except BlockingIOError:
                 continue
             except OSError as error:
@@ -1892,7 +2133,7 @@ class EventClient:
                 self._detach('coordination-eof')
                 raise ConnectionError('event coordination channel closed')
             try:
-                decoded = self._coordination_reader._feed(data)
+                decoded = self._coordination_reader.feed(data)
             except _FrameError as error:
                 self._detach('malformed-coordination-frame')
                 raise JoinProtocolError('malformed coordination frame') from error
@@ -1914,16 +2155,16 @@ class EventClient:
         request_id = self._request_id
         frame = _encode_join_call(
             _JoinCall(
-                _request_id=request_id,
-                _value=value,
+                request_id=request_id,
+                value=value,
             )
         )
-        if frame._wire_bytes - _LENGTH_BYTES > self._max_frame_bytes:
+        if frame.wire_bytes - IPC_LENGTH_BYTES > self._max_frame_bytes:
             raise _FrameError('join request frame body exceeds configured maximum')
         self._in_flight_request_id = request_id
         self._reply = None
         try:
-            if not self._coordination_writer._append(frame):
+            if not self._coordination_writer.append(frame):
                 self._detach('coordination-request-queue-exhausted')
                 raise JoinProtocolError('event coordination request queue is full')
             self._set_coordination_interest()
@@ -1931,16 +2172,17 @@ class EventClient:
                 reply = self._reply
                 if reply is not None:
                     self._reply = None
-                    if reply._error is not None:
-                        raise JoinProtocolError(reply._error)
-                    return reply._result
+                    return reply.unwrap()
                 if self._stop.is_set():
                     self._detach('coordination-stop')
                     raise ConnectionError('event channel stopped during join request')
                 if time.monotonic() >= deadline:
                     self._detach('coordination-reply-timeout')
                     raise ConnectionError('event coordination reply timed out')
-                self._poll_coordination(0.1)
+                with self._wait_phase():
+                    self._poll_coordination(
+                        min(self._wait_slice_secs, max(0.0, deadline - time.monotonic()))
+                    )
             raise ConnectionError('event channel closed during join request')
         finally:
             self._in_flight_request_id = None
@@ -1956,7 +2198,7 @@ class EventClient:
         """Read and queue at most one bounded event frame."""
         while True:
             try:
-                data = sock.recv(min(65_536, self._reader._read_size))
+                data = sock.recv(min(65_536, self._reader.read_size))
             except BlockingIOError:
                 return 0
             except OSError as error:
@@ -1969,7 +2211,7 @@ class EventClient:
                     self._detach('eof')
                 return 0
             try:
-                decoded = self._reader._feed(data)
+                decoded = self._reader.feed(data)
             except _FrameError:
                 self._detach('malformed-frame')
                 return 0
@@ -2008,12 +2250,12 @@ class EventClient:
 
     def acknowledge_strict_control(
         self,
-        control: StrictCapacityControl | StrictOrderingControl,
+        control: StrictOrderingControl,
     ) -> None:
         """Acknowledge one lane-committed strict control remotely.
 
         Args:
-            control: Capacity or ordering control committed by the lane.
+            control: Ordering halt committed by the lane.
 
         Raises:
             ConnectionError: The coordination channel is unavailable, fails,
@@ -2087,16 +2329,15 @@ class EventClient:
                 coordination_socket,
                 self._max_frame_bytes,
             )
-            event_socket.settimeout(self._remaining_connection_timeout(deadline))
-            event_socket.connect(os.fspath(self._path))
+            self._connect_socket(event_socket, deadline)
             event_authentication = _auth_body(
                 _EventAuthentication(
-                    _capability=self._capability,
-                    _connection_id=connection_id,
-                    _group=self._group,
-                    _role='event',
-                    _source=self._source,
-                    _spawn_instance=self._spawn_instance,
+                    capability=self._capability,
+                    connection_id=connection_id,
+                    group=self._group,
+                    role='event',
+                    source=self._source,
+                    spawn_instance=self._spawn_instance,
                 )
             )
             self._send_authentication(
@@ -2104,16 +2345,15 @@ class EventClient:
                 struct.pack('!I', len(event_authentication)) + event_authentication,
                 deadline,
             )
-            coordination_socket.settimeout(self._remaining_connection_timeout(deadline))
-            coordination_socket.connect(os.fspath(self._path))
+            self._connect_socket(coordination_socket, deadline)
             coordination_authentication = _auth_body(
                 _EventAuthentication(
-                    _capability=self._capability,
-                    _connection_id=connection_id,
-                    _group=self._group,
-                    _role='coordination',
-                    _source=self._source,
-                    _spawn_instance=self._spawn_instance,
+                    capability=self._capability,
+                    connection_id=connection_id,
+                    group=self._group,
+                    role='coordination',
+                    source=self._source,
+                    spawn_instance=self._spawn_instance,
                 )
             )
             self._send_authentication(
@@ -2177,7 +2417,8 @@ class EventClient:
         """Return the last captured direct source observation.
 
         Returns:
-            Current join target or `None` after a retry.
+            The last captured target, or `None` before a target is captured or
+            after a retry reply.
         """
         return self._last_join_target
 
@@ -2222,6 +2463,13 @@ class EventClient:
         Returns:
             Number of messages accepted by the active lane sink. Zero can also
             accompany a disconnect, so callers must inspect `connected`.
+
+        Raises:
+            ConnectionError: Reading the event transport fails.
+            JoinProtocolError: A coordination frame or reply is invalid, an
+                unexpected control frame arrives on the event stream, or the
+                source reports a live-channel detach.
+            OSError: Selector operations or transport cleanup fail.
         """
         if self._coordination_socket is not None:
             try:
@@ -2244,7 +2492,12 @@ class EventClient:
         return added
 
     def reconnect(self) -> None:
-        """Discard stale bodies and establish a fresh authenticated channel."""
+        """Discard stale bodies and establish a fresh authenticated channel.
+
+        Raises:
+            ConnectionError: Either transport cannot connect or send its
+                authentication frame.
+        """
         self._detach('reconnect')
         self.connect()
 
@@ -2316,6 +2569,8 @@ class EventServer:
             queue_max_bytes: Per-group complete-frame byte bound.
             expected_uid: Required peer UID, defaulting to this process.
             frame_encoder: Injected single-pass fanout framer.
+            socket_probe_timeout_secs: Owning worker shutdown slice for
+                stale-listener probes.
 
         Raises:
             ValueError: The source is empty or a frame or queue bound is not
@@ -2351,14 +2606,20 @@ class EventServer:
             send=0,
             receive=0,
         )
+        self._socket_probe_timeout_secs = options.get('socket_probe_timeout_secs', 1.0)
         self._source = source
-        self._statuses: dict[str, EventConnectionStatus] = {}
+        self._statuses: dict[str, _EventConnectionStatus] = {}
 
     def __enter__(self) -> Self:
         """Open the private endpoint.
 
         Returns:
             This live event server.
+
+        Raises:
+            SecurityError: An existing endpoint cannot be safely replaced.
+            OSError: The endpoint or its socket resources cannot be opened or
+                configured.
         """
         self.start()
         return self
@@ -2369,7 +2630,12 @@ class EventServer:
         _exc_value: BaseException | None,
         _traceback: object,
     ) -> None:
-        """Close the private endpoint."""
+        """Close the private endpoint.
+
+        Raises:
+            OSError: Closing transports or inspecting or removing the owned
+                socket fails.
+        """
         self.close()
 
     def _accept(self) -> None:
@@ -2385,32 +2651,52 @@ class EventServer:
                 return
             self._next_accepted_sequence += 1
             connected.settimeout(0.0)
-            buffers = _request_socket_buffers(connected, self._max_frame_bytes)
+            try:
+                buffers = _request_socket_buffers(connected, self._max_frame_bytes)
+            except OSError as error:
+                # macOS rejects buffer setup after a queued peer disconnects,
+                # even with unread authentication bytes. A zero-byte send
+                # establishes that loss without consuming or emitting bytes.
+                disconnected = False
+                try:
+                    connected.send(b'')
+                except (BrokenPipeError, ConnectionResetError):
+                    disconnected = True
+                except OSError:
+                    pass
+                try:
+                    connected.close()
+                except OSError as cleanup_error:
+                    error.add_note(f'accepted socket cleanup failure: {cleanup_error!r}')
+                    disconnected = False
+                if disconnected:
+                    continue
+                raise
             self._socket_buffers = buffers
             peer = _ServerPeer(
-                _socket=connected,
-                _buffers=buffers,
-                _reader=_RawFrameReader(max_frame_bytes=_MAX_AUTH_FRAME_BYTES),
-                _writer=_PartialWriter(max_entries=1),
-                _accepted_sequence=self._next_accepted_sequence,
+                socket=connected,
+                buffers=buffers,
+                reader=_RawFrameReader(max_frame_bytes=_MAX_AUTH_FRAME_BYTES),
+                writer=_PartialWriter(max_entries=1),
+                accepted_sequence=self._next_accepted_sequence,
             )
             self._peers[connected.fileno()] = peer
             selector.register(connected, selectors.EVENT_READ, peer)
 
     def _close_peer(self, peer: _ServerPeer) -> None:
         """Close one exact descriptor without affecting a sibling."""
-        descriptor = peer._socket.fileno()
+        descriptor = peer.socket.fileno()
         selector = self._selector
 
         def unregister() -> None:
             if selector is not None:
                 with suppress(KeyError, ValueError):
-                    selector.unregister(peer._socket)
+                    selector.unregister(peer.socket)
 
         def forget() -> None:
             self._peers.pop(descriptor, None)
 
-        close_callables((unregister, forget, peer._socket.close))
+        close_callables((unregister, forget, peer.socket.close))
 
     def _connection_peer(
         self,
@@ -2423,57 +2709,18 @@ class EventServer:
             (
                 item
                 for item in self._peers.values()
-                if item._group == group
-                and item._connection_id == connection_id
-                and item._role == role
+                if item.group == group
+                and item.connection_id == connection_id
+                and item.role == role
             ),
             None,
         )
 
-    def _close_pair(self, peer: _ServerPeer, *, reason: str) -> None:
-        """Close only one exact authenticated sibling pair."""
-        group = peer._group
-        connection_id = peer._connection_id
-        if group is None or connection_id is None:
-            self._close_peer(peer)
-            return
-        was_paired = (
-            self._connection_peer(group, connection_id, 'event') is not None
-            and self._connection_peer(group, connection_id, 'coordination') is not None
-        )
-        siblings = tuple(
-            item
-            for item in self._peers.values()
-            if item._group == group and item._connection_id == connection_id
-        )
-        if not siblings:
-            return
-        first_error: BaseException | None = None
-        try:
-            close_callables(partial(self._close_peer, sibling) for sibling in siblings)
-        except BaseException as error:  # noqa: BLE001
-            first_error = error
-        fence = self._connection_fences.get(group)
-        if fence is not None and not fence._retired and fence._connection_id == connection_id:
-            fence._retired = True
-        if was_paired:
-            self._lost_groups.append(group)
-        if not any(item._group == group for item in self._peers.values()):
-            self._statuses[group] = EventConnectionStatus(
-                _group=group,
-                _connected=False,
-                queued_count=0,
-                queued_bytes=0,
-                _reason=reason,
-            )
-        if first_error is not None:
-            raise first_error
-
     def _current_event_peer(self, group: str) -> _ServerPeer | None:
         """Return the current fully paired event peer for one group."""
         for peer in self._peers.values():
-            connection_id = peer._connection_id
-            if peer._group != group or peer._role != 'event' or connection_id is None:
+            connection_id = peer.connection_id
+            if peer.group != group or peer.role != 'event' or connection_id is None:
                 continue
             coordination = self._connection_peer(group, connection_id, 'coordination')
             if coordination is not None:
@@ -2483,114 +2730,14 @@ class EventServer:
     def _events(self, peer: _ServerPeer) -> int:
         """Return selector interests for one peer."""
         events = selectors.EVENT_READ
-        if peer._writer._has_pending:
+        if peer.writer.has_pending:
             events |= selectors.EVENT_WRITE
         return events
-
-    def _fence_authentication(
-        self,
-        peer: _ServerPeer,
-        authentication: _EventAuthentication,
-    ) -> None:
-        """Reject stale roles and advance one bounded group fence."""
-        group = authentication._group
-        connection_id = authentication._connection_id
-        fence = self._connection_fences.get(group)
-        if fence is None:
-            self._connection_fences[group] = _ConnectionFence(
-                _accepted_sequence=peer._accepted_sequence,
-                _connection_id=connection_id,
-            )
-            return
-        if fence._connection_id == connection_id:
-            if fence._retired:
-                raise _IPCAuthenticationError('event connection identity was already used')
-            fence._accepted_sequence = max(
-                fence._accepted_sequence,
-                peer._accepted_sequence,
-            )
-            return
-        if peer._accepted_sequence <= fence._accepted_sequence:
-            raise _IPCAuthenticationError('event connection role is stale')
-        current = next(
-            (
-                item
-                for item in self._peers.values()
-                if item._group == group and item._connection_id == fence._connection_id
-            ),
-            None,
-        )
-        if current is not None:
-            self._close_pair(current, reason='peer-reconnected')
-        self._connection_fences[group] = _ConnectionFence(
-            _accepted_sequence=peer._accepted_sequence,
-            _connection_id=connection_id,
-        )
-
-    def _authenticate(self, peer: _ServerPeer, body: bytes) -> None:
-        """Authenticate one pending peer exactly once."""
-        if peer._group is not None:
-            raise _IPCAuthenticationError('authenticated event peer sent input')
-        authentication = _decode_auth_body(body)
-        identity = peer_identity(peer._socket)
-        if identity.uid != self._expected_uid:
-            raise _IPCAuthenticationError('event peer user conflicts')
-        grant = self._grants.get(authentication._group)
-        if (
-            grant is None
-            or authentication._source != self._source
-            or authentication._source != grant.source
-            or authentication._spawn_instance != grant.dependent_spawn_instance
-            or authentication._capability != grant.capability
-        ):
-            raise _IPCAuthenticationError('event peer grant conflicts')
-        self._fence_authentication(peer, authentication)
-        same_role = self._connection_peer(
-            authentication._group,
-            authentication._connection_id,
-            authentication._role,
-        )
-        if same_role is not None:
-            self._close_pair(same_role, reason='duplicate-peer-role')
-            raise _IPCAuthenticationError('event connection role is duplicated')
-        peer._grant = grant
-        peer._connection_id = authentication._connection_id
-        peer._group = authentication._group
-        peer._role = authentication._role
-        peer._writer = (
-            _PartialWriter(max_entries=1)
-            if authentication._role == 'coordination'
-            else _PartialWriter(
-                max_entries=self._queue_max_entries,
-                max_bytes=self._queue_max_bytes,
-            )
-        )
-        if (
-            self._connection_peer(
-                authentication._group,
-                authentication._connection_id,
-                'event',
-            )
-            is not None
-            and self._connection_peer(
-                authentication._group,
-                authentication._connection_id,
-                'coordination',
-            )
-            is not None
-        ):
-            self._statuses[authentication._group] = EventConnectionStatus(
-                _group=authentication._group,
-                _connected=True,
-                queued_count=0,
-                queued_bytes=0,
-                _reason=None,
-            )
 
     @staticmethod
     def _join_call_identity(call: _JoinCall) -> tuple[str, str]:
         """Return the source and group carried by one join lifecycle call."""
-        value = call._value
+        value = call.value
         if isinstance(value, GroupBootstrapRequest):
             identity = value.source, value.group
         elif isinstance(value, JoinRequest):
@@ -2599,43 +2746,178 @@ class EventServer:
             identity = value.identity.source, value.identity.group
         return identity
 
+    def _log_detach(self, peer: _ServerPeer, reason: str) -> None:
+        """Record a paired connection's first detach reason on its source owner."""
+        group = peer.group
+        connection_id = peer.connection_id
+        if group is None or connection_id is None:
+            return
+        event = self._connection_peer(group, connection_id, 'event')
+        coordination = self._connection_peer(group, connection_id, 'coordination')
+        if event is None or coordination is None or event.detach_logged:
+            return
+        event.detach_logged = True
+        logging.getLogger('sg_event_daemon.source').info(
+            'detached group %s from its live channel: %s',
+            group,
+            reason,
+            extra={'source': self._source, 'group': group},
+        )
+
+    def _close_pair(self, peer: _ServerPeer, *, reason: str) -> None:
+        """Close only one exact authenticated sibling pair."""
+        group = peer.group
+        connection_id = peer.connection_id
+        if group is None or connection_id is None:
+            self._close_peer(peer)
+            return
+        self._log_detach(peer, reason)
+        was_paired = (
+            self._connection_peer(group, connection_id, 'event') is not None
+            and self._connection_peer(group, connection_id, 'coordination') is not None
+        )
+        siblings = tuple(
+            item
+            for item in self._peers.values()
+            if item.group == group and item.connection_id == connection_id
+        )
+        if not siblings:
+            return
+        first_error: BaseException | None = None
+        try:
+            close_callables(partial(self._close_peer, sibling) for sibling in siblings)
+        except BaseException as error:  # noqa: BLE001
+            first_error = error
+        fence = self._connection_fences.get(group)
+        if fence is not None and not fence.retired and fence.connection_id == connection_id:
+            fence.retired = True
+        if was_paired:
+            self._lost_groups.append(group)
+        if not any(item.group == group for item in self._peers.values()):
+            self._statuses[group] = _EventConnectionStatus(
+                group=group,
+                connected=False,
+                queued_count=0,
+                queued_bytes=0,
+                reason=reason,
+            )
+        if first_error is not None:
+            raise first_error
+
+    def _fence_authentication(
+        self,
+        peer: _ServerPeer,
+        authentication: _EventAuthentication,
+    ) -> None:
+        """Reject stale roles and advance one bounded group fence."""
+        group = authentication.group
+        connection_id = authentication.connection_id
+        fence = self._connection_fences.get(group)
+        if fence is None:
+            self._connection_fences[group] = _ConnectionFence(
+                accepted_sequence=peer.accepted_sequence,
+                connection_id=connection_id,
+            )
+            return
+        if fence.connection_id == connection_id:
+            if fence.retired:
+                raise _IPCAuthenticationError('event connection identity was already used')
+            fence.accepted_sequence = max(
+                fence.accepted_sequence,
+                peer.accepted_sequence,
+            )
+            return
+        if peer.accepted_sequence <= fence.accepted_sequence:
+            raise _IPCAuthenticationError('event connection role is stale')
+        current = next(
+            (
+                item
+                for item in self._peers.values()
+                if item.group == group and item.connection_id == fence.connection_id
+            ),
+            None,
+        )
+        if current is not None:
+            self._close_pair(current, reason='peer-reconnected')
+        self._connection_fences[group] = _ConnectionFence(
+            accepted_sequence=peer.accepted_sequence,
+            connection_id=connection_id,
+        )
+
+    def _authenticate(self, peer: _ServerPeer, body: bytes) -> None:
+        """Authenticate one pending peer exactly once."""
+        if peer.group is not None:
+            raise _IPCAuthenticationError('authenticated event peer sent input')
+        authentication = _decode_auth_body(body)
+        identity = peer_identity(peer.socket)
+        if identity.uid != self._expected_uid:
+            raise _IPCAuthenticationError('event peer user conflicts')
+        grant = self._grants.get(authentication.group)
+        if (
+            grant is None
+            or authentication.source != self._source
+            or authentication.source != grant.source
+            or authentication.spawn_instance != grant.dependent_spawn_instance
+            or authentication.capability != grant.capability
+        ):
+            raise _IPCAuthenticationError('event peer grant conflicts')
+        self._fence_authentication(peer, authentication)
+        same_role = self._connection_peer(
+            authentication.group,
+            authentication.connection_id,
+            authentication.role,
+        )
+        if same_role is not None:
+            self._close_pair(same_role, reason='duplicate-peer-role')
+            raise _IPCAuthenticationError('event connection role is duplicated')
+        peer.grant = grant
+        peer.connection_id = authentication.connection_id
+        peer.group = authentication.group
+        peer.role = authentication.role
+        peer.writer = (
+            _PartialWriter(max_entries=1)
+            if authentication.role == 'coordination'
+            else _PartialWriter(
+                max_entries=self._queue_max_entries,
+                max_bytes=self._queue_max_bytes,
+            )
+        )
+        if (
+            self._connection_peer(
+                authentication.group,
+                authentication.connection_id,
+                'event',
+            )
+            is not None
+            and self._connection_peer(
+                authentication.group,
+                authentication.connection_id,
+                'coordination',
+            )
+            is not None
+        ):
+            self._statuses[authentication.group] = _EventConnectionStatus(
+                group=authentication.group,
+                connected=True,
+                queued_count=0,
+                queued_bytes=0,
+                reason=None,
+            )
+
     def _modify_peer(self, peer: _ServerPeer) -> None:
         """Refresh selector interests for one open peer."""
         selector = self._selector
-        if selector is not None and peer._socket.fileno() >= 0:
-            selector.modify(peer._socket, self._events(peer), peer)
-
-    def _close_connection(
-        self,
-        group: str,
-        connection_id: str,
-        *,
-        reason: str,
-    ) -> None:
-        """Queue a disconnect for one exact pair without touching replacement."""
-        event_peer = self._connection_peer(group, connection_id, 'event')
-        coordination = self._connection_peer(group, connection_id, 'coordination')
-        if event_peer is None:
-            return
-        if coordination is None or coordination._writer._started:
-            self._close_pair(event_peer, reason=reason)
-            return
-        frame = _detach_frame(reason)
-        coordination._writer._clear()
-        if not coordination._writer._append(frame):
-            self._close_pair(event_peer, reason=reason)
-            return
-        coordination._close_after_flush = reason
-        self._modify_peer(coordination)
+        if selector is not None and peer.socket.fileno() >= 0:
+            selector.modify(peer.socket, self._events(peer), peer)
 
     def _pair_is_closing(self, event_peer: _ServerPeer) -> bool:
         """Return whether an exact pair is flushing its disconnect."""
-        group = event_peer._group
-        connection_id = event_peer._connection_id
+        group = event_peer.group
+        connection_id = event_peer.connection_id
         if group is None or connection_id is None:
             return True
         coordination = self._connection_peer(group, connection_id, 'coordination')
-        return coordination is None or coordination._close_after_flush is not None
+        return coordination is None or coordination.close_after_flush is not None
 
     def _paired_event_peer(
         self,
@@ -2648,93 +2930,59 @@ class EventServer:
             return None
         return event_peer
 
-    def _offer_hint_connection(
-        self,
-        group: str,
-        connection_id: str,
-        message: RangeChanged,
-    ) -> bool:
-        """Queue one coalesced hint on a peer without closing it at capacity."""
-        peer = self._paired_event_peer(group, connection_id)
-        if peer is None:
-            return False
-        frame = self._frame_encoder(message)
-        if frame._wire_bytes - _LENGTH_BYTES > self._max_frame_bytes:
-            raise _FrameError('event frame body exceeds configured maximum')
-        if not peer._writer._append_hint(frame):
-            return False
-        self._modify_peer(peer)
-        return True
-
-    def _offer_paced_connection(
-        self,
-        group: str,
-        connection_id: str,
-        message: FanoutMessage,
-    ) -> bool:
-        """Offer one strict frame only to one exact event role."""
-        frame = self._frame_encoder(message)
-        if frame._wire_bytes - _LENGTH_BYTES > self._max_frame_bytes:
-            raise _FrameError('event frame body exceeds configured maximum')
-        peer = self._paired_event_peer(group, connection_id)
-        if peer is None:
-            raise ConnectionError(f'event group is not connected: {group}')
-        if not peer._writer._append(frame):
-            return False
-        self._modify_peer(peer)
-        return True
-
     def _queue_join_reply(
         self,
         peer: _ServerPeer,
         call: _JoinCall,
         result: _JoinResult,
         error: str | None,
+        detach_reason: str | None,
     ) -> None:
         """Queue one bounded correlated reply while the peer remains open."""
-        if peer._socket.fileno() < 0:
+        if peer.socket.fileno() < 0:
             return
         frame = _encode_join_reply(
             _JoinReply(
-                _request_id=call._request_id,
-                _result=result,
-                _error=error,
+                request_id=call.request_id,
+                result=result,
+                error=error,
+                detach_reason=detach_reason,
             )
         )
-        if frame._wire_bytes - _LENGTH_BYTES > self._max_frame_bytes:
+        if frame.wire_bytes - IPC_LENGTH_BYTES > self._max_frame_bytes:
             self._close_pair(peer, reason='join-reply-too-large')
             return
-        if not peer._writer._append(frame):
+        if not peer.writer.append(frame):
             self._close_pair(
                 peer,
-                reason=peer._writer._rejection_reason or 'queue-exhausted',
+                reason=peer.writer.rejection_reason or 'queue-exhausted',
             )
             return
         self._modify_peer(peer)
 
     def _queue_peer_body(self, peer: _ServerPeer, body: bytes) -> None:
         """Authenticate one body or queue one coordination call."""
-        if peer._group is None:
+        if peer.group is None:
             self._authenticate(peer, body)
-            unread = peer._reader._handoff()
-            peer._reader = _RawFrameReader(max_frame_bytes=self._max_frame_bytes)
-            for buffered_body in peer._reader._feed(unread):
+            unread = peer.reader.handoff()
+            peer.reader = _RawFrameReader(max_frame_bytes=self._max_frame_bytes)
+            for buffered_body in peer.reader.feed(unread):
                 self._queue_peer_body(peer, buffered_body)
             return
-        if peer._role != 'coordination':
+        if peer.role != 'coordination':
             raise _IPCAuthenticationError('event peer sent coordination input')
-        if peer._active_request_id is not None:
+        if peer.active_request_id is not None:
             raise _FrameError('coordination peer sent a concurrent request')
         call = _decode_join_call(body)
-        peer._active_request_id = call._request_id
+        peer.active_request_id = call.request_id
         self._requests.append((peer, call))
 
     def _read_peer(self, peer: _ServerPeer) -> None:
         """Read authentication or queue bounded join calls."""
-        if peer._socket.fileno() < 0:
+        if peer.socket.fileno() < 0:
             return
         try:
-            data = peer._socket.recv(min(65_536, peer._reader._read_size))
+            data = peer.socket.recv(min(65_536, peer.reader.read_size))
         except BlockingIOError:
             return
         except (BrokenPipeError, ConnectionResetError):
@@ -2749,9 +2997,9 @@ class EventServer:
             self._close_pair(peer, reason='peer-eof')
             return
         try:
-            bodies = peer._reader._feed(
+            bodies = peer.reader.feed(
                 data,
-                frame_limit=1 if peer._group is None else None,
+                frame_limit=1 if peer.group is None else None,
             )
             for body in bodies:
                 self._queue_peer_body(peer, body)
@@ -2763,76 +3011,29 @@ class EventServer:
         group: str,
         connection_id: str,
         peer: _ServerPeer | None,
-    ) -> EventConnectionStatus:
+    ) -> _EventConnectionStatus:
         """Project queue accounting or the current fence for an exact event peer."""
         if peer is None:
             fence = self._connection_fences.get(group)
-            return EventConnectionStatus(
-                _group=group,
-                _connected=False,
+            return _EventConnectionStatus(
+                group=group,
+                connected=False,
                 queued_count=0,
                 queued_bytes=0,
-                _reason=(
+                reason=(
                     'connection-replaced'
                     if fence is not None
-                    and (fence._retired or fence._connection_id != connection_id)
+                    and (fence.retired or fence.connection_id != connection_id)
                     else 'not-connected'
                 ),
             )
-        return EventConnectionStatus(
-            _group=group,
-            _connected=True,
-            queued_count=peer._writer._pending_count,
-            queued_bytes=peer._writer._pending_bytes,
-            _reason=None,
+        return _EventConnectionStatus(
+            group=group,
+            connected=True,
+            queued_count=peer.writer.pending_count,
+            queued_bytes=peer.writer.pending_bytes,
+            reason=None,
         )
-
-    def _connection_status(
-        self,
-        group: str,
-        connection_id: str,
-    ) -> EventConnectionStatus:
-        """Return event accounting for one exact sibling pair."""
-        peer = self._paired_event_peer(group, connection_id)
-        return self._status_from_peer(group, connection_id, peer)
-
-    def _group_status(self, group: str) -> EventConnectionStatus:
-        """Return current or last body-free status for one group."""
-        peer = self._current_event_peer(group)
-        if peer is not None and peer._connection_id is not None:
-            return self._connection_status(group, peer._connection_id)
-        return self._statuses.get(
-            group,
-            EventConnectionStatus(
-                _group=group,
-                _connected=False,
-                queued_count=0,
-                queued_bytes=0,
-                _reason='not-connected',
-            ),
-        )
-
-    def _publish_connection(
-        self,
-        group: str,
-        connection_id: str,
-        message: FanoutMessage,
-    ) -> EventConnectionStatus:
-        """Publish one frame only to one exact event role."""
-        frame = self._frame_encoder(message)
-        if frame._wire_bytes - _LENGTH_BYTES > self._max_frame_bytes:
-            raise _FrameError('event frame body exceeds configured maximum')
-        peer = self._paired_event_peer(group, connection_id)
-        if peer is None:
-            return self._connection_status(group, connection_id)
-        if not peer._writer._append(frame):
-            self._close_pair(
-                peer,
-                reason=peer._writer._rejection_reason or 'queue-exhausted',
-            )
-            return self._connection_status(group, connection_id)
-        self._modify_peer(peer)
-        return self._connection_status(group, connection_id)
 
     def _unlink_owned_socket(self) -> None:
         """Unlink only the socket inode created by this server."""
@@ -2866,7 +3067,7 @@ class EventServer:
     ) -> _JoinResult:
         """Execute one identity-checked join call on the source thread."""
         call_source, call_group = self._join_call_identity(call)
-        value = call._value
+        value = call.value
         error_message = (
             'remote bootstrap identity conflicts'
             if isinstance(value, GroupBootstrapRequest)
@@ -2900,10 +3101,15 @@ class EventServer:
         return result
 
     def close(self) -> None:
-        """Close peers, listener, selector, and exact owned socket path."""
+        """Close peers, listener, selector, and exact owned socket path.
+
+        Raises:
+            OSError: A transport resource cannot be closed or the owned socket
+                path cannot be inspected or removed.
+        """
 
         def close_peer_if_open(peer: _ServerPeer) -> None:
-            if peer._socket.fileno() in self._peers:
+            if peer.socket.fileno() in self._peers:
                 self._close_pair(peer, reason='server-closed')
 
         cleanups = (
@@ -2932,6 +3138,30 @@ class EventServer:
         if first_error is not None:
             raise first_error
 
+    def close_connection(
+        self,
+        group: str,
+        connection_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Queue a disconnect for one exact pair without touching replacement."""
+        event_peer = self._connection_peer(group, connection_id, 'event')
+        coordination = self._connection_peer(group, connection_id, 'coordination')
+        if event_peer is None:
+            return
+        if coordination is None or coordination.writer.started:
+            self._close_pair(event_peer, reason=reason)
+            return
+        self._log_detach(event_peer, reason)
+        frame = _event_control_frame('detach', {'reason': reason})
+        coordination.writer.clear()
+        if not coordination.writer.append(frame):
+            self._close_pair(event_peer, reason=reason)
+            return
+        coordination.close_after_flush = reason
+        self._modify_peer(coordination)
+
     @property
     def connected(self) -> bool:
         """Return whether the source event listener is open.
@@ -2947,14 +3177,14 @@ class EventServer:
         return tuple(
             sorted(
                 {
-                    peer._group
+                    peer.group
                     for peer in self._peers.values()
-                    if peer._group is not None
-                    and peer._role == 'event'
-                    and peer._connection_id is not None
+                    if peer.group is not None
+                    and peer.role == 'event'
+                    and peer.connection_id is not None
                     and self._connection_peer(
-                        peer._group,
-                        peer._connection_id,
+                        peer.group,
+                        peer.connection_id,
                         'coordination',
                     )
                     is not None
@@ -2962,7 +3192,7 @@ class EventServer:
             )
         )
 
-    def connected_group_statuses(self) -> tuple[EventConnectionStatus, ...]:
+    def connected_group_statuses(self) -> tuple[_EventConnectionStatus, ...]:
         """Return fresh paired-group status using one per-call peer index.
 
         Returns:
@@ -2970,13 +3200,11 @@ class EventServer:
             as disconnected. Unpaired roles are omitted.
         """
         peers = {
-            (peer._group, peer._connection_id, peer._role): peer
+            (peer.group, peer.connection_id, peer.role): peer
             for peer in self._peers.values()
-            if peer._group is not None
-            and peer._connection_id is not None
-            and peer._role is not None
+            if peer.group is not None and peer.connection_id is not None and peer.role is not None
         }
-        statuses: dict[str, EventConnectionStatus] = {}
+        statuses: dict[str, _EventConnectionStatus] = {}
         for (group, connection_id, role), peer in peers.items():
             if role != 'event':
                 continue
@@ -2985,9 +3213,34 @@ class EventServer:
                 statuses[group] = self._status_from_peer(
                     group,
                     connection_id,
-                    peer if coordination._close_after_flush is None else None,
+                    peer if coordination.close_after_flush is None else None,
                 )
         return tuple(statuses[group] for group in sorted(statuses))
+
+    def connection_status(
+        self,
+        group: str,
+        connection_id: str,
+    ) -> _EventConnectionStatus:
+        """Return event accounting for one exact sibling pair."""
+        peer = self._paired_event_peer(group, connection_id)
+        return self._status_from_peer(group, connection_id, peer)
+
+    def _group_status(self, group: str) -> _EventConnectionStatus:
+        """Return current or last body-free status for one group."""
+        peer = self._current_event_peer(group)
+        if peer is not None and peer.connection_id is not None:
+            return self.connection_status(group, peer.connection_id)
+        return self._statuses.get(
+            group,
+            _EventConnectionStatus(
+                group=group,
+                connected=False,
+                queued_count=0,
+                queued_bytes=0,
+                reason='not-connected',
+            ),
+        )
 
     def dispatch_join_requests(self, source: _JoinSource) -> None:
         """Execute queued join work and queue replies on the source thread.
@@ -2996,8 +3249,16 @@ class EventServer:
         queued channel loss, executes the pending source operations, and queues
         their replies without taking ownership of `source`.
 
+        Channel-loss notification failures propagate. Ordinary queued-call
+        failures become error replies, while a stopped owner write propagates
+        so the owning component can stop.
+
         Args:
             source: Source-thread-owned join and channel-loss authority.
+
+        Raises:
+            WriteLockStoppedError: A source-owner write wait is interrupted.
+            OSError: Updating peer selectors or cleaning up a peer fails.
         """
         while self._lost_groups:
             source.event_channel_lost(
@@ -3007,26 +3268,27 @@ class EventServer:
         pending_count = len(self._requests)
         for _ in range(pending_count):
             peer, call = self._requests.popleft()
-            group = peer._group
-            grant = peer._grant
-            connection_id = peer._connection_id
+            group = peer.group
+            grant = peer.grant
+            connection_id = peer.connection_id
             if (
-                peer._socket.fileno() < 0
-                or peer._role != 'coordination'
+                peer.socket.fileno() < 0
+                or peer.role != 'coordination'
                 or group is None
                 or connection_id is None
                 or grant is None
                 or grant != self._grants.get(group)
-                or peer._active_request_id != call._request_id
+                or peer.active_request_id != call.request_id
             ):
                 continue
             if (
-                isinstance(call._value, JoinRequest)
+                isinstance(call.value, JoinRequest)
                 and self._paired_event_peer(group, connection_id) is None
             ):
                 self._requests.append((peer, call))
                 continue
             error: str | None = None
+            detach_reason: str | None = None
             result: _JoinResult = None
             try:
                 result = self._dispatch_join_call(
@@ -3035,10 +3297,12 @@ class EventServer:
                     connection_id,
                     call,
                 )
+            except LiveChannelDetachedError as exception:
+                detach_reason = exception.reason
             except Exception as exception:  # noqa: BLE001
                 raise_owner_write_failure(exception)
                 error = f'{type(exception).__name__}: {exception}'
-            self._queue_join_reply(peer, call, result, error)
+            self._queue_join_reply(peer, call, result, error, detach_reason)
 
     def install_grant(self, grant: EventPeerGrant) -> EventPeerReady:
         """Install or replace one exact dependent authorization.
@@ -3051,6 +3315,7 @@ class EventServer:
 
         Raises:
             ValueError: The grant names a different source.
+            OSError: Closing replaced peer transports fails.
         """
         if grant.source != self._source:
             raise ValueError('event grant source conflicts with endpoint')
@@ -3058,7 +3323,7 @@ class EventServer:
         if previous != grant:
             while True:
                 peer = next(
-                    (item for item in self._peers.values() if item._group == grant.group),
+                    (item for item in self._peers.values() if item.group == grant.group),
                     None,
                 )
                 if peer is None:
@@ -3072,6 +3337,71 @@ class EventServer:
             dependent_spawn_instance=grant.dependent_spawn_instance,
         )
 
+    def offer_hint_connection(
+        self,
+        group: str,
+        connection_id: str,
+        message: RangeChanged,
+    ) -> bool:
+        """Queue one coalesced hint on a peer without closing it at capacity.
+
+        Args:
+            group: Exact destination group.
+            connection_id: Exact authenticated event/coordination pair.
+            message: Range-change hint to queue or coalesce.
+
+        Returns:
+            `True` when queued or already represented by a pending hint;
+            `False` when the pair is absent or its queue has no capacity.
+
+        Raises:
+            ValueError: The encoded frame exceeds the configured body limit.
+            OSError: Updating the peer's selector interest fails.
+        """
+        peer = self._paired_event_peer(group, connection_id)
+        if peer is None:
+            return False
+        frame = self._frame_encoder(message)
+        if frame.wire_bytes - IPC_LENGTH_BYTES > self._max_frame_bytes:
+            raise _FrameError('event frame body exceeds configured maximum')
+        if not peer.writer.append_hint(frame):
+            return False
+        self._modify_peer(peer)
+        return True
+
+    def offer_paced_connection(
+        self,
+        group: str,
+        connection_id: str,
+        message: FanoutMessage,
+    ) -> bool:
+        """Offer one strict frame only to one exact event role.
+
+        Args:
+            group: Exact destination group.
+            connection_id: Exact authenticated event/coordination pair.
+            message: Frame offered without detaching the pair at capacity.
+
+        Returns:
+            Whether the frame was admitted; `False` leaves a full peer
+            attached.
+
+        Raises:
+            ConnectionError: The exact usable pair is absent.
+            ValueError: The encoded frame exceeds the configured body limit.
+            OSError: Updating the peer's selector interest fails.
+        """
+        frame = self._frame_encoder(message)
+        if frame.wire_bytes - IPC_LENGTH_BYTES > self._max_frame_bytes:
+            raise _FrameError('event frame body exceeds configured maximum')
+        peer = self._paired_event_peer(group, connection_id)
+        if peer is None:
+            raise ConnectionError(f'event group is not connected: {group}')
+        if not peer.writer.append(frame):
+            return False
+        self._modify_peer(peer)
+        return True
+
     def poll(self, timeout: float = 0.0) -> None:
         """Drive accepts, authentication, EOF detection, and partial writes.
 
@@ -3080,6 +3410,8 @@ class EventServer:
 
         Raises:
             RuntimeError: The server is not open.
+            OSError: Accepting, reading, selecting, or cleaning up a peer
+                fails.
         """
         selector = self._selector
         if selector is None:
@@ -3091,20 +3423,57 @@ class EventServer:
             peer = cast('_ServerPeer', key.data)
             if mask & selectors.EVENT_READ:
                 self._read_peer(peer)
-            if peer._socket.fileno() < 0:
+            if peer.socket.fileno() < 0:
                 continue
             if mask & selectors.EVENT_WRITE:
                 try:
-                    peer._writer._flush(peer._socket)
+                    peer.writer.flush(peer.socket)
                 except (ConnectionError, OSError):
                     self._close_pair(peer, reason='peer-write-failed')
                     continue
-                if not peer._writer._has_pending and peer._close_after_flush is not None:
-                    self._close_pair(peer, reason=peer._close_after_flush)
+                if not peer.writer.has_pending and peer.close_after_flush is not None:
+                    self._close_pair(peer, reason=peer.close_after_flush)
                     continue
-                if peer._role == 'coordination' and not peer._writer._pending_count:
-                    peer._active_request_id = None
+                if peer.role == 'coordination' and not peer.writer.pending_count:
+                    peer.active_request_id = None
             self._modify_peer(peer)
+
+    def publish_connection(
+        self,
+        group: str,
+        connection_id: str,
+        message: FanoutMessage,
+    ) -> _EventConnectionStatus:
+        """Publish one frame only to one exact event role.
+
+        Args:
+            group: Exact destination group.
+            connection_id: Exact authenticated event/coordination pair.
+            message: Frame to publish to that pair.
+
+        Returns:
+            Current connection and queue status. An absent pair returns a
+            disconnected status; insufficient queue capacity closes the pair
+            and returns its disconnected status.
+
+        Raises:
+            ValueError: The encoded frame exceeds the configured body limit.
+            OSError: Updating peer selectors or closing the pair fails.
+        """
+        frame = self._frame_encoder(message)
+        if frame.wire_bytes - IPC_LENGTH_BYTES > self._max_frame_bytes:
+            raise _FrameError('event frame body exceeds configured maximum')
+        peer = self._paired_event_peer(group, connection_id)
+        if peer is None:
+            return self._status_from_peer(group, connection_id, peer)
+        if not peer.writer.append(frame):
+            self._close_pair(
+                peer,
+                reason=peer.writer.rejection_reason or 'queue-exhausted',
+            )
+            return self.connection_status(group, connection_id)
+        self._modify_peer(peer)
+        return self._status_from_peer(group, connection_id, peer)
 
     @property
     def socket_buffers(self) -> SocketBufferSizes:
@@ -3127,10 +3496,12 @@ class EventServer:
         Raises:
             SecurityError: An existing endpoint is unsafe, live, or replaced
                 during inspection, or its liveness cannot be established.
+            OSError: The endpoint or its socket resources cannot be opened or
+                configured.
         """
         if self._listener is not None:
             return
-        remove_stale_socket(self._path)
+        remove_stale_socket(self._path, timeout_secs=self._socket_probe_timeout_secs)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self._socket_buffers = _request_socket_buffers(
@@ -3246,52 +3617,44 @@ def _contains_secret_key(key: str) -> bool:
 
 def _decode_json(value: bytes, *, context: str) -> dict[str, object]:
     """Decode one strict duplicate-free JSON object."""
-
-    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        decoded: dict[str, object] = {}
-        for key, item in pairs:
-            if key in decoded:
-                raise _FrameError(f'{context} has a duplicate JSON key')
-            decoded[key] = item
-        return decoded
-
-    def reject_constant(constant: str) -> object:
-        raise _FrameError(f'{context} has a non-finite number: {constant}')
-
     try:
-        decoded = json.loads(
-            value.decode('utf-8', errors='strict'),
-            object_pairs_hook=object_pairs,
-            parse_constant=reject_constant,
-        )
-    except _FrameError:
-        raise
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        decoded = decode_json(value)
+    except ValueError as error:
         raise _FrameError(f'{context} is invalid: {error}') from error
     if not isinstance(decoded, dict):
         raise _FrameError(f'{context} must be an object')
     return cast('dict[str, object]', decoded)
 
 
-def _detach_frame(reason: str) -> _OutboundFrame:
-    """Encode one body-free peer detach."""
-    metadata = {'reason': reason}
-    header = encode_event_header('detach', metadata)
-    return _OutboundFrame(
-        _header=header,
-        _payload=b'',
-        _charge_bytes=event_frame_bytes('detach', metadata),
-    )
+def _decode_strict_ordering_fields(
+    fields: Mapping[str, object],
+    identity: LiveJoinIdentity,
+) -> StrictOrderingControl:
+    """Decode contained ordering values after the caller validates its envelope."""
+    try:
+        return StrictOrderingControl(
+            identity=identity,
+            event_id=cast('int', fields['event_id']),
+            last_delivered_id=cast('int', fields['last_delivered_id']),
+            delivery_floor=cast('int', fields['delivery_floor']),
+            action=cast("Literal['halt']", fields['action']),
+        )
+    except ValueError as error:
+        raise _FrameError(f'strict ordering control is invalid: {error}') from error
 
 
 def _encode_fanout_message(message: FanoutMessage) -> _OutboundFrame:
     """Frame one immutable fanout message without reserializing event bodies."""
     kind, metadata, payload = message.wire_parts()
-    header = encode_event_header(kind, metadata)
+    header = (
+        message.encoded.header
+        if isinstance(message, EventDelivery)
+        else encode_event_header(kind, metadata)
+    )
     return _OutboundFrame(
-        _header=header,
-        _payload=payload,
-        _charge_bytes=message.byte_count,
+        header=header,
+        payload=payload,
+        charge_bytes=message.byte_count,
     )
 
 
@@ -3307,13 +3670,13 @@ def _auth_body(authentication: _EventAuthentication) -> bytes:
     """Encode one event peer authentication body."""
     return _encode_json(
         {
-            'capability': authentication._capability,
-            'connection_id': authentication._connection_id,
-            'group': authentication._group,
-            'role': authentication._role,
+            'capability': authentication.capability,
+            'connection_id': authentication.connection_id,
+            'group': authentication.group,
+            'role': authentication.role,
             'schema': _AUTH_SCHEMA,
-            'source': authentication._source,
-            'spawn_instance': authentication._spawn_instance,
+            'source': authentication.source,
+            'spawn_instance': authentication.spawn_instance,
             'version': _EVENT_AUTH_PROTOCOL_VERSION,
         }
     )
@@ -3326,16 +3689,16 @@ def _event_control_frame(
     """Encode one body-free event-channel control frame."""
     header = encode_event_header(kind, metadata)
     return _OutboundFrame(
-        _header=header,
-        _payload=b'',
-        _charge_bytes=event_frame_bytes(kind, metadata),
+        header=header,
+        payload=b'',
+        charge_bytes=event_frame_bytes(kind, metadata),
     )
 
 
 def _encode_join_call(call: _JoinCall) -> _OutboundFrame:
     """Encode one closed request-correlated lane-to-source call."""
-    metadata: dict[str, object] = {'request_id': call._request_id}
-    value = call._value
+    metadata: dict[str, object] = {'request_id': call.request_id}
+    value = call.value
     if isinstance(value, GroupBootstrapRequest):
         metadata.update(_bootstrap_request_payload(value))
         kind = 'group-bootstrap-observe'
@@ -3353,9 +3716,7 @@ def _encode_join_call(call: _JoinCall) -> _OutboundFrame:
         kind = 'join-abort'
     else:
         control = value
-        metadata['control_kind'] = (
-            'capacity' if isinstance(control, StrictCapacityControl) else 'ordering'
-        )
+        metadata['control_kind'] = 'ordering'
         control_metadata = strict_control_metadata(control)
         metadata['identity'] = control_metadata.pop('identity')
         metadata.update(control_metadata)
@@ -3365,7 +3726,7 @@ def _encode_join_call(call: _JoinCall) -> _OutboundFrame:
 
 def _encode_join_reply(reply: _JoinReply) -> _OutboundFrame:
     """Encode one closed request-correlated source reply."""
-    result = reply._result
+    result = reply.result
     payload: dict[str, object] | None
     bootstrap_reply = _bootstrap_reply_payload(result)
     if bootstrap_reply is not None:
@@ -3397,8 +3758,9 @@ def _encode_join_reply(reply: _JoinReply) -> _OutboundFrame:
     return _event_control_frame(
         'join-reply',
         {
-            'error': reply._error,
-            'request_id': reply._request_id,
+            'detach_reason': reply.detach_reason,
+            'error': reply.error,
+            'request_id': reply.request_id,
             'result': payload,
             'result_kind': result_kind,
         },
@@ -3418,13 +3780,13 @@ def _exact_fields(
 
 def _decode_event_body(body: bytes) -> tuple[str, dict[str, object], bytes]:
     """Decode event metadata and payload from an already unprefixed body."""
-    if len(body) < _LENGTH_BYTES:
+    if len(body) < IPC_LENGTH_BYTES:
         raise _FrameError('event frame header length is truncated')
-    (header_length,) = struct.unpack('!I', body[:_LENGTH_BYTES])
-    if header_length <= 0 or header_length > len(body) - _LENGTH_BYTES:
+    (header_length,) = struct.unpack('!I', body[:IPC_LENGTH_BYTES])
+    if header_length <= 0 or header_length > len(body) - IPC_LENGTH_BYTES:
         raise _FrameError('event frame header length conflicts')
-    header_end = _LENGTH_BYTES + header_length
-    header = _decode_json(body[_LENGTH_BYTES:header_end], context='event frame')
+    header_end = IPC_LENGTH_BYTES + header_length
+    header = _decode_json(body[IPC_LENGTH_BYTES:header_end], context='event frame')
     payload = body[header_end:]
     _exact_fields(
         header,
@@ -3444,6 +3806,30 @@ def _decode_event_body(body: bytes) -> tuple[str, dict[str, object], bytes]:
     return kind, cast('dict[str, object]', metadata), payload
 
 
+def _decode_join_control(
+    fields: Mapping[str, object],
+    identity: LiveJoinIdentity,
+) -> StrictOrderingControl:
+    """Decode one strict ordering acknowledgement."""
+    control_kind = fields.get('control_kind')
+    if control_kind != 'ordering':
+        raise _FrameError('strict acknowledgement kind conflicts')
+    _exact_fields(
+        fields,
+        {
+            'action',
+            'control_kind',
+            'delivery_floor',
+            'event_id',
+            'identity',
+            'last_delivered_id',
+            'request_id',
+        },
+        context='strict ordering acknowledgement',
+    )
+    return _decode_strict_ordering_fields(fields, identity)
+
+
 def _finite_float(value: object, *, context: str) -> float:
     """Decode one exact finite JSON integer or float with protocol context."""
     if type(value) not in {float, int}:
@@ -3459,9 +3845,9 @@ def _finite_float(value: object, *, context: str) -> float:
 
 def _frame_length(value: bytes | bytearray, *, max_frame_bytes: int) -> int | None:
     """Read and validate a complete prefix, or await remaining prefix bytes."""
-    if len(value) < _LENGTH_BYTES:
+    if len(value) < IPC_LENGTH_BYTES:
         return None
-    (length,) = struct.unpack('!I', value[:_LENGTH_BYTES])
+    (length,) = struct.unpack('!I', value[:IPC_LENGTH_BYTES])
     if length <= 0:
         raise _FrameError('frame length must be positive')
     if length > max_frame_bytes:
@@ -3539,6 +3925,13 @@ def _group_recovery_ready_payload(
     }
 
 
+def _health_array(value: object) -> list[object]:
+    """Require one decoded JSON array before validating its members."""
+    if not isinstance(value, list):
+        raise _FrameError('health collection must be an array')
+    return cast('list[object]', value)
+
+
 def _health_bool(fields: Mapping[str, object], name: str) -> bool:
     """Require an exact wire boolean without truthiness conversion."""
     value = fields[name]
@@ -3553,12 +3946,12 @@ def _health_fields(
     *,
     context: str,
 ) -> Mapping[str, object]:
-    """Require one exact secret-safe health object before decoding its fields."""
+    """Require one exact health object before decoding and record validation."""
     if not isinstance(value, dict):
         raise _FrameError(f'{context} must be an object')
     mapping = cast('dict[str, object]', value)
     _exact_fields(mapping, expected, context=context)
-    return _freeze_health_payload(mapping)
+    return mapping
 
 
 def _health_int(fields: Mapping[str, object], name: str) -> int:
@@ -3567,6 +3960,14 @@ def _health_int(fields: Mapping[str, object], name: str) -> int:
     if type(value) is not int:
         raise _FrameError(f'health {name} must be an integer')
     return value
+
+
+def _health_ints(value: object) -> tuple[int, ...]:
+    """Require integer members in one frozen health array."""
+    items = _health_array(value)
+    if not all(type(item) is int for item in items):
+        raise _FrameError('health collection members must be integers')
+    return tuple(cast('list[int]', items))
 
 
 def _health_number(fields: Mapping[str, object], name: str) -> float:
@@ -3600,6 +4001,14 @@ def _health_payload_wire(value: Mapping[str, object]) -> dict[str, object]:
         return item
 
     return cast('dict[str, object]', _copy(value))
+
+
+def _health_strings(value: object) -> tuple[str, ...]:
+    """Require string members in one frozen health array."""
+    items = _health_array(value)
+    if not all(isinstance(item, str) for item in items):
+        raise _FrameError('health collection members must be text')
+    return tuple(cast('list[str]', items))
 
 
 def _health_text(fields: Mapping[str, object], name: str) -> str:
@@ -3644,103 +4053,6 @@ def _decode_event_socket_health(value: object) -> EventSocketHealth:
     )
 
 
-def _decode_watchdog_health(value: object) -> WatchdogHealth:
-    """Decode exact watchdog field types before applying record invariants."""
-    fields = _health_fields(value, WatchdogHealth.__dataclass_fields__, context='watchdog health')
-    return WatchdogHealth(
-        kind=cast('WatchdogKind', _health_enum(fields, 'kind', WATCHDOG_KINDS)),
-        site=_health_text(fields, 'site'),
-        source=_health_optional_text(fields, 'source'),
-        group=_health_optional_text(fields, 'group'),
-        worker_instance=_health_text(fields, 'worker_instance'),
-        phase=cast(
-            'WatchdogPhase',
-            _health_enum(fields, 'phase', WATCHDOG_PHASES),
-        ),
-        heartbeat_at=_health_number(fields, 'heartbeat_at'),
-        deadline_at=_health_optional_number(fields, 'deadline_at'),
-        event_id=_health_optional_int(fields, 'event_id'),
-        plugin_id=_health_optional_text(fields, 'plugin_id'),
-        callback_id=_health_optional_text(fields, 'callback_id'),
-        delivery_attempt=_health_optional_int(fields, 'delivery_attempt'),
-        operator_command=_health_optional_text(fields, 'operator_command'),
-    )
-
-
-def _health_tuple(value: object) -> tuple[object, ...]:
-    """Require an array already frozen at the health-object boundary."""
-    if not isinstance(value, tuple):
-        raise _FrameError('health collection must be an array')
-    return cast('tuple[object, ...]', value)
-
-
-def _health_ints(value: object) -> tuple[int, ...]:
-    """Require integer members in one frozen health array."""
-    items = _health_tuple(value)
-    if not all(type(item) is int for item in items):
-        raise _FrameError('health collection members must be integers')
-    return cast('tuple[int, ...]', items)
-
-
-def _decode_source_health(value: object) -> SourceHealth:
-    """Decode exact source field types before applying record invariants."""
-    fields = _health_fields(value, SourceHealth.__dataclass_fields__, context='source health')
-    retention: list[tuple[str, int, int, int]] = []
-    for item in _health_tuple(fields['strict_retention']):
-        row = _health_tuple(item)
-        if len(row) != _STRICT_RETENTION_LENGTH or not isinstance(row[0], str):
-            raise _FrameError('source health strict retention row conflicts')
-        counts = _health_ints(row[1:])
-        retention.append((row[0], counts[0], counts[1], counts[2]))
-    return SourceHealth(
-        site=_health_text(fields, 'site'),
-        source=_health_text(fields, 'source'),
-        source_generation=_health_text(fields, 'source_generation'),
-        status=cast(
-            'SourceRunStatus',
-            _health_enum(
-                fields,
-                'status',
-                SOURCE_RUN_STATUSES,
-            ),
-        ),
-        frontier=_health_int(fields, 'frontier'),
-        successful_clock=_health_number(fields, 'successful_clock'),
-        retry_attempt=_health_int(fields, 'retry_attempt'),
-        next_retry_secs=_health_optional_number(fields, 'next_retry_secs'),
-        open_range_count=_health_int(fields, 'open_range_count'),
-        late_id_count=_health_int(fields, 'late_id_count'),
-        last_error=_health_optional_text(fields, 'last_error'),
-        worker_instance=_health_text(fields, 'worker_instance'),
-        initialized=_health_bool(fields, 'initialized'),
-        pending_obligation_count=_health_int(fields, 'pending_obligation_count'),
-        orphan_marker_count=_health_int(fields, 'orphan_marker_count'),
-        strict_buffer_event_count=_health_int(fields, 'strict_buffer_event_count'),
-        strict_buffer_byte_count=_health_int(fields, 'strict_buffer_byte_count'),
-        strict_retention=tuple(retention),
-        checkpoint_state=_health_text(fields, 'checkpoint_state'),
-        stream_incarnation=_health_optional_text(fields, 'stream_incarnation'),
-        audit_count=_health_int(fields, 'audit_count'),
-        database_size_bytes=_health_int(fields, 'database_size_bytes'),
-        phase=cast(
-            'SourceWatchdogPhase',
-            _health_enum(fields, 'phase', SOURCE_WATCHDOG_PHASES),
-        ),
-        heartbeat_at=_health_number(fields, 'heartbeat_at'),
-        heartbeat_age=_health_number(fields, 'heartbeat_age'),
-        deadline_at=_health_optional_number(fields, 'deadline_at'),
-        overdue_reason=_health_optional_text(fields, 'overdue_reason'),
-    )
-
-
-def _health_strings(value: object) -> tuple[str, ...]:
-    """Require string members in one frozen health array."""
-    items = _health_tuple(value)
-    if not all(isinstance(item, str) for item in items):
-        raise _FrameError('health collection members must be text')
-    return cast('tuple[str, ...]', items)
-
-
 def _decode_group_health(value: object) -> GroupHealth:
     """Decode exact group field types before applying record invariants."""
     fields = _health_fields(value, GroupHealth.__dataclass_fields__, context='group health')
@@ -3781,23 +4093,92 @@ def _decode_group_health(value: object) -> GroupHealth:
         park_reason=_health_optional_text(fields, 'park_reason'),
         failure_kind=_health_optional_text(fields, 'failure_kind'),
         failure_text=_health_optional_text(fields, 'failure_text'),
-        checkpoint_state=_health_text(fields, 'checkpoint_state'),
         conditions=_health_strings(fields['conditions']),
         audit_count=_health_int(fields, 'audit_count'),
+        replay_required_from=_health_optional_int(fields, 'replay_required_from'),
+        history_truncated_floor=_health_optional_int(fields, 'history_truncated_floor'),
         deadline_at=_health_optional_number(fields, 'deadline_at'),
         overdue_reason=_health_optional_text(fields, 'overdue_reason'),
+    )
+
+
+def _decode_source_health(value: object) -> SourceHealth:
+    """Decode exact source field types before applying record invariants."""
+    fields = _health_fields(value, SourceHealth.__dataclass_fields__, context='source health')
+    retention: list[tuple[str, int, int, int]] = []
+    for item in _health_array(fields['strict_retention']):
+        row = _health_array(item)
+        if len(row) != _STRICT_RETENTION_LENGTH or not isinstance(row[0], str):
+            raise _FrameError('source health strict retention row conflicts')
+        counts = _health_ints(row[1:])
+        retention.append((row[0], counts[0], counts[1], counts[2]))
+    return SourceHealth(
+        site=_health_text(fields, 'site'),
+        source=_health_text(fields, 'source'),
+        source_generation=_health_text(fields, 'source_generation'),
+        status=cast(
+            'SourceRunStatus',
+            _health_enum(
+                fields,
+                'status',
+                SOURCE_RUN_STATUSES,
+            ),
+        ),
+        frontier=_health_int(fields, 'frontier'),
+        successful_clock=_health_number(fields, 'successful_clock'),
+        retry_attempt=_health_int(fields, 'retry_attempt'),
+        next_retry_secs=_health_optional_number(fields, 'next_retry_secs'),
+        open_range_count=_health_int(fields, 'open_range_count'),
+        late_id_count=_health_int(fields, 'late_id_count'),
+        last_error=_health_optional_text(fields, 'last_error'),
+        worker_instance=_health_text(fields, 'worker_instance'),
+        initialized=_health_bool(fields, 'initialized'),
+        pending_obligation_count=_health_int(fields, 'pending_obligation_count'),
+        orphan_marker_count=_health_int(fields, 'orphan_marker_count'),
+        strict_buffer_event_count=_health_int(fields, 'strict_buffer_event_count'),
+        strict_buffer_byte_count=_health_int(fields, 'strict_buffer_byte_count'),
+        strict_retention=tuple(retention),
+        conditions=_health_strings(fields['conditions']),
+        stream_incarnation=_health_optional_text(fields, 'stream_incarnation'),
+        audit_count=_health_int(fields, 'audit_count'),
+        database_size_bytes=_health_int(fields, 'database_size_bytes'),
+        phase=cast(
+            'SourceWatchdogPhase',
+            _health_enum(fields, 'phase', SOURCE_WATCHDOG_PHASES),
+        ),
+        heartbeat_at=_health_number(fields, 'heartbeat_at'),
+        heartbeat_age=_health_number(fields, 'heartbeat_age'),
+        deadline_at=_health_optional_number(fields, 'deadline_at'),
+        overdue_reason=_health_optional_text(fields, 'overdue_reason'),
+    )
+
+
+def _decode_watchdog_health(value: object) -> WatchdogHealth:
+    """Decode exact watchdog field types before applying record invariants."""
+    fields = _health_fields(value, WatchdogHealth.__dataclass_fields__, context='watchdog health')
+    return WatchdogHealth(
+        kind=cast('WatchdogKind', _health_enum(fields, 'kind', WATCHDOG_KINDS)),
+        site=_health_text(fields, 'site'),
+        source=_health_optional_text(fields, 'source'),
+        group=_health_optional_text(fields, 'group'),
+        worker_instance=_health_text(fields, 'worker_instance'),
+        phase=cast(
+            'WatchdogPhase',
+            _health_enum(fields, 'phase', WATCHDOG_PHASES),
+        ),
+        heartbeat_at=_health_number(fields, 'heartbeat_at'),
+        deadline_at=_health_optional_number(fields, 'deadline_at'),
+        event_id=_health_optional_int(fields, 'event_id'),
+        plugin_id=_health_optional_text(fields, 'plugin_id'),
+        callback_id=_health_optional_text(fields, 'callback_id'),
+        delivery_attempt=_health_optional_int(fields, 'delivery_attempt'),
+        operator_command=_health_optional_text(fields, 'operator_command'),
     )
 
 
 def _decode_worker_health(value: object) -> WorkerHealth:
     """Decode exact worker field types before applying record invariants."""
     fields = _health_fields(value, WorkerHealth.__dataclass_fields__, context='worker health')
-    outages: list[tuple[str, str]] = []
-    for item in _health_tuple(fields['source_outages']):
-        row = _health_strings(item)
-        if len(row) != _PAIR_LENGTH:
-            raise _FrameError('worker health source outage row conflicts')
-        outages.append((row[0], row[1]))
     return WorkerHealth(
         site=_health_text(fields, 'site'),
         worker_id=_health_text(fields, 'worker_id'),
@@ -3806,12 +4187,9 @@ def _decode_worker_health(value: object) -> WorkerHealth:
         monitor_alive=_health_bool(fields, 'monitor_alive'),
         thread_names=_health_strings(fields['thread_names']),
         stuck_threads=_health_strings(fields['stuck_threads']),
-        breaker_open=_health_bool(fields, 'breaker_open'),
-        breaker_reason=_health_optional_text(fields, 'breaker_reason'),
         socket_buffer_requested=_health_int(fields, 'socket_buffer_requested'),
         socket_send_buffer=_health_int(fields, 'socket_send_buffer'),
         socket_receive_buffer=_health_int(fields, 'socket_receive_buffer'),
-        source_outages=tuple(outages),
         heartbeat_age=_health_number(fields, 'heartbeat_age'),
         watchdog_failure=_health_optional_text(fields, 'watchdog_failure'),
     )
@@ -3869,80 +4247,21 @@ def _decode_event_delivery(
     return EventDelivery(EncodedEvent.from_event_frame(event_id, payload))
 
 
-def _decode_strict_capacity_fields(
-    fields: Mapping[str, object],
-    identity: LiveJoinIdentity,
-) -> StrictCapacityControl:
-    """Decode contained capacity values after the caller validates its envelope."""
-    return StrictCapacityControl(
-        identity=identity,
-        abort_limit=_positive_int(fields['abort_limit'], context='strict capacity abort limit'),
-    )
-
-
-def _decode_strict_ordering_fields(
-    fields: Mapping[str, object],
-    identity: LiveJoinIdentity,
-) -> StrictOrderingControl:
-    """Decode contained ordering values after the caller validates its envelope."""
-    action = fields['action']
-    if not isinstance(action, str) or action not in {'halt', 'skip'}:
-        raise _FrameError('strict ordering action conflicts')
-    delivery_floor = fields['delivery_floor']
-    last_delivered_id = fields['last_delivered_id']
-    if type(delivery_floor) is not int or delivery_floor < 0:
-        raise _FrameError('strict ordering delivery floor must be nonnegative')
-    if type(last_delivered_id) is not int or last_delivered_id < 0:
-        raise _FrameError('strict ordering last delivered id must be nonnegative')
-    return StrictOrderingControl(
-        identity=identity,
-        event_id=_positive_int(
-            fields['event_id'],
-            context='strict ordering event id',
-        ),
-        last_delivered_id=last_delivered_id,
-        delivery_floor=delivery_floor,
-        action=cast("Literal['halt', 'skip']", action),
-    )
-
-
-def _decode_join_control(
-    fields: Mapping[str, object],
-    identity: LiveJoinIdentity,
-) -> StrictCapacityControl | StrictOrderingControl:
-    """Decode one strict capacity or ordering acknowledgement."""
-    control_kind = fields.get('control_kind')
-    if control_kind == 'capacity':
-        _exact_fields(
-            fields,
-            {'abort_limit', 'control_kind', 'identity', 'request_id'},
-            context='strict capacity acknowledgement',
-        )
-        return _decode_strict_capacity_fields(fields, identity)
-    if control_kind != 'ordering':
-        raise _FrameError('strict acknowledgement kind conflicts')
-    _exact_fields(
-        fields,
-        {
-            'action',
-            'control_kind',
-            'delivery_floor',
-            'event_id',
-            'identity',
-            'last_delivered_id',
-            'request_id',
-        },
-        context='strict ordering acknowledgement',
-    )
-    return _decode_strict_ordering_fields(fields, identity)
-
-
 def _request_socket_buffers(sock: socket.socket, requested: int) -> SocketBufferSizes:
-    """Request bounded buffers and record platform-reported effective values."""
+    """Request best-effort buffers and record platform-reported effective values."""
     if requested <= 0:
         raise ValueError('requested socket buffer bytes must be positive')
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, requested)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested)
+    for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        size = requested
+        while size > 0:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, option, size)
+            except OSError as error:
+                if error.errno != errno.ENOBUFS:
+                    raise
+                size //= 2
+            else:
+                break
     return SocketBufferSizes(
         requested=requested,
         send=int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)),
@@ -4122,18 +4441,18 @@ def _decode_auth_body(value: bytes) -> _EventAuthentication:
     if not isinstance(role, str) or role not in {'coordination', 'event'}:
         raise _IPCAuthenticationError('event peer role conflicts')
     return _EventAuthentication(
-        _capability=_string(
+        capability=_string(
             payload['capability'],
             context='event authentication capability',
         ),
-        _connection_id=_string(
+        connection_id=_string(
             payload['connection_id'],
             context='event authentication connection identity',
         ),
-        _group=_string(payload['group'], context='event authentication group'),
-        _role=cast("Literal['coordination', 'event']", role),
-        _source=_string(payload['source'], context='event authentication source'),
-        _spawn_instance=_string(
+        group=_string(payload['group'], context='event authentication group'),
+        role=cast("Literal['coordination', 'event']", role),
+        source=_string(payload['source'], context='event authentication source'),
+        spawn_instance=_string(
             payload['spawn_instance'],
             context='event authentication spawn instance',
         ),
@@ -4405,36 +4724,21 @@ def _decode_group_recovery_ready(fields: Mapping[str, object]) -> GroupRecoveryR
         context='group recovery ready',
     )
 
-    def _recovery_text(field: str, context: str) -> str:
-        text = _string(fields[field], context=context)
-        if looks_secret(text):
-            raise _FrameError(f'{context} contains secret-looking text')
-        return text
-
-    generation = fields['group_generation']
-    revision = fields['resulting_revision']
-    outcome = _string(fields['outcome'], context='group recovery ready outcome')
-    if type(generation) is not int or generation < 0:
-        raise _FrameError('group recovery ready generation must be nonnegative')
-    if type(revision) is not int or revision < 0:
-        raise _FrameError('group recovery ready revision must be nonnegative')
-    if outcome not in {'parked', 'stale'}:
-        raise _FrameError('group recovery ready outcome is invalid')
-    return GroupRecoveryReady(
-        spawn_instance=_recovery_text(
-            'spawn_instance',
-            'group recovery ready spawn',
-        ),
-        evidence_id=_recovery_text(
-            'evidence_id',
-            'group recovery ready evidence id',
-        ),
-        site=_recovery_text('site', 'group recovery ready site'),
-        group=_recovery_text('group', 'group recovery ready group'),
-        group_generation=generation,
-        outcome=cast('ConditionalParkOutcome', outcome),
-        resulting_revision=revision,
-    )
+    try:
+        return GroupRecoveryReady(
+            spawn_instance=_string(fields['spawn_instance'], context='group recovery ready spawn'),
+            evidence_id=_string(fields['evidence_id'], context='group recovery ready evidence id'),
+            site=_string(fields['site'], context='group recovery ready site'),
+            group=_string(fields['group'], context='group recovery ready group'),
+            group_generation=cast('int', fields['group_generation']),
+            outcome=cast(
+                'ConditionalParkOutcome',
+                _string(fields['outcome'], context='group recovery ready outcome'),
+            ),
+            resulting_revision=cast('int', fields['resulting_revision']),
+        )
+    except ValueError as error:
+        raise _FrameError(f'group recovery ready is invalid: {error}') from error
 
 
 def _decode_hello(fields: Mapping[str, object]) -> ControlHello:
@@ -4579,21 +4883,15 @@ def _decode_source_group_assignment(value: object) -> SourceGroupAssignment:
             },
             context='source group assignment',
         )
-        orphan_generation = fields['orphan_generation']
-        reserved_generation = fields['reserved_generation']
-        if (
-            type(orphan_generation) is not int
-            or orphan_generation < 0
-            or type(reserved_generation) is not int
-            or reserved_generation <= orphan_generation
-        ):
-            raise _FrameError('pending source generation fence is invalid')
-        return PendingDispositionSourceGroupAssignment(
-            source=_string(fields['source'], context='source group source'),
-            group=_string(fields['group'], context='source group name'),
-            orphan_generation=orphan_generation,
-            reserved_generation=reserved_generation,
-        )
+        try:
+            return PendingDispositionSourceGroupAssignment(
+                source=_string(fields['source'], context='source group source'),
+                group=_string(fields['group'], context='source group name'),
+                orphan_generation=cast('int', fields['orphan_generation']),
+                reserved_generation=cast('int', fields['reserved_generation']),
+            )
+        except ValueError as error:
+            raise _FrameError(f'pending source assignment is invalid: {error}') from error
     if kind != 'active':
         raise _FrameError('source group assignment kind conflicts')
     _exact_fields(
@@ -4751,9 +5049,9 @@ def _unpack_length_frame(value: bytes, *, max_frame_bytes: int) -> bytes:
     length = _frame_length(value, max_frame_bytes=max_frame_bytes)
     if length is None:
         raise _FrameError('length-prefixed frame is truncated')
-    if len(value) != _LENGTH_BYTES + length:
+    if len(value) != IPC_LENGTH_BYTES + length:
         raise _FrameError('length-prefixed frame size conflicts')
-    return value[_LENGTH_BYTES:]
+    return value[IPC_LENGTH_BYTES:]
 
 
 def _decode_event_envelope(
@@ -4761,6 +5059,18 @@ def _decode_event_envelope(
 ) -> tuple[str, dict[str, object], bytes]:
     """Decode and validate one event envelope around opaque payload bytes."""
     return _decode_event_body(_unpack_length_frame(frame, max_frame_bytes=2**32 - 1))
+
+
+def _validate_group_identity(
+    source: str, group: str, generation: int, start_mode: StartMode, *, context: str
+) -> None:
+    """Validate the shared assignment and bootstrap identity contract."""
+    if not source or not group:
+        raise ValueError(f'{context} identity must not be empty')
+    if type(generation) is not int or generation < 0:
+        raise ValueError(f'{context} generation is invalid')
+    if not is_start_mode(start_mode):
+        raise ValueError(f'{context} start mode is invalid')
 
 
 def _wire_identity(payload: Mapping[str, object]) -> LiveJoinIdentity:
@@ -4818,9 +5128,9 @@ def _decode_identity_join_call(
     decoded_identity = _wire_identity(cast('dict[str, object]', identity))
     if kind == 'join-confirm':
         _exact_fields(fields, {'identity', 'request_id'}, context='join confirm')
-        value: (
-            JoinAbort | JoinConfirm | JoinFinalize | StrictCapacityControl | StrictOrderingControl
-        ) = JoinConfirm(decoded_identity)
+        value: JoinAbort | JoinConfirm | JoinFinalize | StrictOrderingControl = JoinConfirm(
+            decoded_identity
+        )
     elif kind == 'join-finalize':
         _exact_fields(fields, {'identity', 'request_id'}, context='join finalize')
         value = JoinFinalize(decoded_identity)
@@ -4918,13 +5228,18 @@ def _decode_join_reply(fields: Mapping[str, object]) -> _JoinReply:
     """Decode one closed request-correlated source reply."""
     _exact_fields(
         fields,
-        {'error', 'request_id', 'result', 'result_kind'},
+        {'detach_reason', 'error', 'request_id', 'result', 'result_kind'},
         context='join reply',
     )
     request_id = _positive_int(fields['request_id'], context='join reply id')
     error = fields['error']
     if error is not None and not isinstance(error, str):
         raise _FrameError('join reply error must be text or null')
+    detach_reason = fields['detach_reason']
+    if detach_reason is not None and not isinstance(detach_reason, str):
+        raise _FrameError('join reply detach reason must be text or null')
+    if error is not None and detach_reason is not None:
+        raise _FrameError('join reply contains both error and detach reason')
     result_kind = fields['result_kind']
     result_payload = fields['result']
     if result_kind == 'none':
@@ -4934,27 +5249,10 @@ def _decode_join_reply(fields: Mapping[str, object]) -> _JoinReply:
     else:
         result = _decode_join_result(result_kind, result_payload)
     return _JoinReply(
-        _request_id=request_id,
-        _result=result,
-        _error=error,
-    )
-
-
-def _decode_strict_capacity(
-    fields: Mapping[str, object],
-) -> StrictCapacityControl:
-    """Decode one body-free strict-capacity control."""
-    _exact_fields(
-        fields,
-        {'abort_limit', 'identity'},
-        context='strict capacity metadata',
-    )
-    identity = fields['identity']
-    if not isinstance(identity, dict):
-        raise _FrameError('strict capacity identity must be an object')
-    return _decode_strict_capacity_fields(
-        fields,
-        _wire_identity(cast('dict[str, object]', identity)),
+        request_id=request_id,
+        result=result,
+        error=error,
+        detach_reason=detach_reason,
     )
 
 
@@ -4979,13 +5277,11 @@ def _decode_strict_ordering(
 def _decode_body_free_event(
     kind: str,
     fields: Mapping[str, object],
-) -> StrictCapacityControl | StrictOrderingControl | RangeChanged | _PeerDetach:
+) -> StrictOrderingControl | RangeChanged | _PeerDetach:
     """Decode one body-free event-channel control."""
     if kind == 'detach':
         _exact_fields(fields, {'reason'}, context='detach metadata')
-        return _PeerDetach(_reason=_string(fields['reason'], context='detach reason'))
-    if kind == 'strict-capacity':
-        return _decode_strict_capacity(fields)
+        return _PeerDetach(reason=_string(fields['reason'], context='detach reason'))
     if kind == 'strict-ordering':
         return _decode_strict_ordering(fields)
     if kind == 'range-changed':
@@ -5022,6 +5318,9 @@ def encode_control_message(message: ControlMessage) -> bytes:
 
     Returns:
         Complete length-prefixed canonical frame.
+
+    Raises:
+        ValueError: The message cannot be encoded as canonical strict JSON.
     """
     kind, payload = _message_payload(message)
     body = _encode_json(

@@ -10,7 +10,8 @@ if TYPE_CHECKING:
 
 EVENT_SCHEMA = 'sg-event-daemon-event-channel'
 EVENT_VERSION = 1
-_SEGMENTED_FRAME_PREFIX_BYTES = 8
+IPC_LENGTH_BYTES = 4
+SEGMENTED_FRAME_PREFIX_BYTES = 8
 
 
 def encode_event_header(kind: str, metadata: Mapping[str, object]) -> bytes:
@@ -54,7 +55,7 @@ def event_frame_bytes(
         Complete bytes including both four-byte prefix words.
     """
     return (
-        _SEGMENTED_FRAME_PREFIX_BYTES
+        SEGMENTED_FRAME_PREFIX_BYTES
         + len(encode_event_header(kind, metadata))
         + payload_byte_count
     )

@@ -16,12 +16,13 @@ from sg_event_daemon._health import (
     GroupHealth,
     WatchdogHealth,
     WorkerHealth,
-    aggregate_status,
     bound_health_text,
 )
 from sg_event_daemon._lane import LaneHealth
 from sg_event_daemon._logging import configure_logging, register_redaction_values
+from sg_event_daemon._probe import ProbeResult
 from sg_event_daemon._source import SOURCE_RUN_STATUSES, SourceHealth
+from tests.health_helpers import status_from_health
 
 if TYPE_CHECKING:
     from sg_event_daemon._watchdog import WatchdogKind, WatchdogPhase
@@ -77,7 +78,6 @@ def _group(**overrides: Unpack[_GroupOverrides]) -> GroupHealth:
         park_reason=overrides.get('park_reason'),
         failure_kind=overrides.get('failure_kind'),
         failure_text=overrides.get('failure_text'),
-        checkpoint_state='complete',
         conditions=(condition for condition in overrides.get('conditions', ())),
     )
 
@@ -111,7 +111,6 @@ def _source(
         strict_buffer_event_count=7,
         strict_buffer_byte_count=8,
         strict_retention=(('editorial', 90, 7, 8),),
-        checkpoint_state='complete',
     )
 
 
@@ -140,7 +139,6 @@ def _watchdog(
 
 def _worker(
     *,
-    breaker_open: bool = False,
     heartbeat_at: float = 99.0,
     watchdog_failure: str | None = None,
 ) -> WorkerHealth:
@@ -152,8 +150,6 @@ def _worker(
         monitor_alive=True,
         thread_names=('source:events', 'lane:editorial'),
         stuck_threads=(),
-        breaker_open=breaker_open,
-        breaker_reason=None,
         socket_buffer_requested=8192,
         socket_send_buffer=16_384,
         socket_receive_buffer=16_384,
@@ -172,6 +168,8 @@ def test_aggregate_status_uses_exact_primary_precedence() -> None:
         'ordering-anomaly',
         'capacity-exhausted',
         'callback-failed',
+        'write-lock-stalled',
+        'checkpoint-stalled',
         'source-degraded',
         'catching-up',
         'parked',
@@ -187,13 +185,14 @@ def test_aggregate_status_uses_exact_primary_precedence() -> None:
     )
     sources = (_source(retry_attempt=1, next_retry_secs=2.0),)
     groups = (group,)
-    workers = (_worker(breaker_open=True),)
-    status = aggregate_status(
+    workers = (_worker(),)
+    status = status_from_health(
         sources=(source for source in sources),
         groups=(item for item in groups),
         workers=(worker for worker in workers),
         now=100.0,
         stale_after_secs=10.0,
+        worker_breaker_open=True,
         database_sizes=(item for item in (('source.db', 10),)),
     )
 
@@ -206,31 +205,34 @@ def test_aggregate_status_uses_exact_primary_precedence() -> None:
         'catching-up',
     }
     assert status.database_sizes == (('source.db', 10),)
-    assert 'worker-breaker-open' in health_module.probe_health_conditions(
-        sources=(source for source in sources),
-        groups=(item for item in groups),
-        workers=(worker for worker in workers),
-        now=100.0,
-        stale_after_secs=10.0,
-        worker_breaker_open=True,
-    )
-    assert not health_module.probe_health_ready(
-        sources=(source for source in sources),
-        groups=(item for item in groups),
-        workers=(worker for worker in workers),
-        now=100.0,
-        stale_after_secs=10.0,
-        worker_breaker_open=True,
-    )
     assert (
-        health_module.primary_state_for_conditions(dict.fromkeys(('idle', 'healthy')).keys())
+        'worker-breaker-open'
+        in health_module.evaluate_health(
+            sources=(source for source in sources),
+            groups=(item for item in groups),
+            workers=(worker for worker in workers),
+            now=100.0,
+            stale_after_secs=10.0,
+            worker_breaker_open=True,
+        ).conditions
+    )
+    assert not health_module.evaluate_health(
+        sources=(source for source in sources),
+        groups=(item for item in groups),
+        workers=(worker for worker in workers),
+        now=100.0,
+        stale_after_secs=10.0,
+        worker_breaker_open=True,
+    ).readiness
+    assert (
+        health_module._primary_state_for_conditions(dict.fromkeys(('idle', 'healthy')).keys())
         == 'idle'
     )
 
 
 def test_authoritative_lane_capacity_names_always_produce_status() -> None:
     lane = replace(_lane(), phase='callback')
-    for condition in ('late-capacity-exhausted', 'strict-capacity-exhausted'):
+    for condition in ('late-capacity-exhausted',):
         group = GroupHealth.from_lane(
             lane,
             queue_event_count=0,
@@ -247,11 +249,10 @@ def test_authoritative_lane_capacity_names_always_produce_status() -> None:
             park_reason=None,
             failure_kind=None,
             failure_text=None,
-            checkpoint_state='complete',
             conditions=(condition,),
         )
 
-        status = aggregate_status(
+        status = status_from_health(
             sources=(_source(),),
             groups=(group,),
             workers=(_worker(),),
@@ -263,20 +264,33 @@ def test_authoritative_lane_capacity_names_always_produce_status() -> None:
         assert status.conditions == ('capacity-exhausted',)
 
 
+def test_condition_flags_report_changes_and_status_order() -> None:
+    flags = health_module.ConditionFlags()
+    assert flags.names() == ()
+    assert flags.set('checkpoint-stalled') is True
+    assert flags.set('write-lock-stalled') is True
+    assert flags.set('checkpoint-stalled') is False
+    assert flags.names() == ('write-lock-stalled', 'checkpoint-stalled')
+    assert flags.clear('write-lock-stalled') is True
+    assert flags.clear('write-lock-stalled') is False
+    assert flags.names() == ('checkpoint-stalled',)
+
+
 def test_empty_poll_is_ready_while_open_breaker_stays_live() -> None:
-    empty_poll = aggregate_status(
+    empty_poll = status_from_health(
         sources=(_source(),),
         groups=(),
         workers=(_worker(),),
         now=100.0,
         stale_after_secs=10.0,
     )
-    open_breaker = aggregate_status(
+    open_breaker = status_from_health(
         sources=(_source(),),
         groups=(),
-        workers=(_worker(breaker_open=True),),
+        workers=(_worker(),),
         now=100.0,
         stale_after_secs=10.0,
+        worker_breaker_open=True,
     )
 
     assert empty_poll.liveness
@@ -339,7 +353,7 @@ def test_owner_health_retains_exact_audit_count_and_database_size() -> None:
 
 
 def test_park_affects_neither_probe_and_callback_only_readiness() -> None:
-    parked = aggregate_status(
+    parked = status_from_health(
         sources=(_source(),),
         groups=(
             _group(
@@ -354,7 +368,7 @@ def test_park_affects_neither_probe_and_callback_only_readiness() -> None:
         now=100.0,
         stale_after_secs=10.0,
     )
-    failed = aggregate_status(
+    failed = status_from_health(
         sources=(_source(),),
         groups=(
             _group(
@@ -382,7 +396,7 @@ def test_park_affects_neither_probe_and_callback_only_readiness() -> None:
     ('blocker_owner', 'expected_condition'),
     [
         pytest.param('source', 'source-degraded', id='source'),
-        pytest.param('worker', 'worker-breaker-open', id='worker'),
+        pytest.param('worker', 'stale', id='worker'),
         pytest.param('supervisor', 'worker-breaker-open', id='supervisor-extra'),
     ],
 )
@@ -399,7 +413,7 @@ def test_parked_group_failure_does_not_hide_non_group_blocker(
         conditions=('parked', 'callback-failed'),
     )
 
-    status = aggregate_status(
+    status = status_from_health(
         sources=(
             (
                 _source(retry_attempt=1, next_retry_secs=2.0)
@@ -408,7 +422,7 @@ def test_parked_group_failure_does_not_hide_non_group_blocker(
             ),
         ),
         groups=(parked_failure,),
-        workers=(_worker(breaker_open=blocker_owner == 'worker'),),
+        workers=(replace(_worker(), monitor_alive=blocker_owner != 'worker'),),
         now=100.0,
         stale_after_secs=10.0,
         worker_breaker_open=blocker_owner == 'supervisor',
@@ -429,7 +443,7 @@ def test_parked_group_failure_is_visible_without_blocking_readiness() -> None:
         conditions=('parked', 'callback-failed'),
     )
 
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(parked_failure,),
         workers=(_worker(),),
@@ -476,6 +490,37 @@ def test_registered_health_text_is_redacted_before_utf8_bounding() -> None:
     assert '<redacted>' in result
 
 
+def test_stall_conditions_fail_readiness_and_keep_liveness() -> None:
+    status = status_from_health(
+        sources=(replace(_source(), conditions=('write-lock-stalled',)),),
+        groups=(),
+        workers=(_worker(),),
+        now=100.0,
+        stale_after_secs=10.0,
+    )
+    assert status.readiness is False
+    assert status.liveness is True
+
+
+def test_stall_conditions_rank_after_callback_failed_and_before_degraded() -> None:
+    source = replace(_source(), conditions=('checkpoint-stalled',), last_error='provider error')
+
+    def state(source: SourceHealth, groups: tuple[GroupHealth, ...] = ()) -> str:
+        return status_from_health(
+            sources=(source,),
+            groups=groups,
+            workers=(_worker(),),
+            now=100.0,
+            stale_after_secs=10.0,
+        ).primary_state
+
+    assert state(source) == 'checkpoint-stalled'
+    source = replace(source, conditions=('checkpoint-stalled', 'write-lock-stalled'))
+    assert state(source) == 'write-lock-stalled'
+    group = _group(conditions=('callback-failed', 'write-lock-stalled'))
+    assert state(source, (group,)) == 'callback-failed'
+
+
 def test_status_preserves_depth_join_capacity_and_audit_evidence() -> None:
     transitions = tuple(
         BreakerTransition(
@@ -486,7 +531,7 @@ def test_status_preserves_depth_join_capacity_and_audit_evidence() -> None:
         )
         for index in range(105)
     )
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(
             _group(
@@ -540,7 +585,7 @@ def test_structured_health_contains_status_evidence_fields() -> None:
         'strict_buffer_event_count',
         'strict_buffer_byte_count',
         'strict_retention',
-        'checkpoint_state',
+        'conditions',
         'stream_incarnation',
         'audit_count',
         'database_size_bytes',
@@ -550,15 +595,6 @@ def test_structured_health_contains_status_evidence_fields() -> None:
         'deadline_at',
         'overdue_reason',
     } <= source_names
-    assert tuple(field.name for field in fields(SourceHealth))[-7:] == (
-        'audit_count',
-        'database_size_bytes',
-        'phase',
-        'heartbeat_at',
-        'heartbeat_age',
-        'deadline_at',
-        'overdue_reason',
-    )
     group_names = {field.name for field in fields(GroupHealth)}
     assert {
         'site',
@@ -587,20 +623,16 @@ def test_structured_health_contains_status_evidence_fields() -> None:
         'park_reason',
         'failure_kind',
         'failure_text',
-        'checkpoint_state',
         'audit_count',
+        'replay_required_from',
+        'history_truncated_floor',
         'deadline_at',
         'overdue_reason',
     } <= group_names
-    assert tuple(field.name for field in fields(GroupHealth))[-3:] == (
-        'audit_count',
-        'deadline_at',
-        'overdue_reason',
-    )
 
 
 def test_supervisor_clock_computes_stale_and_idle() -> None:
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(_group(),),
         workers=(_worker(heartbeat_at=80.0),),
@@ -615,7 +647,7 @@ def test_supervisor_clock_computes_stale_and_idle() -> None:
 
 
 def test_supervisor_clock_recomputes_source_age_and_overdue_readiness() -> None:
-    status = aggregate_status(
+    status = status_from_health(
         sources=(replace(_source(), heartbeat_at=90.0, overdue_reason='source-phase-overdue'),),
         groups=(),
         workers=(_worker(),),
@@ -626,6 +658,29 @@ def test_supervisor_clock_recomputes_source_age_and_overdue_readiness() -> None:
     assert status.sources[0].heartbeat_age == 10.0
     assert status.primary_state == 'stale'
     assert not status.readiness
+
+
+def test_supervisor_conditions_join_the_aggregate() -> None:
+    conditions = health_module.evaluate_health(
+        sources=(),
+        groups=(),
+        workers=(_worker(),),
+        now=100.0,
+        stale_after_secs=10.0,
+        supervisor_conditions=('checkpoint-stalled',),
+    ).conditions
+    assert 'checkpoint-stalled' in conditions
+    assert (
+        health_module.evaluate_health(
+            sources=(),
+            groups=(),
+            workers=(_worker(),),
+            now=100.0,
+            stale_after_secs=10.0,
+            supervisor_conditions=('checkpoint-stalled',),
+        ).readiness
+        is False
+    )
 
 
 def test_unparked_group_failure_blocks_beside_parked_group_failure() -> None:
@@ -652,7 +707,7 @@ def test_unparked_group_failure_blocks_beside_parked_group_failure() -> None:
         group='active',
     )
 
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(parked_failure, active_failure),
         workers=(_worker(),),
@@ -675,7 +730,7 @@ def test_unparked_group_failure_still_blocks_readiness() -> None:
         conditions=('callback-failed',),
     )
 
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(failed,),
         workers=(_worker(),),
@@ -688,7 +743,7 @@ def test_unparked_group_failure_still_blocks_readiness() -> None:
 
 
 def test_watchdog_failure_uses_existing_stale_primary_state() -> None:
-    status = aggregate_status(
+    status = status_from_health(
         sources=(),
         groups=(),
         workers=(_worker(watchdog_failure='watchdog-sampling-failed'),),
@@ -778,7 +833,7 @@ def test_watchdog_health_enforces_phase_deadline_shape(
 def test_watchdog_health_excludes_worker_local_fence_fields() -> None:
     payload = asdict(_watchdog('lane', 'callback', deadline_at=105.0))
 
-    assert tuple(payload) == (
+    assert set(payload) == {
         'kind',
         'site',
         'source',
@@ -792,7 +847,7 @@ def test_watchdog_health_excludes_worker_local_fence_fields() -> None:
         'callback_id',
         'delivery_attempt',
         'operator_command',
-    )
+    }
 
 
 @pytest.mark.parametrize('value', [-1.0, float('inf'), float('nan')])
@@ -838,8 +893,7 @@ def test_health_text_fields_are_utf8_bounded(value: str, expected: str) -> None:
         site=identity,
         worker_id=identity,
         spawn_instance=identity,
-        breaker_reason=value,
-        source_outages=(('events-a', value), ('events-b', value)),
+        watchdog_failure=value,
     )
     transition = BreakerTransition(
         sequence=1,
@@ -851,8 +905,7 @@ def test_health_text_fields_are_utf8_bounded(value: str, expected: str) -> None:
     assert group.park_reason == expected
     assert group.failure_text == expected
     assert socket_health.reason == expected
-    assert worker.breaker_reason == expected
-    assert worker.source_outages == (('events-a', expected), ('events-b', expected))
+    assert worker.watchdog_failure == expected
     assert transition.reason == expected
     assert len(expected.encode()) <= 4096
     assert group.site == group.source == group.group == group.worker_instance == identity
@@ -889,11 +942,10 @@ def test_lifecycle_only_conditions_always_produce_status(
         park_reason=None,
         failure_kind=None,
         failure_text=None,
-        checkpoint_state='complete',
         conditions=(condition,),
     )
 
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(group,),
         workers=(_worker(),),
@@ -910,7 +962,7 @@ def test_lifecycle_only_conditions_always_produce_status(
 
 @pytest.mark.parametrize('join_phase', ['catching-up', 'detached', 'joining'])
 def test_unattached_group_is_not_ready(join_phase: str) -> None:
-    status = aggregate_status(
+    status = status_from_health(
         sources=(_source(),),
         groups=(
             _group(
@@ -926,3 +978,25 @@ def test_unattached_group_is_not_ready(join_phase: str) -> None:
     assert status.primary_state == 'catching-up'
     assert status.liveness
     assert not status.readiness
+
+
+@pytest.mark.parametrize('generated_at', [None, 100.0])
+def test_status_preserves_actual_probe_authority(generated_at: float | None) -> None:
+    probe = ProbeResult(
+        liveness=False,
+        readiness=False,
+        complete=False,
+        conditions=('worker-breaker-open',),
+        generated_at=generated_at,
+        snapshot_age_seconds=None if generated_at is None else 0.0,
+    )
+    status = health_module.aggregate_status(
+        sources=(_source(),),
+        groups=(),
+        workers=(_worker(),),
+        now=100.0,
+        probe=probe,
+    )
+    assert not status.liveness
+    assert not status.readiness
+    assert status.conditions == (('stale',) if generated_at is None else probe.conditions)

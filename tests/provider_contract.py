@@ -50,10 +50,10 @@ class _Handle(Protocol):
 
 class _OfficialConnection:
     def __init__(self) -> None:
-        self._closed = False
+        self.closed = False
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
 
 class _OfficialPool:
@@ -63,7 +63,7 @@ class _OfficialPool:
 
 class _OfficialResponder:
     def __init__(self) -> None:
-        self._requests: list[dict[str, object]] = []
+        self.requests: list[dict[str, object]] = []
 
     def request(
         self,
@@ -76,7 +76,7 @@ class _OfficialResponder:
         if not isinstance(body, bytes | str):
             raise TypeError('official provider emitted a body-free request')
         payload = cast('dict[str, object]', json.loads(body))
-        self._requests.append(payload)
+        self.requests.append(payload)
         result = _response_result(payload)
         return (200, 'OK'), {'content-type': 'application/json'}, json.dumps({'results': result})
 
@@ -91,27 +91,27 @@ class _LocalAsyncTransport:
         response_factory: Callable[..., object],
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        self._checkins = 0
-        self._checkouts = 0
-        self._closed = False
+        self.checkins = 0
+        self.checkouts = 0
+        self.closed = False
         self._loop = loop
-        self._requests: list[dict[str, object]] = []
+        self.requests: list[dict[str, object]] = []
         self._response_factory = response_factory
 
     def checkin(self) -> None:
-        self._checkins += 1
+        self.checkins += 1
 
     def checkout(self) -> None:
-        self._checkouts += 1
+        self.checkouts += 1
 
     async def close(self) -> None:
         assert asyncio.get_running_loop() is self._loop
-        self._closed = True
+        self.closed = True
 
     async def send(self, request: _Request) -> object:
         assert asyncio.get_running_loop() is self._loop
         payload = _decode_request(request)
-        self._requests.append(payload)
+        self.requests.append(payload)
         return self._response_factory(**_response_arguments(payload))
 
     async def send_streaming(self, _request: _Request) -> object:
@@ -120,19 +120,16 @@ class _LocalAsyncTransport:
 
 class _LocalTransport:
     def __init__(self, response_factory: Callable[..., object]) -> None:
-        self._closed = False
-        self._requests: list[dict[str, object]] = []
+        self.closed = False
+        self.requests: list[dict[str, object]] = []
         self._response_factory = response_factory
 
-    def abort(self, _token: str) -> None:
-        pass
-
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def send(self, request: _Request) -> object:
         payload = _decode_request(request)
-        self._requests.append(payload)
+        self.requests.append(payload)
         return self._response_factory(**_response_arguments(payload))
 
     def send_streaming(self, _request: _Request) -> object:
@@ -294,28 +291,28 @@ async def _run_local_async(provider: Provider) -> None:
         _assert_common_settings(handle)
         object.__setattr__(handle, '_transport', transport)
     await _exercise_find_async(handles[0])
-    _assert_read_requests(transports[0]._requests)
+    _assert_read_requests(transports[0].requests)
     for handle in handles:
         await handle.close()
-    assert all(transport._closed for transport in transports)
-    assert all(transport._checkouts == transport._checkins for transport in transports)
+    assert all(transport.closed for transport in transports)
+    assert all(transport.checkouts == transport.checkins for transport in transports)
     assert all(object.__getattribute__(handle, '_transport') is None for handle in handles)
 
 
 def _run_local_sync(provider: Provider) -> None:
     handles = [provider.create_sync(_SITE, _credential()) for _index in range(3)]
     assert len({id(handle) for handle in handles}) == 3
-    assert all(object.__getattribute__(handle, '_transport') is None for handle in handles)
+    assert all(object.__getattribute__(handle, 'transport') is None for handle in handles)
     transports = [_LocalTransport(_local_response_factory()) for _handle in handles]
     for handle, transport in zip(handles, transports, strict=True):
         _assert_common_settings(handle)
-        object.__setattr__(handle, '_transport', transport)
+        object.__setattr__(handle, 'transport', transport)
     _exercise_find(handles[0])
-    _assert_read_requests(transports[0]._requests)
+    _assert_read_requests(transports[0].requests)
     for handle in handles:
         handle.close()
-    assert all(transport._closed for transport in transports)
-    assert all(object.__getattribute__(handle, '_transport') is None for handle in handles)
+    assert all(transport.closed for transport in transports)
+    assert all(object.__getattribute__(handle, 'transport') is None for handle in handles)
 
 
 def _run_official_sync(provider: Provider) -> None:
@@ -327,12 +324,12 @@ def _run_official_sync(provider: Provider) -> None:
         _assert_common_settings(handle)
         _inject_official_responder(handle, responder)
     _exercise_find(handles[0])
-    _assert_read_requests(responders[0]._requests)
+    _assert_read_requests(responders[0].requests)
     connections = [_OfficialConnection() for _handle in handles]
     for handle, connection in zip(handles, connections, strict=True):
         object.__setattr__(handle, '_connection', _OfficialPool(connection))
         handle.close()
-    assert all(connection._closed for connection in connections)
+    assert all(connection.closed for connection in connections)
     assert all(object.__getattribute__(handle, '_connection') is None for handle in handles)
 
 

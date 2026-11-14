@@ -7,12 +7,19 @@ import threading
 import time
 from typing import TYPE_CHECKING, TypedDict, Unpack
 
-from ._checkpoint import Checkpointer, CheckpointState
+from ._checkpoint import Checkpointer
 from ._resources import close_resources
-from ._sqlite import Schema, open_database
+from ._sqlite import (
+    WAL_TRIGGER_BYTES,
+    WAL_TRIGGER_CHECK_SECS,
+    Schema,
+    open_database,
+    wal_file_bytes,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    import logging
+    from collections.abc import Callable, Mapping
     from pathlib import Path
     from types import TracebackType
     from typing import Self
@@ -49,7 +56,7 @@ class _CheckpointStatus(TypedDict):
     """Share a lock and the latest state between the owner and its views."""
 
     lock: threading.Lock
-    state: CheckpointState
+    stalled: bool
 
 
 class CheckpointHostStoppedError(RuntimeError):
@@ -62,20 +69,21 @@ class CheckpointView:
     def __init__(self, status: _CheckpointStatus | None = None) -> None:
         """Share a host-owned state cell, or represent an unregistered idle file."""
         self._status: _CheckpointStatus = (
-            status if status is not None else {'lock': threading.Lock(), 'state': 'idle'}
+            status if status is not None else {'lock': threading.Lock(), 'stalled': False}
         )
 
-    def state(self) -> CheckpointState:
-        """Return idle before the first attempt, then complete or incomplete."""
+    def stalled(self) -> bool:
+        """Return whether the latest attempt still crosses either bound."""
         with self._status['lock']:
-            return self._status['state']
+            return self._status['stalled']
 
 
 class _CheckpointHostSeams(TypedDict, total=False):
-    """Type the optional monotonic clock and checkpointer factory replacements."""
+    """Type optional clock, checkpointer factory, and WAL trigger replacements."""
 
     clock: Callable[[], float]
     checkpointer_factory: Callable[..., Checkpointer]
+    wal_trigger_bytes: int
 
 
 class _CheckpointFile(TypedDict):
@@ -86,6 +94,7 @@ class _CheckpointFile(TypedDict):
     schema: Schema
     first_due: float
     status: _CheckpointStatus
+    log_extra: Mapping[str, str]
 
 
 class CheckpointHost:
@@ -93,7 +102,8 @@ class CheckpointHost:
 
     Register files after their owner initializes them. Each checkpoint thread
     opens and closes its own existing-only connection. `close()` interrupts
-    timer waits and joins all threads; registration after close is rejected.
+    timer waits and joins every thread except the caller; registration after
+    close is rejected.
     """
 
     def __init__(
@@ -102,15 +112,17 @@ class CheckpointHost:
         interval_secs: float,
         synchronous: str,
         on_failure: Callable[[str], None],
+        logger: logging.Logger,
         **seams: Unpack[_CheckpointHostSeams],
     ) -> None:
         """Configure independent file timers and the fatal-failure callback.
 
         Args:
-            interval_secs: Finite positive time between checkpoint attempts.
+            interval_secs: Finite positive time between scheduled attempts.
             synchronous: SQLite synchronous policy for each owned connection.
             on_failure: Called once when a file's checkpoint thread fails.
-            **seams: Optional monotonic clock and checkpointer factory.
+            logger: Owning source logger for checkpoint transitions.
+            **seams: Optional clock, checkpointer factory, and WAL trigger.
 
         Raises:
             ValueError: `interval_secs` is not finite and positive.
@@ -120,8 +132,10 @@ class CheckpointHost:
         self._interval_secs = interval_secs
         self._synchronous = synchronous
         self._on_failure = on_failure
+        self._logger = logger
         self._clock = seams.get('clock', time.monotonic)
         self._checkpointer_factory = seams.get('checkpointer_factory', Checkpointer)
+        self._wal_trigger_bytes = seams.get('wal_trigger_bytes', WAL_TRIGGER_BYTES)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._files: dict[Path, tuple[CheckpointView, threading.Thread]] = {}
@@ -136,31 +150,50 @@ class CheckpointHost:
                 synchronous=self._synchronous,
                 create=False,
             )
+            checkpointer: Checkpointer | None = None
             try:
                 checkpointer = self._checkpointer_factory(
                     database.connection,
                     file['path'],
                     interval_secs=self._interval_secs,
+                    logger=self._logger,
+                    log_extra=file['log_extra'],
                 )
                 due = file['first_due']
-                while not self._stop.wait(max(0.0, due - self._clock())):
+                trigger = self._wal_trigger_bytes
+                while not self._stop.wait(
+                    min(WAL_TRIGGER_CHECK_SECS, max(0.0, due - self._clock()))
+                ):
+                    size = wal_file_bytes(file['path'])
+                    scheduled = self._clock() >= due
+                    if not scheduled and size <= trigger:
+                        continue
                     try:
-                        checkpointer.run_once()
+                        attempt = checkpointer.run_once()
                     finally:
                         with file['status']['lock']:
-                            file['status']['state'] = checkpointer.state
-                    elapsed = max(0.0, self._clock() - due)
-                    due += (int(elapsed // self._interval_secs) + 1) * self._interval_secs
+                            file['status']['stalled'] = bool(checkpointer.crossed)
+                    trigger = self._wal_trigger_bytes + (
+                        0 if attempt.reuse == 'reused' else attempt.wal_bytes
+                    )
+                    if scheduled:
+                        elapsed = max(0.0, self._clock() - due)
+                        due += (int(elapsed // self._interval_secs) + 1) * self._interval_secs
             except BaseException as error:
-                close_resources((database,), primary_error=error)
+                close_resources(
+                    (database,) if checkpointer is None else (checkpointer, database),
+                    primary_error=error,
+                )
                 raise
             else:
-                database.close()
+                close_resources((checkpointer, database))
 
-    def register(self, path: Path, identity: str, schema: Schema) -> CheckpointView:
+    def register(
+        self, path: Path, identity: str, schema: Schema, *, log_extra: Mapping[str, str]
+    ) -> CheckpointView:
         """Start one timer for an initialized file, reusing resolved-path views.
 
-        The first attempt waits one interval plus this registration's
+        The first scheduled attempt waits one interval plus this registration's
         `interval * index / count` offset. Later registrations do not change
         existing timers.
 
@@ -169,6 +202,7 @@ class CheckpointHost:
                 path.
             identity: Stable identity matching the database's stored identity.
                 A mismatch fails asynchronously through `on_failure`.
+            log_extra: Owner identity fields attached to transition messages.
             schema: Database schema used when the checkpoint thread opens it.
 
         Returns:
@@ -177,6 +211,8 @@ class CheckpointHost:
 
         Raises:
             CheckpointHostStoppedError: This host is stopping or closed.
+            OSError: The database path cannot be resolved.
+            RuntimeError: The checkpoint thread cannot be started.
         """
         path = path.resolve()
         with self._lock:
@@ -192,7 +228,8 @@ class CheckpointHost:
                 identity=identity,
                 schema=schema,
                 first_due=first_due,
-                status={'lock': threading.Lock(), 'state': 'idle'},
+                log_extra=dict(log_extra),
+                status={'lock': threading.Lock(), 'stalled': False},
             )
             view = CheckpointView(file['status'])
             thread = threading.Thread(
@@ -219,7 +256,11 @@ class CheckpointHost:
             return tuple(thread for _view, thread in self._files.values())
 
     def close(self) -> None:
-        """Interrupt timer waits and join threads after their connections close."""
+        """Interrupt timer waits and join threads after their connections close.
+
+        Skip the calling thread if invoked from a checkpoint thread; that
+        thread finishes its own cleanup after this method returns.
+        """
         self.request_stop()
         for thread in self.threads():
             if thread is not threading.current_thread():

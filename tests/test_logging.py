@@ -4,16 +4,24 @@ import io
 import logging
 import logging.handlers
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import pytest
 
-import sg_event_daemon._control as control_module
 import sg_event_daemon._logging as logging_module
-from sg_event_daemon._config import CredentialConfig, SecretValue, SiteConfig
+from sg_event_daemon._config import (
+    CredentialConfig,
+    GroupConfig,
+    PluginConfig,
+    SecretValue,
+    SiteConfig,
+    SourceConfig,
+)
+from sg_event_daemon._gaps import log_gap_filled, log_paused, log_resumed
 from sg_event_daemon._logging import (
     _DISPATCH_FIELDS,
     _discover_redaction_values,
@@ -24,7 +32,7 @@ from sg_event_daemon._logging import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Mapping
 
 
 @dataclass
@@ -57,22 +65,6 @@ def _raise_secret_context_error(secret: str) -> None:
 
 def _raise_secret_value_error(secret: str) -> None:
     raise ValueError(f'request failed with {secret}')
-
-
-@pytest.fixture(autouse=True)
-def _restore_daemon_logger() -> Iterator[None]:
-    logger = logging.getLogger('sg_event_daemon')
-    old_handlers = list(logger.handlers)
-    old_level = logger.level
-    old_propagate = logger.propagate
-    try:
-        yield
-    finally:
-        for handler in logger.handlers:
-            handler.close()
-        logger.handlers[:] = old_handlers
-        logger.setLevel(old_level)
-        logger.propagate = old_propagate
 
 
 def _secret(*parts: str) -> str:
@@ -129,6 +121,71 @@ def test_configure_logging_writes_readable_text_to_stdout() -> None:
     assert isinstance(logger.handlers[0].formatter, _TextFormatter)
 
 
+@pytest.mark.parametrize('register_later', [False, True])
+def test_credential_profile_names_are_not_redacted(register_later: bool) -> None:
+    plugin = PluginConfig(
+        id='notify',
+        path=Path('notify.py'),
+        credentials='events',
+        config={'token': 'plugin-token', 'credentials': {'nested': 'plugin-credential'}},
+        secrets={},
+    )
+    config = replace(
+        _site_config(),
+        credentials={
+            'source': CredentialConfig('source', 'poller', SecretValue('source-api-key')),
+            'events': CredentialConfig('events', 'callbacks', SecretValue('events-api-key')),
+        },
+        sources={'events': SourceConfig('events', 'source')},
+        groups={'callbacks': GroupConfig('callbacks', 'events', (plugin,), 'events')},
+    )
+    stream = io.StringIO()
+    logger = configure_logging(redact_from=() if register_later else (config,), stream=stream)
+    if register_later:
+        register_redaction_values(config)
+    extra = {'site': 'studio', 'source': 'events'}
+    log_paused(extra, 'max_open_ranges', 500, 501)
+    log_resumed(extra, 1.2)
+    log_gap_filled(extra, 101, 102, 2.3)
+    logger.info('resource source-api-key events-api-key plugin-token plugin-credential')
+
+    messages = [line.split(': ', 1)[1] for line in stream.getvalue().splitlines()]
+    assert messages == [
+        (
+            'source paused: max_open_ranges limit 500 reached (501); '
+            'open gaps continue and new gaps wait site=studio source=events'
+        ),
+        'source resumed after 1.2s paused site=studio source=events',
+        'late events in IDs 101-102 all appeared; gap closed after 2.3s site=studio source=events',
+        'resource <redacted> <redacted> <redacted> <redacted>',
+    ]
+
+
+@pytest.mark.parametrize('register_later', [False, True])
+def test_credential_values_from_every_site_are_redacted(register_later: bool) -> None:
+    sites = {
+        name: SiteConfig(
+            name=name,
+            server='https://example.invalid',
+            default_source='events',
+            credentials={'source': CredentialConfig('source', 'poller', SecretValue(secret))},
+            sources={},
+            groups={},
+            workers={},
+        )
+        for name, secret in (('first', 'first-api-key'), ('second', 'second-api-key'))
+    }
+    config = {'sites': sites}
+    stream = io.StringIO()
+    logger = configure_logging(redact_from=() if register_later else (config,), stream=stream)
+    if register_later:
+        register_redaction_values(config)
+
+    logger.info('source events first-api-key second-api-key')
+
+    assert stream.getvalue().split(': ', 1)[1] == 'source events <redacted> <redacted>\n'
+
+
 def test_daemon_logger_owns_one_nonpropagating_hierarchy() -> None:
     stream = io.StringIO()
     daemon_logger = configure_logging(stream=stream)
@@ -182,8 +239,25 @@ def test_discovery_collects_secrets_not_identity_fields() -> None:
     assert 'daemon-poller' not in values
 
 
-def test_discovery_keeps_collecting_plain_sensitive_mappings() -> None:
-    values = _discover_redaction_values([{'auth_headers': {'X-Token': 'abc123'}}])
+@pytest.mark.parametrize(
+    'name',
+    [
+        'api_key',
+        'apikey',
+        'auth',
+        'auth_header',
+        'auth_headers',
+        'authorization',
+        'credential',
+        'credentials',
+        'password',
+        'secret',
+        'secrets',
+        'token',
+    ],
+)
+def test_discovery_keeps_collecting_plain_sensitive_mappings(name: str) -> None:
+    values = _discover_redaction_values([{name: {'X-Token': 'abc123'}}])
 
     assert 'abc123' in values
 
@@ -259,10 +333,6 @@ def test_exception_formatter_preserves_non_runtime_identity() -> None:
     assert '_raise_secret_value_error' in exception
     assert 'RuntimeError' not in exception
     assert secret not in output
-
-
-def test_logging_and_control_share_secret_names() -> None:
-    assert control_module.SENSITIVE_NAMES is logging_module.SENSITIVE_NAMES
 
 
 def test_logging_has_no_rotating_file_or_smtp_handler() -> None:

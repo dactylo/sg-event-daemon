@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
@@ -49,3 +50,31 @@ def test_installed_wheel_reports_its_version(tmp_path: Path) -> None:
         env={**os.environ, 'PYTHONPATH': str(installed)},
     )
     assert result.stdout == f'sg-event-daemon {expected}\n', process_transcript(result)
+
+
+def test_sdist_excludes_repository_support_files(tmp_path: Path) -> None:
+    project = tmp_path / 'project'
+    _copy_project(project)
+    for name in ('CHANGELOG.md', 'Makefile'):
+        shutil.copy2(_ROOT / name, project / name)
+    for directory, name in (
+        ('benchmarks', 'storage_load.py'),
+        ('docs', 'development.md'),
+        ('tests', 'test_packaging.py'),
+    ):
+        (project / directory).mkdir()
+        shutil.copy2(_ROOT / directory / name, project / directory / name)
+
+    with tarfile.open(_build(project, 'sdist'), 'r:gz') as archive:
+        names = {name.split('/', 1)[1] for name in archive.getnames() if '/' in name}
+
+    assert {name.split('/', 1)[0] for name in names} == {
+        'LICENSE',
+        'PKG-INFO',
+        'README.md',
+        'pyproject.toml',
+        'src',
+    }
+    assert all(
+        name.startswith('src/sg_event_daemon/') for name in names if name.startswith('src/')
+    )

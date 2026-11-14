@@ -1,7 +1,5 @@
 """Strict immutable configuration loading."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import ipaddress
@@ -17,34 +15,27 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, TypedDict, cast
 
-from ._event_frame import event_frame_bytes
+from ._event_frame import IPC_LENGTH_BYTES, event_frame_bytes
 from ._identity import canonical_bytes, stream_fingerprint
 from ._providers import SUPPORTED_PROVIDERS
 from ._state_paths import source_socket_kind
 from ._watchdog import provider_budget_secs
 
-DEFAULT_BATCH_SIZE = 500
 DEFAULT_CHECKPOINT_INTERVAL_SECS = 1.0
 DEFAULT_COMMIT_BATCH_MAX_BYTES = 67_108_864
-_DEFAULT_EXECUTION: Literal['sync', 'async'] = 'sync'
+DEFAULT_LATE_EVENT_WINDOW_SECS = 300.0
 DEFAULT_MAX_FAILURE_TEXT_BYTES = 262_144
 DEFAULT_MAX_GROUP_OBLIGATIONS = 1_000
 DEFAULT_MAX_IPC_FRAME_BYTES = 8_388_608
 DEFAULT_MAX_LATE_IDS_PER_GROUP = 50_000
 DEFAULT_MAX_MANIFEST_BYTES = 1_048_576
-DEFAULT_MAX_OPEN_RANGES = 100
+DEFAULT_MAX_OPEN_RANGES = 500
 DEFAULT_MAX_PENDING_EPOCHS = 8
-DEFAULT_MAX_PENDING_GROUP_OBLIGATIONS = 1_300
+DEFAULT_MAX_PENDING_GROUP_OBLIGATIONS = 6_500
 DEFAULT_MAX_RANGE_QUERY_PAGES = 100
-DEFAULT_MAX_SOURCE_LATE_IDS = 50_000
-_DEFAULT_ORDERING: Literal['eager', 'strict'] = 'eager'
-DEFAULT_QUEUE_MAX_BYTES = 67_108_864
-DEFAULT_QUEUE_MAX_EVENTS = 1_000
+DEFAULT_MAX_SOURCE_LATE_IDS = 500_000
 DEFAULT_SQLITE_SYNCHRONOUS: Literal['normal', 'full'] = 'normal'
-DEFAULT_STRICT_HOLDBACK_SECS = 300.0
-DEFAULT_STRICT_MAX_BYTES = 268_435_456
-DEFAULT_STRICT_MAX_EVENTS = 20_000
-DEFAULT_VISIBILITY_OVERLAP_SECS = 300.0
+DEFAULT_STRICT_HOLDBACK_SECS = 2.0
 MIN_PENDING_EPOCHS = 2
 _ACCEPTANCE_ALLOWED_KEYS = frozenset(
     {
@@ -66,24 +57,31 @@ _ACCEPTANCE_REQUIRED_KEYS = frozenset(
     }
 )
 _DEFAULT_ASYNC_CANCEL_GRACE_SECS = 5.0
+_DEFAULT_BATCH_SIZE = 500
 _DEFAULT_CALLBACK_DEADLINE_SECS = 120.0
+_DEFAULT_EXECUTION: Literal['sync', 'async'] = 'sync'
 _DEFAULT_FETCH_INTERVAL_SECS = 1.0
 _DEFAULT_HEALTHY_RESET_SECS = 300.0
 _DEFAULT_HEALTH_INTERVAL_SECS = 2.0
 _DEFAULT_MAX_CONCURRENT_CATCHUP_READERS = 4
 _DEFAULT_MAX_EVENT_BYTES = 4_194_304
 _DEFAULT_MAX_PLUGIN_CONFIG_BYTES = 262_144
+_DEFAULT_ORDERING: Literal['eager', 'strict'] = 'eager'
 _DEFAULT_POLL_RETRY_BASE_SECS = 1.0
 _DEFAULT_POLL_RETRY_JITTER_FRACTION = 0.2
 _DEFAULT_POLL_RETRY_MAX_SECS = 60.0
 _DEFAULT_POLL_RETRY_MULTIPLIER = 2.0
 _DEFAULT_PROBE_BIND = str(ipaddress.IPv4Address(0))
+_DEFAULT_QUEUE_MAX_BYTES = 67_108_864
+_DEFAULT_QUEUE_MAX_EVENTS = 1_000
 _DEFAULT_RESTART_LIMIT = 5
 _DEFAULT_RESTART_WINDOW_SECS = 300.0
 _DEFAULT_RPC_ATTEMPT_INTERVAL_SECS = 3.0
 _DEFAULT_RPC_MAX_ATTEMPTS = 3
 _DEFAULT_RPC_TIMEOUT_SECS = 30.0
 _DEFAULT_SHUTDOWN_DEADLINE_SECS = 10.0
+_DEFAULT_STRICT_MAX_BYTES = 268_435_456
+_DEFAULT_STRICT_MAX_EVENTS = 20_000
 _DEFAULT_SUPERVISOR_POLL_INTERVAL_SECS = 1.0
 _DEFAULT_WORKER = 'default'
 _DEFAULT_WORKER_STARTUP_DEADLINE_SECS = 30.0
@@ -95,11 +93,11 @@ _RESERVED_WORKER_NAMES = frozenset({'dedicated', 'default'})
 class SecretValue:
     """Hold a resolved secret behind an explicit reveal operation."""
 
-    __slots__ = ('__value',)
+    __slots__ = ('_value',)
 
     def __init__(self, value: str) -> None:
         """Store one protected secret value."""
-        object.__setattr__(self, '_SecretValue__value', value)
+        object.__setattr__(self, '_value', value)
 
     def __deepcopy__(self, memo: dict[int, object]) -> SecretValue:
         """Reuse this immutable wrapper during deep copying."""
@@ -128,7 +126,7 @@ class SecretValue:
         Returns:
             The resolved secret.
         """
-        return self.__value
+        return self._value
 
 
 class _GroupStateOptions(TypedDict):
@@ -147,7 +145,7 @@ class _SourceStateOptions(TypedDict):
     """Type the configuration policy shared by every source-state assembly."""
 
     synchronous: str
-    visibility_overlap_secs: float
+    late_event_window_secs: float
     max_open_ranges: int
     max_group_obligations: int
     max_range_query_pages: int
@@ -181,41 +179,15 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class ControlConfig:
-    """Contain the state path needed by control-plane commands.
-
-    Attributes:
-        state_dir: Daemon state directory from which the supervisor control
-            socket path is derived.
-    """
+class _ControlConfig:
+    """Contain the state path needed by control-plane commands."""
 
     state_dir: Path
 
 
 @dataclass(frozen=True)
-class DaemonConfig:
-    """Define deployment-wide daemon settings.
-
-    Attributes:
-        state_dir: Directory for durable daemon state.
-        sg_api_provider: Selected SG API implementation.
-        probe_bind: Address used for probe listeners.
-        probe_port: Probe port, or none when probes are disabled.
-        sqlite_synchronous: Durability mode for SQLite transactions.
-        checkpoint_interval_secs: Interval between worker checkpoints.
-        health_interval_secs: Interval between worker health updates.
-        worker_startup_deadline_secs: Maximum worker startup time.
-        supervisor_poll_interval_secs: Supervisor polling interval.
-        shutdown_deadline_secs: Maximum graceful shutdown time.
-        async_cancel_grace_secs: Grace period for async cancellation.
-        max_ipc_frame_bytes: Largest accepted IPC frame.
-        max_plugin_config_bytes: Largest plugin configuration.
-        max_manifest_bytes: Largest callback manifest.
-        max_failure_text_bytes: Largest persisted failure text.
-        max_group_obligations: Bound on obligations per group.
-        max_pending_epochs: Bound on pending strict epochs.
-        max_concurrent_catchup_readers: Bound on concurrent catch-up reads.
-    """
+class _DaemonConfig:
+    """Define deployment-wide daemon settings."""
 
     state_dir: Path
     sg_api_provider: Literal['shotgun-api3', 'sg-python-api']
@@ -289,18 +261,18 @@ class SourceConfig:
     name: str
     credentials: str
     fetch_interval_secs: float = _DEFAULT_FETCH_INTERVAL_SECS
-    batch_size: int = DEFAULT_BATCH_SIZE
-    visibility_overlap_secs: float = DEFAULT_VISIBILITY_OVERLAP_SECS
+    batch_size: int = _DEFAULT_BATCH_SIZE
+    late_event_window_secs: float = DEFAULT_LATE_EVENT_WINDOW_SECS
     poll_retry_base_secs: float = _DEFAULT_POLL_RETRY_BASE_SECS
     poll_retry_max_secs: float = _DEFAULT_POLL_RETRY_MAX_SECS
     poll_retry_multiplier: float = _DEFAULT_POLL_RETRY_MULTIPLIER
     poll_retry_jitter_fraction: float = _DEFAULT_POLL_RETRY_JITTER_FRACTION
     max_event_bytes: int = _DEFAULT_MAX_EVENT_BYTES
     commit_batch_max_bytes: int = DEFAULT_COMMIT_BATCH_MAX_BYTES
-    queue_max_events: int = DEFAULT_QUEUE_MAX_EVENTS
-    queue_max_bytes: int = DEFAULT_QUEUE_MAX_BYTES
-    strict_max_events: int = DEFAULT_STRICT_MAX_EVENTS
-    strict_max_bytes: int = DEFAULT_STRICT_MAX_BYTES
+    queue_max_events: int = _DEFAULT_QUEUE_MAX_EVENTS
+    queue_max_bytes: int = _DEFAULT_QUEUE_MAX_BYTES
+    strict_max_events: int = _DEFAULT_STRICT_MAX_EVENTS
+    strict_max_bytes: int = _DEFAULT_STRICT_MAX_BYTES
     max_open_ranges: int = DEFAULT_MAX_OPEN_RANGES
     max_range_query_pages: int = DEFAULT_MAX_RANGE_QUERY_PAGES
     max_pending_group_obligations: int = DEFAULT_MAX_PENDING_GROUP_OBLIGATIONS
@@ -335,7 +307,7 @@ class SiteConfig:
 class Config:
     """Contain one fully resolved daemon configuration."""
 
-    daemon: DaemonConfig
+    daemon: _DaemonConfig
     sites: Mapping[str, SiteConfig]
 
 
@@ -343,25 +315,25 @@ class Config:
 class _GroupLoadContext:
     """Carry shared group-loader inputs."""
 
-    _config_path: Path
-    _credentials: Mapping[str, CredentialConfig]
-    _daemon: DaemonConfig
-    _default_source: str
-    _site_name: str
-    _sources: Mapping[str, SourceConfig]
-    _workers: Mapping[str, WorkerConfig]
+    config_path: Path
+    credentials: Mapping[str, CredentialConfig]
+    daemon: _DaemonConfig
+    default_source: str
+    site_name: str
+    sources: Mapping[str, SourceConfig]
+    workers: Mapping[str, WorkerConfig]
 
 
 @dataclass(frozen=True)
 class _PluginLoadContext:
     """Carry shared plugin-loader inputs."""
 
-    _config_path: Path
-    _credentials: Mapping[str, CredentialConfig]
-    _default_credentials: str
-    _group_name: str
-    _max_config_bytes: int
-    _site_name: str
+    config_path: Path
+    credentials: Mapping[str, CredentialConfig]
+    default_credentials: str
+    group_name: str
+    max_config_bytes: int
+    site_name: str
 
 
 def _canonical_plugin_bytes(value: Mapping[str, object]) -> bytes:
@@ -558,7 +530,7 @@ def _state_directory(table: Mapping[str, object], config_path: Path) -> Path:
     return path if path.is_absolute() else config_path.resolve().parent / path
 
 
-def _load_daemon(table: Mapping[str, object], config_path: Path) -> DaemonConfig:
+def _load_daemon(table: Mapping[str, object], config_path: Path) -> _DaemonConfig:
     """Load deployment-wide daemon configuration."""
     context = 'daemon'
     _check_keys(
@@ -611,7 +583,7 @@ def _load_daemon(table: Mapping[str, object], config_path: Path) -> DaemonConfig
     )
     if max_pending_epochs < MIN_PENDING_EPOCHS:
         raise ConfigError('daemon.max_pending_epochs must be at least 2')
-    return DaemonConfig(
+    return _DaemonConfig(
         state_dir=_state_directory(table, config_path),
         sg_api_provider=provider,
         probe_bind=probe_bind,
@@ -687,7 +659,7 @@ def _load_daemon(table: Mapping[str, object], config_path: Path) -> DaemonConfig
 def _strict_group_holdback_secs(group: GroupConfig, source: SourceConfig) -> float:
     """Return the positive stored holdback for eager or strict groups."""
     return (
-        source.visibility_overlap_secs
+        source.late_event_window_secs
         if group.strict_holdback_secs is None
         else group.strict_holdback_secs
     )
@@ -696,7 +668,10 @@ def _strict_group_holdback_secs(group: GroupConfig, source: SourceConfig) -> flo
 def _validate_name(value: str, context: str) -> str:
     """Validate one bounded configuration identifier."""
     if _NAME_PATTERN.fullmatch(value) is None:
-        raise ConfigError(f'invalid {context} name {value!r}')
+        raise ConfigError(
+            f'invalid {context} name {value!r}; use 1-64 lowercase letters, digits, '
+            "'-' or '_', starting with a letter"
+        )
     return value
 
 
@@ -799,7 +774,7 @@ def _load_plugin(
     load_context: _PluginLoadContext,
 ) -> PluginConfig:
     """Load one plugin and resolve its effective credentials."""
-    context = f'sites.{load_context._site_name}.groups.{load_context._group_name}.plugins'
+    context = f'sites.{load_context.site_name}.groups.{load_context.group_name}.plugins'
     _check_keys(
         table,
         allowed=frozenset({'config', 'credentials', 'id', 'path', 'secrets'}),
@@ -809,7 +784,7 @@ def _load_plugin(
     plugin_id = _validate_name(_required_string(table, 'id', context), 'plugin')
     path_value = Path(_required_string(table, 'path', context)).expanduser()
     if not path_value.is_absolute():
-        path_value = load_context._config_path.parent / path_value
+        path_value = load_context.config_path.parent / path_value
     path_value = path_value.resolve()
     if not path_value.is_file():
         raise ConfigError(
@@ -819,9 +794,9 @@ def _load_plugin(
         table,
         'credentials',
         context,
-        load_context._default_credentials,
+        load_context.default_credentials,
     )
-    if credential_name not in load_context._credentials:
+    if credential_name not in load_context.credentials:
         raise ConfigError(
             f'{context}.{plugin_id} references unknown credentials {credential_name}'
         )
@@ -830,9 +805,10 @@ def _load_plugin(
         'Mapping[str, object]',
         _freeze_json(config_table, f'{context}.{plugin_id} plugin config'),
     )
-    if len(_canonical_plugin_bytes(config_table)) > load_context._max_config_bytes:
+    if len(_canonical_plugin_bytes(config_table)) > load_context.max_config_bytes:
         raise ConfigError(
-            f'{context}.{plugin_id} plugin config exceeds {load_context._max_config_bytes} bytes'
+            f'{context}.{plugin_id} plugin config exceeds daemon.max_plugin_config_bytes '
+            f'({load_context.max_config_bytes} bytes)'
         )
     secrets_table = _optional_mapping(table, 'secrets', context)
     secret_refs = {
@@ -855,16 +831,16 @@ def _load_plugins(
     """Load the explicitly ordered plugins for one group."""
     if not isinstance(value, list) or not value:
         raise ConfigError(
-            f'sites.{load_context._site_name}.groups.'
-            f'{load_context._group_name}.plugins must be a nonempty array'
+            f'sites.{load_context.site_name}.groups.'
+            f'{load_context.group_name}.plugins must be a nonempty array'
         )
     raw_plugins = cast('list[object]', value)
     plugins = tuple(
         _load_plugin(
             _mapping(
                 item,
-                f'sites.{load_context._site_name}.groups.'
-                f'{load_context._group_name}.plugins[{index}]',
+                f'sites.{load_context.site_name}.groups.'
+                f'{load_context.group_name}.plugins[{index}]',
             ),
             load_context,
         )
@@ -874,8 +850,8 @@ def _load_plugins(
     duplicates = sorted({plugin_id for plugin_id in ids if ids.count(plugin_id) > 1})
     if duplicates:
         raise ConfigError(
-            f'sites.{load_context._site_name}.groups.'
-            f'{load_context._group_name} has duplicate plugin id: '
+            f'sites.{load_context.site_name}.groups.'
+            f'{load_context.group_name} has duplicate plugin id: '
             f'{", ".join(duplicates)}'
         )
     return plugins
@@ -887,7 +863,7 @@ def _load_group(
     load_context: _GroupLoadContext,
 ) -> GroupConfig:
     """Load one group and resolve all local references."""
-    context = f'sites.{load_context._site_name}.groups.{name}'
+    context = f'sites.{load_context.site_name}.groups.{name}'
     _check_keys(
         table,
         allowed=frozenset(
@@ -910,26 +886,26 @@ def _load_group(
         table,
         'source',
         context,
-        load_context._default_source,
+        load_context.default_source,
     )
-    if source_name not in load_context._sources:
+    if source_name not in load_context.sources:
         raise ConfigError(
-            f'site {load_context._site_name} group {name} references unknown source {source_name}'
+            f'site {load_context.site_name} group {name} references unknown source {source_name}'
         )
-    source = load_context._sources[source_name]
+    source = load_context.sources[source_name]
     callback_credentials = _optional_string(
         table,
         'callback_credentials',
         context,
         source.credentials,
     )
-    if callback_credentials not in load_context._credentials:
+    if callback_credentials not in load_context.credentials:
         raise ConfigError(f'{context} references unknown credentials {callback_credentials}')
     execution_value = _optional_string(table, 'execution', context, _DEFAULT_EXECUTION)
     if execution_value not in {'async', 'sync'}:
         raise ConfigError(f'{context}.execution must be sync or async')
     execution = cast("Literal['sync', 'async']", execution_value)
-    if execution == 'async' and load_context._daemon.sg_api_provider == 'shotgun-api3':
+    if execution == 'async' and load_context.daemon.sg_api_provider == 'shotgun-api3':
         raise ConfigError(f'{context} async execution requires sg-python-api')
     ordering_value = _optional_string(table, 'ordering', context, _DEFAULT_ORDERING)
     if ordering_value not in {'eager', 'strict'}:
@@ -943,7 +919,7 @@ def _load_group(
         else None
     )
     worker = _optional_string(table, 'worker', context, _DEFAULT_WORKER)
-    if worker not in {'default', 'dedicated'} and worker not in load_context._workers:
+    if worker not in {'default', 'dedicated'} and worker not in load_context.workers:
         raise ConfigError(f'{context} references unknown worker {worker}')
     callback_deadline = _positive_float(
         table,
@@ -951,24 +927,25 @@ def _load_group(
         context,
         _DEFAULT_CALLBACK_DEADLINE_SECS,
     )
-    credential = load_context._credentials[callback_credentials]
+    credential = load_context.credentials[callback_credentials]
     provider_budget = provider_budget_secs(credential)
     if callback_deadline < provider_budget:
         warnings.warn(
-            f'{context} callback deadline {callback_deadline} is below '
-            f'the nominal provider budget {provider_budget}',
+            f'{context}.callback_deadline_secs ({callback_deadline}) is below one SG request '
+            f"with retries ({provider_budget}s); raise it or lower the credential's "
+            'timeout_secs/max_rpc_attempts',
             UserWarning,
             stacklevel=2,
         )
     plugins = _load_plugins(
         table['plugins'],
         _PluginLoadContext(
-            _config_path=load_context._config_path,
-            _credentials=load_context._credentials,
-            _default_credentials=callback_credentials,
-            _group_name=group_name,
-            _max_config_bytes=load_context._daemon.max_plugin_config_bytes,
-            _site_name=load_context._site_name,
+            config_path=load_context.config_path,
+            credentials=load_context.credentials,
+            default_credentials=callback_credentials,
+            group_name=group_name,
+            max_config_bytes=load_context.daemon.max_plugin_config_bytes,
+            site_name=load_context.site_name,
         ),
     )
     return GroupConfig(
@@ -990,11 +967,11 @@ def _load_groups(
 ) -> Mapping[str, GroupConfig]:
     """Load all callback groups for one site."""
     if not table:
-        raise ConfigError(f'sites.{load_context._site_name}.groups must not be empty')
+        raise ConfigError(f'sites.{load_context.site_name}.groups must not be empty')
     groups = {
         name: _load_group(
             name,
-            _mapping(value, f'sites.{load_context._site_name}.groups.{name}'),
+            _mapping(value, f'sites.{load_context.site_name}.groups.{name}'),
             load_context,
         )
         for name, value in table.items()
@@ -1018,6 +995,7 @@ def _load_source(
                 'commit_batch_max_bytes',
                 'credentials',
                 'fetch_interval_secs',
+                'late_event_window_secs',
                 'max_event_bytes',
                 'max_late_ids_per_group',
                 'max_open_ranges',
@@ -1032,7 +1010,6 @@ def _load_source(
                 'queue_max_events',
                 'strict_max_bytes',
                 'strict_max_events',
-                'visibility_overlap_secs',
             }
         ),
         context=context,
@@ -1065,12 +1042,12 @@ def _load_source(
         fetch_interval_secs=_positive_float(
             table, 'fetch_interval_secs', context, _DEFAULT_FETCH_INTERVAL_SECS
         ),
-        batch_size=_positive_int(table, 'batch_size', context, DEFAULT_BATCH_SIZE),
-        visibility_overlap_secs=_positive_float(
+        batch_size=_positive_int(table, 'batch_size', context, _DEFAULT_BATCH_SIZE),
+        late_event_window_secs=_positive_float(
             table,
-            'visibility_overlap_secs',
+            'late_event_window_secs',
             context,
-            DEFAULT_VISIBILITY_OVERLAP_SECS,
+            DEFAULT_LATE_EVENT_WINDOW_SECS,
         ),
         poll_retry_base_secs=retry_base,
         poll_retry_max_secs=retry_max,
@@ -1084,14 +1061,14 @@ def _load_source(
             DEFAULT_COMMIT_BATCH_MAX_BYTES,
         ),
         queue_max_events=_positive_int(
-            table, 'queue_max_events', context, DEFAULT_QUEUE_MAX_EVENTS
+            table, 'queue_max_events', context, _DEFAULT_QUEUE_MAX_EVENTS
         ),
-        queue_max_bytes=_positive_int(table, 'queue_max_bytes', context, DEFAULT_QUEUE_MAX_BYTES),
+        queue_max_bytes=_positive_int(table, 'queue_max_bytes', context, _DEFAULT_QUEUE_MAX_BYTES),
         strict_max_events=_positive_int(
-            table, 'strict_max_events', context, DEFAULT_STRICT_MAX_EVENTS
+            table, 'strict_max_events', context, _DEFAULT_STRICT_MAX_EVENTS
         ),
         strict_max_bytes=_positive_int(
-            table, 'strict_max_bytes', context, DEFAULT_STRICT_MAX_BYTES
+            table, 'strict_max_bytes', context, _DEFAULT_STRICT_MAX_BYTES
         ),
         max_open_ranges=_positive_int(table, 'max_open_ranges', context, DEFAULT_MAX_OPEN_RANGES),
         max_range_query_pages=_positive_int(
@@ -1199,7 +1176,7 @@ def _load_workers(
 
 
 def _validate_source_limits(
-    daemon: DaemonConfig,
+    daemon: _DaemonConfig,
     site_name: str,
     sources: Mapping[str, SourceConfig],
     groups: Mapping[str, GroupConfig],
@@ -1213,7 +1190,7 @@ def _validate_source_limits(
             {'event_id': maximum_integer},
             payload_byte_count=source.max_event_bytes,
         )
-        if framed_event_bytes - 4 > daemon.max_ipc_frame_bytes:
+        if framed_event_bytes - IPC_LENGTH_BYTES > daemon.max_ipc_frame_bytes:
             raise ConfigError(f'{context}.max_event_bytes does not fit max_ipc_frame_bytes')
         if source.queue_max_bytes < daemon.max_ipc_frame_bytes:
             raise ConfigError(f'{context}.queue_max_bytes must hold max_ipc_frame_bytes')
@@ -1238,7 +1215,7 @@ def _validate_source_limits(
 def _load_site(
     name: str,
     table: Mapping[str, object],
-    daemon: DaemonConfig,
+    daemon: _DaemonConfig,
     config_path: Path,
 ) -> SiteConfig:
     """Load one site and validate all local references."""
@@ -1266,13 +1243,13 @@ def _load_site(
     groups = _load_groups(
         _required_mapping(table, 'groups', context),
         _GroupLoadContext(
-            _config_path=config_path,
-            _credentials=credentials,
-            _daemon=daemon,
-            _default_source=default_source,
-            _site_name=site_name,
-            _sources=sources,
-            _workers=workers,
+            config_path=config_path,
+            credentials=credentials,
+            daemon=daemon,
+            default_source=default_source,
+            site_name=site_name,
+            sources=sources,
+            workers=workers,
         ),
     )
     _validate_source_limits(daemon, site_name, sources, groups)
@@ -1288,7 +1265,7 @@ def _load_site(
 
 
 def group_state_options(
-    daemon: DaemonConfig, source: SourceConfig, group: GroupConfig | None
+    daemon: _DaemonConfig, source: SourceConfig, group: GroupConfig | None
 ) -> _GroupStateOptions:
     """Build group authority policy from configuration.
 
@@ -1309,7 +1286,7 @@ def group_state_options(
         'max_manifest_bytes': daemon.max_manifest_bytes,
         'max_pending_epochs': daemon.max_pending_epochs,
         'strict_holdback_secs': (
-            source.visibility_overlap_secs
+            source.late_event_window_secs
             if group is None
             else _strict_group_holdback_secs(group, source)
         ),
@@ -1368,6 +1345,9 @@ def load_config(path: Path) -> Config:
     Raises:
         ConfigError: The file cannot be read, is malformed, or violates the
             configuration contract.
+        OSError: Resolving a configuration, state, or plugin path fails.
+        RuntimeError: A home directory named in a state or plugin path cannot
+            be resolved.
     """
     root = _parse_toml(path, 'configuration file')
     _check_keys(
@@ -1392,7 +1372,7 @@ def load_config(path: Path) -> Config:
     return Config(daemon=daemon, sites=MappingProxyType(sites))
 
 
-def load_control_config(path: Path) -> ControlConfig:
+def load_control_config(path: Path) -> _ControlConfig:
     """Load only the state path required by control commands.
 
     Args:
@@ -1404,10 +1384,14 @@ def load_control_config(path: Path) -> ControlConfig:
     Raises:
         ConfigError: The file cannot be read, or its TOML or `daemon.state_dir`
             is invalid.
+        OSError: Resolving the configuration path for a relative state
+            directory fails.
+        RuntimeError: A home directory named in the state path cannot be
+            resolved.
     """
     root = _parse_toml(path, 'configuration file')
     daemon = _required_mapping(root, 'daemon', 'configuration')
-    return ControlConfig(state_dir=_state_directory(daemon, path))
+    return _ControlConfig(state_dir=_state_directory(daemon, path))
 
 
 def source_registration_holdback_secs(group: GroupConfig, source: SourceConfig) -> float:
@@ -1418,11 +1402,11 @@ def source_registration_holdback_secs(group: GroupConfig, source: SourceConfig) 
     return 0.0 if group.ordering == 'eager' else _strict_group_holdback_secs(group, source)
 
 
-def source_state_options(daemon: DaemonConfig, source: SourceConfig) -> _SourceStateOptions:
+def source_state_options(daemon: _DaemonConfig, source: SourceConfig) -> _SourceStateOptions:
     """Build source authority limits and durability policy from configuration."""
     return {
         'synchronous': daemon.sqlite_synchronous.upper(),
-        'visibility_overlap_secs': source.visibility_overlap_secs,
+        'late_event_window_secs': source.late_event_window_secs,
         'max_open_ranges': source.max_open_ranges,
         'max_group_obligations': daemon.max_group_obligations,
         'max_range_query_pages': source.max_range_query_pages,

@@ -7,30 +7,17 @@ from collections.abc import Generator, Iterable
 from typing import TextIO, cast
 
 
-class ClosableTextOutput:
-    """Text output that discards writes after its downstream reader closes.
-
-    Attributes other than writing and flushing come from the wrapped stream, so
-    encoding, terminal detection, and reconfiguration behave as on that stream.
-    """
+class _ClosableTextOutput:
+    """Text output that discards writes after its downstream reader closes."""
 
     def __init__(self, stream: TextIO) -> None:
-        """Wrap a text stream.
-
-        Args:
-            stream: Stream written through until its reader closes.
-        """
+        """Wrap a text stream."""
         self._closed_downstream = False
         self._stream = stream
 
     def __getattr__(self, name: str) -> object:
         """Return an attribute of the wrapped stream."""
         return getattr(self._stream, name)
-
-    @property
-    def _is_downstream_closed(self) -> bool:
-        """Whether the downstream reader has closed the stream."""
-        return self._closed_downstream
 
     def flush(self) -> None:
         """Flush the wrapped stream unless its reader has closed.
@@ -46,6 +33,11 @@ class ClosableTextOutput:
             if not _is_downstream_closure(error):
                 raise
             self._closed_downstream = True
+
+    @property
+    def is_downstream_closed(self) -> bool:
+        """Whether the downstream reader has closed the stream."""
+        return self._closed_downstream
 
     def write(self, text: str) -> int:
         """Write text, or discard it after the reader has closed.
@@ -116,7 +108,7 @@ def _silence_descriptor(stream: TextIO) -> bool:
 
 
 @contextlib.contextmanager
-def closable_stdout() -> Generator[ClosableTextOutput, None, None]:
+def closable_stdout() -> Generator[_ClosableTextOutput, None, None]:
     """Route standard output through a closure-absorbing wrapper.
 
     On every exit, including `SystemExit` from argument parsing, pending output
@@ -127,9 +119,13 @@ def closable_stdout() -> Generator[ClosableTextOutput, None, None]:
 
     Yields:
         The installed wrapper.
+
+    Raises:
+        OSError: Flushing fails for a reason other than downstream closure, or
+            redirecting the closed output to the null device fails.
     """
     original = sys.stdout
-    output = ClosableTextOutput(original)
+    output = _ClosableTextOutput(original)
     sys.stdout = cast('TextIO', output)
     try:
         yield output
@@ -138,7 +134,7 @@ def closable_stdout() -> Generator[ClosableTextOutput, None, None]:
             output.flush()
         finally:
             sys.stdout = original
-            if output._is_downstream_closed and not _silence_descriptor(original):  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            if output.is_downstream_closed and not _silence_descriptor(original):
                 # The interpreter still flushes a stream without a descriptor
                 # at shutdown, so replace it with one that cannot fail.
                 sys.stdout = _null_text_stream()

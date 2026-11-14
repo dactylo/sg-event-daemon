@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sg_event_daemon._config import Config, DaemonConfig
+from sg_event_daemon._config import Config, _DaemonConfig
 from sg_event_daemon._state_paths import (
     group_lock_path,
     site_groups_directory,
@@ -21,7 +21,7 @@ def test_state_database_paths_preserve_layout_without_creating_directories(
     tmp_path: Path,
 ) -> None:
     config = Config(
-        daemon=DaemonConfig(state_dir=tmp_path / 'state', sg_api_provider='shotgun-api3'),
+        daemon=_DaemonConfig(state_dir=tmp_path / 'state', sg_api_provider='shotgun-api3'),
         sites={},
     )
 
@@ -41,7 +41,7 @@ def test_worker_lock_paths_preserve_layout_without_creating_directories(
     tmp_path: Path,
 ) -> None:
     config = Config(
-        daemon=DaemonConfig(state_dir=tmp_path / 'state', sg_api_provider='shotgun-api3'),
+        daemon=_DaemonConfig(state_dir=tmp_path / 'state', sg_api_provider='shotgun-api3'),
         sites={},
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import sys
 from contextlib import ExitStack, closing, contextmanager
@@ -10,26 +11,31 @@ from typing import TYPE_CHECKING
 from sg_event_daemon._checkpoint import Checkpointer
 from sg_event_daemon._group_recovery import DispositionRequest
 from sg_event_daemon._group_state import GroupOpenOptions, GroupState
-from sg_event_daemon._group_types import AuditIdentity
+from sg_event_daemon._group_types import AuditIdentity, CompleteLateStep, ReserveLateStep
+from sg_event_daemon._lane import Delivery
 from sg_event_daemon._source_state import SourceState
 from sg_event_daemon._write_lock import WriteContext
 from tests._storage_support import group_lock, write_context_for
+from tests.group._support import commit_step
 from tests.source._support import SOURCE_GENERATION, STREAM
+from tests.test_lane import Backend, build_lane, make_event, open_group_state, record_callback
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from sg_event_daemon._plugins import EventContext
 
 
 class _KillWrites(WriteContext):
     armed: str = ''
     commits: int = 0
-    attempts: int = 0
+    _attempts: int = 0
 
     @contextmanager
     def transaction(self, connection: sqlite3.Connection) -> Generator[sqlite3.Connection]:
         if self.armed == 'stale':
-            object.__setattr__(self, 'attempts', self.attempts + 1)
-            _pause(f'preflight:{self.attempts}')
+            object.__setattr__(self, '_attempts', self._attempts + 1)
+            _pause(f'preflight:{self._attempts}')
         with super().transaction(connection) as active:
             yield active
             if self.armed == 'before':
@@ -40,7 +46,13 @@ class _KillWrites(WriteContext):
         if self.armed == 'after':
             _pause('kill:after')
         if self.armed == 'checkpoint':
-            checkpointer = Checkpointer(connection, Path('events.db'), interval_secs=1)
+            checkpointer = Checkpointer(
+                connection,
+                Path('events.db'),
+                interval_secs=1,
+                logger=logging.getLogger('sg_event_daemon.source'),
+                log_extra={},
+            )
 
             def checkpoint_progress() -> int:
                 _pause('kill:checkpoint')
@@ -49,6 +61,36 @@ class _KillWrites(WriteContext):
             connection.set_progress_handler(checkpoint_progress, 1)
             checkpointer.run_once()
             raise AssertionError('checkpoint did not enter its progress callback')
+
+
+def _callback_main(path: Path) -> None:
+    with open_group_state(path) as state:
+        writes = _KillWrites(state._writes.lock)
+        state._writes = writes
+        point = ''
+
+        def callback(context: EventContext) -> None:
+            print(f'callback:{context.delivery_attempt}', flush=True)
+            if point == 'callback':
+                assert sys.stdin.readline() == 'continue\n'
+
+        lane, _factory = build_lane(
+            state,
+            (record_callback(0, 'callback', callback),),
+            backend=Backend(events={11: make_event(11)}, exact_reads={}),
+        )
+        assert lane.setup() is None
+        print('ready', flush=True)
+        try:
+            for line in sys.stdin:
+                action, _group, point = json.loads(line)
+                object.__setattr__(writes, 'armed', 'before' if point == 'before' else '')
+                if action == 'resume-callback':
+                    lane.resume()
+                lane.deliver_many_counted((Delivery(make_event(11)),))
+                print('done', flush=True)
+        finally:
+            lane.close()
 
 
 def _pause(notice: str) -> None:
@@ -99,9 +141,13 @@ def _lane_operation(state: GroupState, action: str) -> None:
         result = state.advance_irrelevant_prefix(106, expected_revision=current.revision)
         assert result.cursor == (100 if action == 'fence' else 106)
     elif action == 'reserve':
-        state.reserve_late_event('range-101-103', 102, expected_revision=current.revision)
+        commit_step(
+            state, ReserveLateStep('range-101-103', 102), expected_revision=current.revision
+        )
     elif action == 'late':
-        state.complete_late_id('range-101-103', 102, expected_revision=current.revision)
+        commit_step(
+            state, CompleteLateStep('range-101-103', 102), expected_revision=current.revision
+        )
     elif action == 'scan':
         state.complete_obligation_scan('range-101-103')
     elif action in {'park', 'unpark'}:
@@ -154,12 +200,15 @@ def open_source(path: Path, writes: WriteContext) -> SourceState:
         stream_fingerprint=STREAM,
         source_generation=SOURCE_GENERATION,
         token_factory=lambda: 'range-101-103',
-        visibility_overlap_secs=1,
+        late_event_window_secs=1,
     )
 
 
-def main() -> None:
+def _main() -> None:
     path = Path(sys.argv[1])
+    if len(sys.argv) == 3 and sys.argv[2] == 'callback':
+        _callback_main(path)
+        return
     writes = _KillWrites(write_context_for(path).lock)
     with ExitStack() as stack:
         source = stack.enter_context(open_source(path, writes))
@@ -194,4 +243,4 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    main()
+    _main()

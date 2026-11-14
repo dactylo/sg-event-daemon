@@ -1,0 +1,82 @@
+name: Start release
+
+# Starts the Release workflow on the version tag of each commit of main that a
+# successful push run of CI tested, so the release run's checks appear on the
+# tagged commit.
+
+on:
+  # zizmor reports every workflow_run trigger. This one is safe: the job runs
+  # only after push runs of this repository, never for forks or pull requests,
+  # and it reads pyproject.toml without running the checked-out code.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  start:
+    name: Start release
+    # Only a successful push run of CI on the default branch of this public
+    # repository, not of a fork, can start a release.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      !github.event.repository.private
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Start the release workflow for a tagged version
+        id: start
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_WORKFLOW_FILE: release.yml
+        run: |
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']
+          version = project['version']
+          tag = f'v{version}'
+          commit = os.environ['RELEASE_COMMIT']
+          tagged = subprocess.run(
+              ['git', 'rev-parse', '--verify', '--quiet', f'refs/tags/{tag}^{{commit}}'],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version) is None:
+              message = f'Version {version} in pyproject.toml is not in X.Y.Z form; nothing to publish.'
+          elif tagged.returncode or tagged.stdout.strip() != commit:
+              message = f'No {tag} tag at this commit; nothing to publish.'
+          else:
+              subprocess.run(
+                  [
+                      'gh', 'workflow', 'run', os.environ['RELEASE_WORKFLOW_FILE'],
+                      '--repo', os.environ['GITHUB_REPOSITORY'], '--ref', tag,
+                  ],
+                  check=True,
+              )
+              message = f'Started the release workflow for {tag}.'
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+              summary.write(message + '\n')
+          print(message)

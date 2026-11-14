@@ -39,10 +39,10 @@ env:
     ${{ !github.event.repository.private || github.event_name != 'workflow_dispatch' ||
         inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER) }}
   CI_IMPORT: sg_event_daemon
-  NODE_VERSION: 24.21.0
+  NODE_VERSION: 26.12.0
   UV_PYTHON_DOWNLOADS: never
   UV_SYSTEM_PYTHON: "0"
-  UV_VERSION: 0.12.13
+  UV_VERSION: 0.13.6
 
 defaults:
   run:
@@ -67,23 +67,23 @@ jobs:
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           architecture: >-
             ${{ runner.environment == 'self-hosted' && runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           python-version: "3.13"
       - name: Set up Node for Pyright
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
       - name: Set up locked development environment
@@ -133,7 +133,8 @@ jobs:
 
   test:
     needs: quality
-    timeout-minutes: 60
+    # Leave room for several 15-minute test timeouts to reach pytest's failure summary.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -167,14 +168,40 @@ jobs:
           if [ "$CI_HOSTED" = true ]; then
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
+      - name: Report machine before tests
+        env:
+          CI_RUNNER_OS: ${{ runner.os }}
+        run: |
+          # Diagnostics only; the "|| true" keeps any failed command from failing the job.
+          {
+            if [ "$CI_RUNNER_OS" = macOS ]; then
+              printf 'Cores: %s\n' "$(sysctl -n hw.ncpu)"
+              printf 'Memory: %s bytes\n' "$(sysctl -n hw.memsize)"
+              printf 'CPU: %s\n' "$(sysctl -n machdep.cpu.brand_string)"
+              printf 'OS: macOS %s\n' "$(sw_vers -productVersion)"
+              vm_stat
+              ps -Ao pcpu,pmem,etime,command -r | head -15
+            else
+              printf 'Cores: %s\n' "$(nproc)"
+              grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo
+              grep -m1 'model name' /proc/cpuinfo
+              printf 'OS: %s\n' "$(uname -sr)"
+              ps -Ao pcpu,pmem,etime,args --sort=-pcpu | head -15
+            fi
+            uptime
+            df -h .
+            printf 'Open files limit: %s; processes limit: %s\n' "$(ulimit -n)" "$(ulimit -u)"
+          } || true
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
+          # The test Python is installed after this step, so name the cache by its version.
+          cache-suffix: ${{ matrix.python-version }}
       - name: Create test environment with supported SQLite
         env:
           TEST_PYTHON: ${{ matrix.python-version }}
@@ -204,9 +231,9 @@ jobs:
       - name: Check SQLite runtime
         run: |
           python - <<'PY'
-          from sg_event_daemon._sqlite import _validate_sqlite_version
+          from sg_event_daemon._sqlite import validate_sqlite_version
 
-          _validate_sqlite_version()
+          validate_sqlite_version()
           PY
       - name: Run tests
         env:
@@ -218,7 +245,33 @@ jobs:
           if [ "$CI_QUICK_TESTS" = true ]; then
             selection=(-m 'not slow')
           fi
-          python -m pytest -q -n auto --dist worksteal --durations=15 "${selection[@]}"
+          # -vv outweighs the configured -q, so each test's result is logged as it finishes.
+          python -m pytest -vv -n auto --dist worksteal --durations=15 "${selection[@]}"
+      - name: Report machine after tests
+        if: always()
+        env:
+          CI_RUNNER_OS: ${{ runner.os }}
+        run: |
+          # Diagnostics only; the "|| true" keeps any failed command from failing the job.
+          {
+            if [ "$CI_RUNNER_OS" = macOS ]; then
+              printf 'Cores: %s\n' "$(sysctl -n hw.ncpu)"
+              printf 'Memory: %s bytes\n' "$(sysctl -n hw.memsize)"
+              printf 'CPU: %s\n' "$(sysctl -n machdep.cpu.brand_string)"
+              printf 'OS: macOS %s\n' "$(sw_vers -productVersion)"
+              vm_stat
+              ps -Ao pcpu,pmem,etime,command -r | head -15
+            else
+              printf 'Cores: %s\n' "$(nproc)"
+              grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo
+              grep -m1 'model name' /proc/cpuinfo
+              printf 'OS: %s\n' "$(uname -sr)"
+              ps -Ao pcpu,pmem,etime,args --sort=-pcpu | head -15
+            fi
+            uptime
+            df -h .
+            printf 'Open files limit: %s; processes limit: %s\n' "$(ulimit -n)" "$(ulimit -u)"
+          } || true
 
   package:
     needs: [quality, test]
@@ -240,18 +293,19 @@ jobs:
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           architecture: >-
             ${{ runner.environment == 'self-hosted' && runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           python-version: "3.13"
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
+          enable-cache: false # published distributions are built without a restored cache
           version: ${{ env.UV_VERSION }}
       - name: Build distributions
         run: uv build --python python --no-python-downloads --build-constraints requirements-ci.txt --require-hashes
@@ -269,22 +323,17 @@ jobs:
           assert len(sdists) == 1, sdists
 
           sdist_roots = {
-              '.gitignore',
-              'LICENSE',
-              'PKG-INFO',
-              'README.md',
-              'pyproject.toml',
-              'src',
-              'docs',
+              '.gitignore', 'LICENSE', 'PKG-INFO', 'README.md', 'pyproject.toml', 'src',
           }
 
           with zipfile.ZipFile(wheels[0]) as archive:
               archives = [(archive.filename, archive.namelist(), False)]
           with tarfile.open(sdists[0], 'r:gz') as archive:
-              archives.append((archive.name, archive.getnames(), True))
+              archives.append((archive.name, archive.getmembers(), True))
 
-          for archive_name, names, strip_sdist_root in archives:
-              for raw_name in names:
+          for archive_name, members, strip_sdist_root in archives:
+              for member in members:
+                  raw_name = member.name if strip_sdist_root else member
                   path = PurePosixPath(raw_name)
                   assert not path.is_absolute(), (archive_name, raw_name)
                   assert '..' not in path.parts, (archive_name, raw_name)
@@ -295,9 +344,6 @@ jobs:
                       assert parts[0] in sdist_roots, (archive_name, raw_name)
                       if parts[0] == 'src' and len(parts) > 1:
                           assert parts[1] == 'sg_event_daemon', (archive_name, raw_name)
-                      if parts[0] == 'docs' and len(parts) > 1:
-                          assert len(parts) == 2, (archive_name, raw_name)
-                          assert parts[1] in {'operations.md', 'porting.md'}, (archive_name, raw_name)
                   else:
                       assert (
                           parts[0] == 'sg_event_daemon'
@@ -319,7 +365,7 @@ jobs:
         run: git diff --exit-code
       - name: Save distributions
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.CI_HOSTED == 'true' && 'python-distributions' || 'local-distributions' }}
           path: dist/

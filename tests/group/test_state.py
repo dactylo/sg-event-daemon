@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import sqlite3
-import time
+import sys
 import tracemalloc
+from contextlib import closing
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from unittest.mock import Mock
 
 import pytest
 
+import sg_event_daemon._group_delivery as group_delivery
 import sg_event_daemon._group_types as group_types
-from sg_event_daemon._group_errors import InvalidTransitionError
+from sg_event_daemon._group_errors import InvalidTransitionError, RevisionConflictError
 from sg_event_daemon._group_recovery import DispositionRequest
 from sg_event_daemon._group_state import GroupOpenOptions, GroupState
 from sg_event_daemon._group_types import (
     AuditIdentity,
+    BeginCallbackStep,
+    CompleteLateStep,
     LiveJoinIdentity,
+    ReserveLateStep,
+    StartEventStep,
 )
 from sg_event_daemon._health import GroupHealth
 from sg_event_daemon._lane import LaneHealth
@@ -33,6 +40,8 @@ from tests._storage_support import (
     open_test_group,
     write_context_for,
 )
+from tests.group._support import commit_step
+from tests.source._support import open_source
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -57,19 +66,30 @@ class _CloseProbe:
         operations: list[str],
         error: KeyboardInterrupt | None,
     ) -> None:
-        self._error = error
+        self.error = error
         self._name = name
         self._operations = operations
-        self._traceback: object | None = None
+        self.traceback: object | None = None
 
     def close(self) -> None:
         self._operations.append(self._name)
-        if self._error is not None:
+        if self.error is not None:
             try:
-                raise self._error
+                raise self.error
             except KeyboardInterrupt as error:
-                self._traceback = error.__traceback__
+                self.traceback = error.__traceback__
                 raise
+
+
+def _capacity_pending_count(state: GroupState) -> int:
+    connection = vars(state)['_database'].connection
+    return int(
+        connection.execute(
+            'SELECT COUNT(*) FROM late_ids WHERE group_name = ? '
+            "AND terminal_state = 'capacity-pending'",
+            ('editorial',),
+        ).fetchone()[0]
+    )
 
 
 def _group_state_with_close_probes(
@@ -96,23 +116,21 @@ def _group_state_with_close_probes(
     return state, probes, operations
 
 
-def _manifest(*callback_ids: str) -> CallbackManifest:
-    return CallbackManifest(
-        callbacks=tuple(
-            CallbackIdentity(
-                ordinal=ordinal,
-                plugin_id='publish',
-                callback_id=callback_id,
-                execution='sync',
-                filter_digest=f'filter-{ordinal}',
-                config_digest=f'config-{ordinal}',
-                secret_refs=(),
-                credential_name='publisher',
-                credential_fingerprint='publisher:publish-script',
-            )
-            for ordinal, callback_id in enumerate(callback_ids)
-        )
-    )
+def _late_capacity_resume_options(path: Path, limit: int) -> GroupOpenOptions:
+    return {
+        'writes': write_context_for(path),
+        'site': 'studio',
+        'site_server_url': 'https://studio.example.invalid',
+        'source': 'events',
+        'group': 'editorial',
+        'group_generation': 7,
+        'ordering': 'eager',
+        'stream_fingerprint': 'stream-v1',
+        'source_generation': 'source-spawn-1',
+        'verified_incarnation': 'incarnation-1',
+        'start_mode': 'resume',
+        'max_late_ids_per_group': limit,
+    }
 
 
 def _obligation(state: GroupState, *, closed: bool = False) -> None:
@@ -137,6 +155,43 @@ def _open_group(
         max_group_obligations=max_group_obligations,
         max_late_ids_per_group=max_late_ids_per_group,
         ordering=ordering,
+    )
+
+
+def _create_halted_late_capacity_group(path: Path) -> int:
+    with _open_group(path, max_late_ids_per_group=1) as state:
+        _obligation(state)
+        reserved = commit_step(state, ReserveLateStep('range-1', 42), expected_revision=0)
+        connection = vars(state)['_database'].connection
+        connection.execute(
+            "INSERT INTO late_ids VALUES ('editorial', 'range-1', 43, 'capacity-pending', 1)"
+        )
+        connection.execute(
+            "INSERT INTO late_ids VALUES ('editorial', 'range-1', 44, 'capacity-pending', 2)"
+        )
+        halted = state.snapshot()
+        assert reserved.late_id_count == 1
+        assert _capacity_pending_count(state) == 2
+        assert halted.status == 'late-capacity-exhausted'
+        return halted.revision
+
+
+def manifest(*callback_ids: str) -> CallbackManifest:
+    return CallbackManifest(
+        callbacks=tuple(
+            CallbackIdentity(
+                ordinal=ordinal,
+                plugin_id='publish',
+                callback_id=callback_id,
+                execution='sync',
+                filter_digest=f'filter-{ordinal}',
+                config_digest=f'config-{ordinal}',
+                secret_refs=(),
+                credential_name='publisher',
+                credential_fingerprint='publisher:publish-script',
+            )
+            for ordinal, callback_id in enumerate(callback_ids)
+        )
     )
 
 
@@ -233,10 +288,87 @@ def test_close_exhausts_owned_resources_when_every_close_succeeds() -> None:
     assert operations == ['database', 'handoff', 'lock', 'write-lock']
 
 
+def test_combined_commit_advances_the_revision_per_step_and_conflicts_whole(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _open_group(tmp_path / 'group.db') as state:
+        _obligation(state, closed=True)
+        steps = (
+            group_types.ReserveLateStep('range-1', 42),
+            group_types.StartEventStep(42, manifest('one'), 'range-1'),
+            group_types.BeginCallbackStep(0),
+        )
+        with closing(sqlite3.connect(tmp_path / 'group.db')) as operator, operator:
+            operator.execute(
+                "UPDATE group_state SET revision = revision + 1 WHERE group_name = 'editorial'"
+            )
+        with pytest.raises(RevisionConflictError):
+            state.commit_pre_invocation(steps, expected_revision=0)
+        assert state.snapshot().late_id_count == 0
+        constructor = group_types.GroupSnapshot
+        counted = Mock(wraps=constructor)
+        for module in tuple(sys.modules.values()):
+            for name, value in tuple(vars(module).items()):
+                if value is constructor:
+                    monkeypatch.setattr(module, name, counted)
+        result = state.commit_pre_invocation(steps, expected_revision=1)
+        assert counted.call_count == 1
+        assert result.rejection is None
+        assert result.snapshot.revision == 4
+        assert result.snapshot.callback_marks[0][4] == 1
+        assert result.snapshot == state.snapshot()
+
+
+def test_disposition_open_does_not_promote_late_capacity(tmp_path: Path) -> None:
+    path = tmp_path / 'editorial.db'
+    revision_before = _create_halted_late_capacity_group(path)
+
+    with GroupState.open_for_disposition(
+        path, group_lock(path, 'editorial'), **_late_capacity_resume_options(path, 3)
+    ) as state:
+        assert _capacity_pending_count(state) == 2
+        assert state.snapshot().revision == revision_before
+
+
+def test_first_start_full_commits_identity_and_position(tmp_path: Path) -> None:
+    path = tmp_path / 'editorial.db'
+    with _open_group(path) as state:
+        snapshot = state.snapshot()
+        assert snapshot.site == 'studio'
+        assert snapshot.source == 'events'
+        assert snapshot.group == 'editorial'
+        assert snapshot.group_generation == 7
+        assert snapshot.revision == 0
+        assert snapshot.status == 'running'
+        assert snapshot.conditions == ()
+        assert snapshot.cursor == 41
+        assert snapshot.delivery_floor == 41
+        assert snapshot.verified_incarnation == 'incarnation-1'
+
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            """
+            SELECT site, site_server_url, source_name, group_name, group_generation,
+                   ordering_mode, stream_fingerprint
+            FROM groups CROSS JOIN source_meta
+            WHERE group_name = 'editorial'
+            """
+        ).fetchone() == (
+            'studio',
+            'https://studio.example.invalid',
+            'events',
+            'editorial',
+            7,
+            'eager',
+            'stream-v1',
+        )
+
+
 def test_group_audit_count_returns_exact_owner_row_count(tmp_path: Path) -> None:
     with _open_group(tmp_path / 'editorial.db') as state:
-        state.start_event(42, _manifest('publish'), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(state, StartEventStep(42, manifest('publish'), None), expected_revision=0)
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         state.resolve_conditional_park(
             group_types.ConditionalParkDirective(
                 evidence_id='evidence-audit-count',
@@ -253,6 +385,59 @@ def test_group_audit_count_returns_exact_owner_row_count(tmp_path: Path) -> None
         )
 
         assert state.audit_count() == 2
+
+
+def test_group_open_requires_explicit_start_mode(tmp_path: Path) -> None:
+    options: dict[str, object] = {
+        'writes': write_context_for(tmp_path / 'group.db'),
+        'site': 'studio',
+        'site_server_url': 'https://studio.example.invalid',
+        'source': 'events',
+        'group': 'editorial',
+        'group_generation': 1,
+        'ordering': 'eager',
+        'stream_fingerprint': 'stream-v1',
+        'source_generation': 'source-1',
+        'verified_incarnation': 'incarnation-1',
+    }
+    with pytest.raises(KeyError, match='start_mode'):
+        GroupState.open(
+            tmp_path / 'group.db',
+            group_lock(tmp_path / 'group.db', 'editorial'),
+            **cast('GroupOpenOptions', options),
+        )
+
+
+def test_lane_lock_fails_before_a_second_owner_can_mutate_state(tmp_path: Path) -> None:
+    path = tmp_path / 'editorial.db'
+    with _open_group(path) as first:
+        before = first.snapshot()
+        with pytest.raises(AlreadyLockedError):
+            _open_group(path)
+        assert first.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ('limit', 'pending_after', 'status'),
+    [(3, 0, 'running'), (2, 1, 'halted'), (1, 2, 'halted')],
+)
+def test_lane_open_promotes_late_capacity_under_current_limit(
+    tmp_path: Path, limit: int, pending_after: int, status: str
+) -> None:
+    path = tmp_path / 'editorial.db'
+    revision_before = _create_halted_late_capacity_group(path)
+
+    with GroupState.open(
+        path, group_lock(path, 'editorial'), **_late_capacity_resume_options(path, limit)
+    ) as state:
+        current = state.snapshot()
+        assert _capacity_pending_count(state) == pending_after
+        assert (current.status == 'running') is (status == 'running')
+        if pending_after == 2:
+            assert current.revision == revision_before
+        else:
+            assert current.revision == revision_before + 1
+        assert current.late_id_count == 3 - pending_after
 
 
 @pytest.mark.parametrize('invalid_mode', ['legacy', 'other'])
@@ -296,7 +481,7 @@ def test_close_exhausts_owned_resources_after_database_failures(
     first_failure: str,
 ) -> None:
     state, probes, operations = _group_state_with_close_probes(failures)
-    first_error = probes[first_failure]._error
+    first_error = probes[first_failure].error
     assert first_error is not None
 
     with pytest.raises(KeyboardInterrupt) as raised:
@@ -307,7 +492,7 @@ def test_close_exhausts_owned_resources_after_database_failures(
         traceback = traceback.tb_next
     assert operations == ['database', 'handoff', 'lock', 'write-lock']
     assert raised.value is first_error
-    assert traceback is probes[first_failure]._traceback
+    assert traceback is probes[first_failure].traceback
     if len(failures) > 1:
         assert any('handoff close failed' in note for note in first_error.__notes__)
 
@@ -356,36 +541,6 @@ def test_failed_open_attempts_all_owned_cleanup(
         assert 'lock cleanup failure' in caught.value.__notes__[-1]
 
 
-def test_group_open_requires_explicit_start_mode(tmp_path: Path) -> None:
-    options: dict[str, object] = {
-        'writes': write_context_for(tmp_path / 'group.db'),
-        'site': 'studio',
-        'site_server_url': 'https://studio.example.invalid',
-        'source': 'events',
-        'group': 'editorial',
-        'group_generation': 1,
-        'ordering': 'eager',
-        'stream_fingerprint': 'stream-v1',
-        'source_generation': 'source-1',
-        'verified_incarnation': 'incarnation-1',
-    }
-    with pytest.raises(KeyError, match='start_mode'):
-        GroupState.open(
-            tmp_path / 'group.db',
-            group_lock(tmp_path / 'group.db', 'editorial'),
-            **cast('GroupOpenOptions', options),
-        )
-
-
-def test_lane_lock_fails_before_a_second_owner_can_mutate_state(tmp_path: Path) -> None:
-    path = tmp_path / 'editorial.db'
-    with _open_group(path) as first:
-        before = first.snapshot()
-        with pytest.raises(AlreadyLockedError):
-            _open_group(path)
-        assert first.snapshot() == before
-
-
 def test_live_join_validation_does_not_wait_for_a_writer(tmp_path: Path) -> None:
     path = tmp_path / 'group.db'
     with _open_group(path) as state:
@@ -403,9 +558,8 @@ def test_live_join_validation_does_not_wait_for_a_writer(tmp_path: Path) -> None
         writer = sqlite3.connect(path, isolation_level=None)
         try:
             writer.execute('BEGIN IMMEDIATE')
-            started = time.monotonic()
+            state._database.connection.execute('PRAGMA busy_timeout=0')
             assert state.validate_live_join(identity, before.revision) == before
-            assert time.monotonic() - started < 0.5
         finally:
             writer.rollback()
             writer.close()
@@ -587,15 +741,63 @@ def test_primary_synchronous_policy_survives_reopen_with_full_handoff(
             assert handoff.execute('PRAGMA synchronous').fetchone() == (2,)
 
 
+def test_refresh_source_facts_and_rows_share_one_read_transaction(tmp_path: Path) -> None:
+    path = tmp_path / 'source.db'
+    with open_source(path, configured_stream='stream-v1') as source, _open_group(path) as state:
+        source.initialize(50, incarnation='incarnation-1')
+        connection = state._handoff.connection
+        connection.execute("""
+            UPDATE source_meta SET initialized=1, frontier=50, successful_clock=1,
+            source_generation='source-spawn-1', stream_incarnation='incarnation-1'
+            """)
+        insert_range(connection, 'range-a', 42, 50)
+        bind_group(connection, 'range-a', 'editorial', 7, floor=41, eligibility_point=0)
+        writer = sqlite3.connect(path, isolation_level=None)
+        changed = False
+
+        def after_meta(statement: str) -> None:
+            nonlocal changed
+            if changed or 'FROM range_groups AS bindings' not in statement:
+                return
+            changed = True
+            writer.execute("""
+            UPDATE discovery_ranges SET range_state='closed', close_generation=1,
+            source_revision=2 WHERE obligation_id='range-a'
+            """)
+            insert_source_late_ids(writer, 'range-a', (42,))
+            writer.execute('UPDATE source_meta SET frontier=60, successful_clock=2')
+
+        primary = state._database.connection
+        primary.set_trace_callback(after_meta)
+        try:
+            before, old_ranges = state.refresh_ranges()
+            assert old_ranges is not None
+            (old_range,) = old_ranges
+        finally:
+            primary.set_trace_callback(None)
+            writer.close()
+        assert changed
+        assert (before.frontier, before.source_successful_clock) == (50, 1)
+        assert not old_range.closed
+        assert old_range.visibility_deadline == 300.0
+        after, pending = state.refresh_ranges(before.range_revision)
+        assert pending is not None
+        assert (after.frontier, after.source_successful_clock) == (60, 2)
+        assert pending[0].closed
+        assert pending[0].visibility_deadline == old_range.visibility_deadline
+
+
 def test_restart_preserves_in_flight_manifest_marks_and_attempts(tmp_path: Path) -> None:
     path = tmp_path / 'editorial.db'
     with _open_group(path) as state:
-        state.start_event(42, _manifest('prepare', 'publish'), expected_revision=0)
-        state.begin_callback(0, expected_revision=1)
+        commit_step(
+            state, StartEventStep(42, manifest('prepare', 'publish'), None), expected_revision=0
+        )
+        commit_step(state, BeginCallbackStep(0), expected_revision=1)
         before_restart = state.callback_done(0, expected_revision=2)
     with _open_group(path) as reopened:
         assert reopened.snapshot() == before_restart
-        retried = reopened.begin_callback(1, expected_revision=3)
+        retried = commit_step(reopened, BeginCallbackStep(1), expected_revision=3)
         assert retried.callback_marks[1][-1] == 1
 
 
@@ -638,6 +840,7 @@ def test_stream_and_ordering_mismatches_project_independently_and_restore(
         ('duplicate', 10, (1, (11,))),
         ('open', 10, (1, (11,))),
         ('stale', 10, (1, (11,))),
+        ('scan-complete', 10, (1, (11,))),
         ('done', 10, (0, ())),
         ('zero-limit', 0, (1, ())),
     ],
@@ -650,7 +853,7 @@ def test_unresolved_late_id_projection_cases(
         insert_range(connection, 'a', 10, 12, state='closed')
         bind_group(connection, 'a', 'editorial', 7, floor=0, eligibility_point=0)
         insert_source_late_ids(connection, 'a', (11,))
-        if case in {'duplicate', 'open', 'stale'}:
+        if case in {'duplicate', 'open', 'stale', 'scan-complete'}:
             insert_range(connection, 'b', 11, 13, state='open' if case == 'open' else 'closed')
             bind_group(
                 connection,
@@ -659,6 +862,7 @@ def test_unresolved_late_id_projection_cases(
                 6 if case == 'stale' else 7,
                 floor=0,
                 eligibility_point=0,
+                state='scan-complete' if case == 'scan-complete' else 'pending',
             )
             insert_source_late_ids(connection, 'b', (11 if case == 'duplicate' else 12,))
         if case == 'done':
@@ -667,13 +871,158 @@ def test_unresolved_late_id_projection_cases(
         assert state.unresolved_late_id_projection(limit=limit) == expected
 
 
+@pytest.mark.parametrize('after_write', [False, True])
+def test_combined_commit_rolls_back_rejected_step_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after_write: bool,
+) -> None:
+    original = group_delivery.begin_callback_step
+
+    def reject_after_write(
+        connection: sqlite3.Connection,
+        group: str,
+        ordinal: int,
+        revision: int,
+    ) -> int:
+        original(connection, group, ordinal, revision)
+        raise InvalidTransitionError('rejected after writing attempt')
+
+    if after_write:
+        monkeypatch.setattr(group_delivery, 'begin_callback_step', reject_after_write)
+    with _open_group(tmp_path / 'group.db') as state:
+        _obligation(state, closed=True)
+        result = state.commit_pre_invocation(
+            (
+                group_types.ReserveLateStep('range-1', 42),
+                group_types.StartEventStep(42, manifest('one'), 'range-1'),
+                group_types.BeginCallbackStep(0 if after_write else 1),
+            ),
+            expected_revision=0,
+        )
+        assert isinstance(result.rejection, InvalidTransitionError)
+        assert result.snapshot.revision == 2
+        assert result.snapshot.in_flight_event_id == 42
+        assert result.snapshot.callback_marks[0][4] == 0
+        assert result.snapshot == state.snapshot()
+
+
+@pytest.mark.parametrize('final', [False, True])
+@pytest.mark.parametrize('rejection', ['capacity', 'cas', 'fence'])
+def test_done_step_savepoint_preserves_only_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final: bool,
+    rejection: str,
+) -> None:
+    path = tmp_path / 'group.db'
+    with _open_group(path) as state:
+        started = commit_step(
+            state,
+            StartEventStep(42, manifest('a') if final else manifest('a', 'b'), None),
+            expected_revision=0,
+        )
+        attempted = commit_step(state, BeginCallbackStep(0), expected_revision=started.revision)
+        original = group_delivery.begin_callback_step
+        error_type = (
+            RevisionConflictError
+            if rejection == 'cas'
+            else (
+                group_delivery.StrictObligationBlockedError
+                if rejection == 'fence'
+                else InvalidTransitionError
+            )
+        )
+
+        def reject(connection: sqlite3.Connection, group: str, ordinal: int, revision: int) -> int:
+            original(connection, group, ordinal, revision)
+            raise error_type(f'{rejection} rejected next attempt')
+
+        monkeypatch.setattr(group_delivery, 'begin_callback_step', reject)
+        steps = (group_types.CallbackDoneStep(0),)
+        if final:
+            steps += (group_types.StartEventStep(43, manifest('b'), None),)
+        result = state.commit_pre_invocation(
+            (*steps, group_types.BeginCallbackStep(0 if final else 1)),
+            expected_revision=attempted.revision,
+        )
+        assert type(result.rejection) is error_type
+        assert str(result.rejection) == f'{rejection} rejected next attempt'
+        assert result.snapshot.revision == attempted.revision + 1
+        assert result.snapshot.cursor == (42 if final else 41)
+        assert result.snapshot.in_flight_event_id == (None if final else 42)
+        assert [mark[3:] for mark in result.snapshot.callback_marks] == (
+            [] if final else [('done', 1), ('pending', 0)]
+        )
+        assert result.snapshot == state.snapshot()
+        with closing(sqlite3.connect(path)) as reader, reader:
+            assert reader.execute(
+                'SELECT event_id, ordinal, outcome, delivery_attempt '
+                'FROM callback_marks ORDER BY ordinal'
+            ).fetchall() == ([] if final else [(42, 0, 'done', 1), (42, 1, 'pending', 0)])
+        monkeypatch.setattr(group_delivery, 'begin_callback_step', original)
+        retried = state.commit_pre_invocation(
+            ((group_types.StartEventStep(43, manifest('b'), None),) if final else ())
+            + (group_types.BeginCallbackStep(0 if final else 1),),
+            expected_revision=result.snapshot.revision,
+        )
+        assert retried.rejection is None
+        assert retried.snapshot.callback_marks[-1][4] == 1
+
+
+@pytest.mark.parametrize('case', ['stale', 'invalid', 'fence'])
+def test_rejected_done_step_commits_no_success(tmp_path: Path, case: str) -> None:
+    path = tmp_path / 'group.db'
+    with _open_group(path, ordering='strict') as state:
+        started = commit_step(
+            state,
+            StartEventStep(42, manifest('a') if case == 'fence' else manifest('a', 'b'), None),
+            expected_revision=0,
+        )
+        attempted = commit_step(state, BeginCallbackStep(0), expected_revision=started.revision)
+        if case == 'fence':
+            # Publish a fence that rejects completion itself.
+            _obligation(state)
+        before = state.snapshot()
+        steps = (
+            group_types.CallbackDoneStep(1 if case == 'invalid' else 0),
+            group_types.BeginCallbackStep(1),
+        )
+        if case == 'stale':
+            with pytest.raises(RevisionConflictError):
+                state.commit_pre_invocation(steps, expected_revision=attempted.revision - 1)
+        else:
+            result = state.commit_pre_invocation(steps, expected_revision=attempted.revision)
+            assert result.snapshot == before
+            assert isinstance(result.rejection, InvalidTransitionError)
+            assert str(result.rejection) == (
+                'callback was not invoked and pending'
+                if case == 'invalid'
+                else 'strict delivery is blocked by an unresolved obligation'
+            )
+        assert state.snapshot() == before
+        with closing(sqlite3.connect(path)) as reader, reader:
+            assert reader.execute(
+                "SELECT COUNT(*) FROM callback_marks WHERE outcome = 'done'"
+            ).fetchone() == (0,)
+            assert reader.execute('SELECT cursor FROM group_state').fetchone() == (41,)
+
+
 def test_unresolved_late_id_projection_reports_only_pending_callback_work(tmp_path: Path) -> None:
     with _open_group(tmp_path / 'editorial.db', max_late_ids_per_group=2) as state:
         _obligation(state, closed=True)
-        state.reserve_late_event('range-1', 42, expected_revision=state.snapshot().revision)
-        state.reserve_late_event('range-1', 43, expected_revision=state.snapshot().revision)
-        state.complete_late_id('range-1', 43, expected_revision=state.snapshot().revision)
-        state.reserve_late_event('range-1', 44, expected_revision=state.snapshot().revision)
+        commit_step(
+            state, ReserveLateStep('range-1', 42), expected_revision=state.snapshot().revision
+        )
+        commit_step(
+            state, ReserveLateStep('range-1', 43), expected_revision=state.snapshot().revision
+        )
+        commit_step(
+            state, CompleteLateStep('range-1', 43), expected_revision=state.snapshot().revision
+        )
+        commit_step(
+            state, ReserveLateStep('range-1', 44), expected_revision=state.snapshot().revision
+        )
 
         expected_late_ids = (42, 44)
         unresolved_count, unresolved_late_ids = state.unresolved_late_id_projection(
@@ -714,7 +1063,6 @@ def test_unresolved_late_id_projection_reports_only_pending_callback_work(tmp_pa
             park_reason=None,
             failure_kind=None,
             failure_text=None,
-            checkpoint_state='complete',
             conditions=(),
         )
 
@@ -731,16 +1079,23 @@ def test_unresolved_late_id_projection_uses_scalar_and_bounded_queries(
         connection = vars(state)['_database'].connection
         insert_range(connection, 'range-1', 1, 50_000, state='closed')
         bind_group(connection, 'range-1', 'editorial', 7, floor=41, eligibility_point=0)
+        connection.execute('BEGIN')
         insert_source_late_ids(connection, 'range-1', range(1, 50_001))
+        connection.commit()
         statements: list[str] = []
         connection.set_trace_callback(statements.append)
 
-        tracemalloc.start()
+        tracing_was_active = tracemalloc.is_tracing()
+        if not tracing_was_active:
+            tracemalloc.start()
+        starting_bytes, _peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
         try:
             projection = state.unresolved_late_id_projection(limit=100)
             _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
         finally:
-            tracemalloc.stop()
+            if not tracing_was_active:
+                tracemalloc.stop()
             connection.set_trace_callback(None)
 
         selects = tuple(
@@ -751,7 +1106,7 @@ def test_unresolved_late_id_projection_uses_scalar_and_bounded_queries(
         assert projection == (50_000, tuple(range(1, 101)))
         assert len(selects) == 2
         assert selects[0].startswith('SELECT COUNT(*) FROM (')
-        assert selects[1].endswith('ORDER BY sl.event_id LIMIT 100')
-        assert peak_bytes < 512 * 1024
+        assert selects[1].endswith('LIMIT 100')
+        assert peak_bytes - starting_bytes < 512 * 1024
         with pytest.raises(ValueError, match='late-id projection limit must be nonnegative'):
             state.unresolved_late_id_projection(limit=-1)

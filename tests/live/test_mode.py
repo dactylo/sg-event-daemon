@@ -98,6 +98,31 @@ def test_load_option_does_not_select_durability(pytester: pytest.Pytester) -> No
     result.assert_outcomes(skipped=1)
 
 
+def test_namespace_options_forward_the_known_namespace(pytester: pytest.Pytester) -> None:
+    namespace = 'sg-event-daemon-20261031T120000000000Z-' + 'a' * 32
+    _write_isolated_live_test(pytester, marker='live', resolve_external=True)
+    pytester.makepyfile(
+        test_options=f"""\
+from tests._live_mode import live_options
+
+
+def test_options(pytestconfig):
+    options = live_options(pytestconfig)
+    assert options.namespace == {namespace!r}
+    assert options.recover == {namespace!r}
+"""
+    )
+    result = pytester.runpytest_subprocess(
+        '-q',
+        '--run-live',
+        '--live-provider=shotgun-api3',
+        '--live-mode=sync',
+        f'--live-namespace={namespace}',
+        f'--live-recover={namespace}',
+    )
+    result.assert_outcomes(passed=2)
+
+
 def test_run_live_requires_provider_and_mode(pytester: pytest.Pytester) -> None:
     _write_isolated_live_test(pytester, marker='live')
     result = pytester.runpytest_subprocess('-q', '--run-live')
@@ -126,6 +151,25 @@ def test_selected_tier_resolves_external_fixture(
         '--live-mode=sync',
     )
     result.assert_outcomes(passed=1)
+
+
+@pytest.mark.parametrize('option', ['--live-namespace', '--live-recover'])
+@pytest.mark.parametrize(
+    'value',
+    ['', 'other-prefix', 'sg-event-daemon-20261331T120000000000Z-' + 'a' * 32],
+)
+def test_namespace_options_refuse_a_malformed_value(
+    pytester: pytest.Pytester,
+    option: str,
+    value: str,
+) -> None:
+    _write_isolated_live_test(pytester, marker='live')
+    result = pytester.runpytest_subprocess(
+        '-q', '--run-live', '--live-provider=shotgun-api3', '--live-mode=sync', f'{option}={value}'
+    )
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([f'*{option}*valid live namespace*'])
+    assert 'external fixture was resolved' not in result.stdout.str()
 
 
 def test_shotgun_api3_rejects_sync_async_mode(pytester: pytest.Pytester) -> None:

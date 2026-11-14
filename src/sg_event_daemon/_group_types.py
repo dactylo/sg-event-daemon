@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import Self
 
+PreInvocationStep: TypeAlias = (
+    'ReserveLateStep | StartEventStep | BeginCallbackStep | CompleteLateStep | CallbackDoneStep'
+)
+
 _CALLBACK_FIELDS = frozenset(
     {
         'callback_id',
@@ -58,7 +62,6 @@ GroupStatus: TypeAlias = Literal[
     'running',
     'shape-mismatch',
     'stream-identity-changed',
-    'strict-capacity-exhausted',
 ]
 GROUP_STATUSES: tuple[GroupStatus, ...] = get_args(GroupStatus)
 _GROUP_STATUSES = frozenset(GROUP_STATUSES)
@@ -110,6 +113,53 @@ StartMode: TypeAlias = Literal['initialize', 'resume']
 
 
 @dataclass(frozen=True)
+class ReserveLateStep:
+    """Reserve one obligation-owned event before invocation."""
+
+    obligation_id: str
+    event_id: int
+
+
+@dataclass(frozen=True)
+class StartEventStep:
+    """Record an event and its callback manifest before invocation."""
+
+    event_id: int
+    manifest: CallbackManifest
+    obligation_id: str | None
+
+
+@dataclass(frozen=True)
+class BeginCallbackStep:
+    """Record the next attempt of one pending callback."""
+
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class CallbackDoneStep:
+    """Record the preceding callback's success before the next attempt."""
+
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class CompleteLateStep:
+    """Complete a reserved late event that matches no callback."""
+
+    obligation_id: str
+    event_id: int
+
+
+@dataclass(frozen=True)
+class PreInvocationResult:
+    """Return committed progress and any rejected pre-invocation step."""
+
+    snapshot: GroupSnapshot
+    rejection: Exception | None
+
+
+@dataclass(frozen=True)
 class AuditIdentity:
     """Carry trusted local process identity for an operator transition."""
 
@@ -131,29 +181,6 @@ class AuditIdentity:
         except KeyError:
             username = str(uid)
         return cls(local_uid=uid, username=username, pid=os.getpid())
-
-
-@dataclass(frozen=True)
-class AuditRecord:
-    """Contain one immutable operator-transition audit row."""
-
-    site: str
-    group: str
-    event_id: int | None
-    plugin_id: str | None
-    callback_id: str | None
-    command: str
-    wall_clock_time: float
-    prior_revision: int
-    new_revision: int
-    reason: str
-    operator_label: str | None
-    local_uid: int
-    username: str
-    pid: int
-    disposition_id: str | None
-    command_fingerprint: str | None
-    terminal_result: str | None
 
 
 @dataclass(frozen=True)
@@ -192,7 +219,14 @@ class ConditionalParkDirective:
     observed_at_wall_clock: float
 
     def __post_init__(self) -> None:
-        """Reject malformed or secret-looking recovery evidence at construction."""
+        """Reject malformed or secret-looking recovery evidence at construction.
+
+        Raises:
+            ValueError: An identity is empty or looks secret, a generation,
+                event id, or revision is not an exact nonnegative integer, or
+                the observation time is not an exact int or float with a
+                finite, nonnegative value.
+        """
         identities = (
             self.evidence_id,
             self.site,
@@ -360,12 +394,8 @@ class ReplayRequiredNotice:
     from_event_id: int
     digest: str
 
-    def canonical_bytes(self) -> bytes:
-        """Return canonical notice bytes excluding the attached digest.
-
-        Returns:
-            Deterministic bytes covering the complete replay marker.
-        """
+    def _canonical_bytes(self) -> bytes:
+        """Return canonical notice bytes excluding the attached digest."""
         return canonical_bytes(
             {
                 'site': self.site,
@@ -393,7 +423,7 @@ class ReplayRequiredNotice:
             An immutable canonically digested replay notice.
         """
         command = cls(**fields, digest='')
-        object.__setattr__(command, 'digest', digest(command.canonical_bytes()))
+        object.__setattr__(command, 'digest', digest(command._canonical_bytes()))
         return command
 
 

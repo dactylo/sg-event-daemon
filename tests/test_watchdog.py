@@ -16,20 +16,29 @@ from sg_event_daemon._watchdog import (
     WatchdogPhase,
     internal_stall_deadline_secs,
     provider_budget_secs,
+    watchdog_grace_secs,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from tests._stall_policy import StallDetectors
 
 _CELL_IDENTITY = 'registration-1'
 
 
 @dataclass
 class _Clock:
-    _now: float = 10.0
+    now: float = 10.0
 
     def __call__(self) -> float:
-        return self._now
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def _production_watchdog_contract(stall_detectors: StallDetectors) -> None:
+    # These cell and formula tests use explicit timestamps, with no live detector.
+    stall_detectors.enable('coordination', 'phase')
 
 
 def _watchdog(clock: _Clock) -> ComponentWatchdog:
@@ -48,7 +57,7 @@ def test_callback_heartbeat_slides_only_its_current_deadline() -> None:
     watchdog = _watchdog(clock)
 
     with watchdog.watch('callback', deadline_at=20.0):
-        clock._now = 17.0
+        clock.now = 17.0
         watchdog.heartbeat(sliding_deadline_secs=9.0)
         sample = watchdog.sample()
 
@@ -56,14 +65,55 @@ def test_callback_heartbeat_slides_only_its_current_deadline() -> None:
     assert sample.deadline_at == 26.0
 
 
+@pytest.mark.parametrize('parent', ['internal', 'startup'])
+def test_child_run_time_does_not_consume_parent_budget(parent: WatchdogPhase) -> None:
+    clock = _Clock(now=0.0)
+    watchdog = _watchdog(clock)
+    watchdog.transition(parent, deadline_at=10.0)
+
+    clock.now = 4.0
+    with watchdog.watch('callback', deadline_at=300.0):
+        with watchdog.watch('internal', deadline_at=280.0):
+            clock.now = 200.0
+        clock.now = 254.0
+
+    restored = watchdog.sample()
+    assert restored.phase == parent
+    assert restored.heartbeat_at == 254.0
+    assert restored.deadline_at == 260.0
+
+
+@pytest.mark.parametrize('parent', ['internal', 'startup'])
+def test_child_exit_by_exception_still_shifts_parent(parent: WatchdogPhase) -> None:
+    clock = _Clock(now=0.0)
+    watchdog = _watchdog(clock)
+    watchdog.transition(parent, deadline_at=10.0)
+
+    def fail_child() -> None:
+        clock.now = 254.0
+        raise RuntimeError('child failed')
+
+    clock.now = 4.0
+    with (
+        pytest.raises(RuntimeError, match='child failed'),
+        watchdog.watch('callback', deadline_at=300.0),
+    ):
+        fail_child()
+
+    restored = watchdog.sample()
+    assert restored.phase == parent
+    assert restored.heartbeat_at == 254.0
+    assert restored.deadline_at == 260.0
+
+
 def test_idle_restoration_refreshes_heartbeat_and_preserves_budget() -> None:
-    clock = _Clock(_now=0.0)
+    clock = _Clock(now=0.0)
     watchdog = _watchdog(clock)
     watchdog.transition('idle', deadline_at=11.0)
     idle = watchdog.sample()
 
     with watchdog.watch('internal', deadline_at=15.0):
-        clock._now = 20.0
+        clock.now = 20.0
     restored = watchdog.sample()
 
     assert restored.registration_token == _CELL_IDENTITY
@@ -104,6 +154,23 @@ def test_internal_stall_deadline_uses_one_validated_shared_formula() -> None:
             internal_stall_deadline_secs(*arguments)
 
 
+def test_nested_phase_extends_an_enclosing_wait_phase() -> None:
+    clock = _Clock(now=0)
+    watchdog = ComponentWatchdog(
+        kind='source',
+        identity='source',
+        worker_instance='spawn',
+        registration_token=_CELL_IDENTITY,
+        startup_deadline_secs=10,
+        clock=clock,
+    )
+    watchdog.transition('wait', deadline_at=2)
+    clock.now = 1
+    with watchdog.watch('internal', deadline_at=20):
+        clock.now = 6
+    assert watchdog.sample().deadline_at == 7
+
+
 def test_nested_watch_restores_outer_identity_latest_heartbeat_and_deadline() -> None:
     clock = _Clock()
     watchdog = _watchdog(clock)
@@ -116,10 +183,10 @@ def test_nested_watch_restores_outer_identity_latest_heartbeat_and_deadline() ->
         callback_id='callback',
         delivery_attempt=2,
     ):
-        clock._now = 12.0
+        clock.now = 12.0
         watchdog.heartbeat()
         with watchdog.watch('internal', deadline_at=18.0):
-            clock._now = 16.0
+            clock.now = 16.0
             watchdog.heartbeat()
         restored = watchdog.sample()
 
@@ -133,11 +200,11 @@ def test_nested_watch_restores_outer_identity_latest_heartbeat_and_deadline() ->
     startup = watchdog.sample()
     assert startup.phase == 'startup'
     assert startup.heartbeat_at == 16.0
-    assert startup.deadline_at == 40.0
+    assert startup.deadline_at == 46.0
 
 
 def test_non_idle_restoration_preserves_outer_absolute_deadline() -> None:
-    clock = _Clock(_now=0.0)
+    clock = _Clock(now=0.0)
     watchdog = _watchdog(clock)
     watchdog.transition(
         'callback',
@@ -149,7 +216,7 @@ def test_non_idle_restoration_preserves_outer_absolute_deadline() -> None:
     )
 
     with watchdog.watch('internal', deadline_at=15.0):
-        clock._now = 20.0
+        clock.now = 20.0
     restored = watchdog.sample()
 
     assert restored.phase == 'callback'
@@ -247,12 +314,12 @@ def test_watchdog_sampling_does_not_wait_for_watched_operation() -> None:
             delivery_attempt=2,
         ):
             entered.set()
-            assert release.wait(1.0)
+            assert release.wait()
 
     owner = threading.Thread(target=block_in_callback)
     owner.start()
     try:
-        assert entered.wait(1.0)
+        assert entered.wait()
         sample = watchdog.sample()
         assert sample.phase == 'callback'
         assert sample.event_id == 41
@@ -262,7 +329,7 @@ def test_watchdog_sampling_does_not_wait_for_watched_operation() -> None:
         assert owner.is_alive()
     finally:
         release.set()
-        owner.join(1.0)
+        owner.join()
     assert not owner.is_alive()
 
 
@@ -275,7 +342,7 @@ def test_watchdog_sequences_increase_on_transition_enter_heartbeat_and_restore()
     sequences.append(watchdog.sample().transition_sequence)
     with watchdog.watch('callback', deadline_at=25.0):
         sequences.append(watchdog.sample().transition_sequence)
-        clock._now = 12.0
+        clock.now = 12.0
         watchdog.heartbeat(sliding_deadline_secs=15.0)
         sequences.append(watchdog.sample().transition_sequence)
     sequences.append(watchdog.sample().transition_sequence)
@@ -352,7 +419,7 @@ def test_absolute_phase_heartbeat_does_not_slide_deadline(phase: WatchdogPhase) 
     )
 
     with watchdog.watch(phase, deadline_at=20.0):
-        clock._now = 17.0
+        clock.now = 17.0
         watchdog.heartbeat(sliding_deadline_secs=100.0)
         sample = watchdog.sample()
 
@@ -398,3 +465,21 @@ def test_watchdog_rejects_empty_identity_fields_and_nonpositive_startup_budget(
 ) -> None:
     with pytest.raises(ValueError, match='must'):
         construct()
+
+
+@pytest.mark.parametrize('phase', ['idle', 'shutdown'])
+def test_nested_phase_leaves_idle_and_shutdown_unextended(phase: WatchdogPhase) -> None:
+    clock = _Clock(now=0)
+    watchdog = _watchdog(clock)
+    watchdog.transition(phase, deadline_at=2)
+    clock.now = 1
+    with watchdog.watch('internal', deadline_at=20):
+        clock.now = 6
+    assert watchdog.sample().deadline_at == (8 if phase == 'idle' else 2)
+
+
+@pytest.mark.parametrize(
+    ('interval', 'expected'), [(2.0, 10.0), (0.2, 1.0), (0.05, 0.5), (0.01, 0.5)]
+)
+def test_watchdog_grace_has_a_floor(interval: float, expected: float) -> None:
+    assert watchdog_grace_secs(interval) == expected

@@ -12,6 +12,7 @@ import signal
 import sys
 import threading
 import time
+import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -32,18 +33,25 @@ from ._config import (
     source_stream_fingerprint,
 )
 from ._control import (
+    OPERATOR_WAIT_CAP_SECS,
     REQUEST_TIMEOUT_SECS,
+    SUPERVISOR_DATABASE_BUSY_CODE,
     ControlClient,
     ControlCommandError,
+    ControlOutcomeUnknownError,
     ControlProtocolError,
     ControlRequest,
     ControlServer,
     ControlUnavailableError,
+    unknown_outcome_message,
 )
 from ._downstream import closable_stdout
 from ._events import EVENT_FIELDS, Event
 from ._group_types import AuditIdentity
+from ._health import looks_secret
 from ._ipc import (
+    OUTCOME_KEY,
+    OUTCOME_UNKNOWN,
     ControlHello,
     OperatorCommand,
     StopCommand,
@@ -56,7 +64,8 @@ from ._plugins import PluginError, load_plugins
 from ._probe import ProbeServer
 from ._providers import Provider, ProviderError, load_provider
 from ._sqlite import DatabaseError
-from ._supervisor import Supervisor
+from ._supervisor import OperatorOutcomeUnknownError, Supervisor
+from ._watchdog import shutdown_slice_secs
 from ._worker import WorkerSpec, build_worker_runtime, build_worker_specs
 
 if TYPE_CHECKING:
@@ -326,23 +335,28 @@ def _handle_supervisor_request(
         arguments=request.arguments,
         identity=identity,
     )
-    result = (
-        supervisor.adopt_source_stream_command(
-            command,
-            timeout=REQUEST_TIMEOUT_SECS,
+    try:
+        result = (
+            supervisor.adopt_source_stream_command(
+                command,
+                timeout=OPERATOR_WAIT_CAP_SECS,
+            )
+            if request.command == 'adopt-source-stream'
+            else supervisor.dispatch_group_disposition_command(
+                command,
+                timeout=OPERATOR_WAIT_CAP_SECS,
+            )
+            if request.command in {'replay', 'reset-group-to-latest'}
+            else supervisor.dispatch_operator_command(
+                command,
+                timeout=OPERATOR_WAIT_CAP_SECS,
+            )
         )
-        if request.command == 'adopt-source-stream'
-        else supervisor.dispatch_group_disposition_command(
-            command,
-            timeout=REQUEST_TIMEOUT_SECS,
-        )
-        if request.command in {'replay', 'reset-group-to-latest'}
-        else supervisor.dispatch_operator_command(
-            command,
-            timeout=REQUEST_TIMEOUT_SECS,
-        )
-    )
+    except OperatorOutcomeUnknownError as error:
+        return {OUTCOME_KEY: OUTCOME_UNKNOWN, 'message': str(error)}
     if not result.ok:
+        if result.result.get('code') == SUPERVISOR_DATABASE_BUSY_CODE:
+            raise ControlCommandError(result.message, result=result.result)
         raise _RuntimeCommandError(result.message or 'operator command failed')
     return result.result
 
@@ -385,6 +399,16 @@ def _is_provider_failure(error: Exception) -> bool:
     )
 
 
+def _load_config_with_warnings(path: Path) -> Config:
+    """Print configuration warnings in the command-line message format."""
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter('always', UserWarning)
+        config = load_config(path)
+    for warning in recorded:
+        print(f'warning: {warning.message}', file=sys.stderr)
+    return config
+
+
 def _print_version() -> int:
     """Print the installed distribution version without other work."""
     try:
@@ -407,10 +431,14 @@ def _receive_assignment(
     timeout: float,
 ) -> WorkerAssignment | None:
     """Receive and validate one parent-decided worker assignment."""
-    try:
-        message = control.receive(timeout=timeout)
-    except EOFError:
-        return None
+    while True:
+        try:
+            message = control.receive(timeout=timeout)
+        except TimeoutError:
+            continue
+        except EOFError:
+            return None
+        break
     if isinstance(message, StopCommand):
         return None
     if not isinstance(message, WorkerAssignment):
@@ -418,15 +446,6 @@ def _receive_assignment(
     if message.worker_id != spec.worker_id or message.spawn_instance != spawn_instance:
         raise ValueError('worker assignment identity conflicts with argv')
     return message
-
-
-def _report_error(message: str) -> None:
-    """Print one redacted, terminal-safe error line to standard error."""
-    visible = _CONTROL_CHARACTERS.sub(
-        lambda match: f'\\x{ord(match.group()):02x}',
-        redact_text(message),
-    )
-    print(f'error: {visible}', file=sys.stderr)
 
 
 def _required_provider_capabilities(config: Config) -> frozenset[str]:
@@ -448,12 +467,35 @@ def _run_control(args: argparse.Namespace) -> int:
     if not isinstance(config_path, Path) or not isinstance(command, str):
         raise TypeError('control command arguments are invalid')
     control_config = load_control_config(config_path)
+    reason = getattr(args, 'reason', None)
+    if isinstance(reason, str) and looks_secret(reason):
+        raise _RuntimeCommandError('--reason must not contain secret-looking text')
     check = getattr(args, 'check', None)
     request_command = 'probe' if command == 'status' and check is not None else command
-    result = ControlClient.for_state_dir(control_config.state_dir).request(
-        request_command,
-        {} if request_command == 'probe' else _control_arguments(args),
-    )
+    try:
+        result = ControlClient.for_state_dir(
+            control_config.state_dir,
+            response_timeout=(
+                None if request_command in {'status', 'probe'} else OPERATOR_WAIT_CAP_SECS
+            ),
+        ).request(
+            request_command,
+            {} if request_command == 'probe' else _control_arguments(args),
+        )
+    except ControlOutcomeUnknownError as error:
+        if command == 'status':
+            raise ControlUnavailableError(
+                f'the supervisor did not answer within {REQUEST_TIMEOUT_SECS:g} seconds; '
+                'a recovery command may be running'
+            ) from error
+        raise ControlOutcomeUnknownError(
+            unknown_outcome_message(command, 'no answer arrived')
+        ) from error
+    if result.get(OUTCOME_KEY) == OUTCOME_UNKNOWN:
+        message = result.get('message')
+        if not isinstance(message, str):
+            raise ControlProtocolError('unknown control outcome has no message')
+        raise ControlOutcomeUnknownError(message)
     print(
         json.dumps(
             dict(result),
@@ -483,7 +525,10 @@ def _running_source_incarnations(config: Config) -> dict[tuple[str, str], str]:
     try:
         result = ControlClient.for_state_dir(config.daemon.state_dir).request('status')
     except ControlUnavailableError as error:
-        print(f'warning: running supervisor status is unavailable: {error}', file=sys.stderr)
+        print(
+            f'warning: no running supervisor; live evidence omits stream incarnation: {error}',
+            file=sys.stderr,
+        )
         return {}
     return _incarnations_from_status(result)
 
@@ -589,20 +634,26 @@ def _run_supervise(args: argparse.Namespace) -> int:
     config_path = args.config
     if not isinstance(config_path, Path):
         raise TypeError('supervisor config path is invalid')
-    config = load_config(config_path)
+    config = _load_config_with_warnings(config_path)
     configure_logging(redact_from=(config,))
     _validated_provider(config)
     stop = threading.Event()
     supervisor = Supervisor(config=config, config_path=config_path)
-    probe = (
-        None
-        if config.daemon.probe_port is None
-        else ProbeServer(
-            config.daemon.probe_bind,
-            config.daemon.probe_port,
-            supervisor.probe_result,
+    try:
+        probe = (
+            None
+            if config.daemon.probe_port is None
+            else ProbeServer(
+                config.daemon.probe_bind,
+                config.daemon.probe_port,
+                supervisor.probe_result,
+            )
         )
-    )
+    except OSError as error:
+        raise _RuntimeCommandError(
+            f'daemon.probe_bind/probe_port '
+            f'({config.daemon.probe_bind}:{config.daemon.probe_port}) cannot be bound: {error}'
+        ) from error
     shutdown_deadline_at: float | None = None
     try:
         with (
@@ -610,8 +661,8 @@ def _run_supervise(args: argparse.Namespace) -> int:
             supervisor,
         ):
             try:
-                supervisor.reconcile_durable_state()
-                supervisor.start()
+                supervisor.reconcile_durable_state(should_stop=stop.is_set)
+                supervisor.start(should_stop=stop.is_set)
                 if probe is not None:
                     probe.start()
 
@@ -626,6 +677,9 @@ def _run_supervise(args: argparse.Namespace) -> int:
                         supervisor,
                         request,
                         peer,
+                    ),
+                    socket_probe_timeout_secs=shutdown_slice_secs(
+                        config.daemon.shutdown_deadline_secs
                     ),
                 ) as control:
                     supervisor.run(
@@ -650,7 +704,7 @@ def _run_validate_config(args: argparse.Namespace) -> int:
     config_path = args.config
     if not isinstance(config_path, Path):
         raise TypeError('validation config path is invalid')
-    config = load_config(config_path)
+    config = _load_config_with_warnings(config_path)
     configure_logging(redact_from=(config,))
     provider = _validated_provider(config)
     _validate_plugins(config, provider)
@@ -704,6 +758,24 @@ def _validated_worker_args(
     return config_path, site, worker_id, control_fd, spawn_instance
 
 
+def _visible_error(message: str) -> str:
+    """Escape controls and redact secrets in one terminal error."""
+    return _CONTROL_CHARACTERS.sub(
+        lambda match: f'\\x{ord(match.group()):02x}',
+        redact_text(message),
+    )
+
+
+def _report_error(message: str) -> None:
+    """Print one redacted, terminal-safe error line to standard error."""
+    print(f'error: {_visible_error(message)}', file=sys.stderr)
+
+
+def _report_worker_failure(message: str) -> None:
+    """Print one redacted worker failure with a UTC timestamp."""
+    print(f'{datetime.now(UTC).isoformat()} error: {_visible_error(message)}', file=sys.stderr)
+
+
 def _worker_spec(config: Config, site_name: str, worker_id: str) -> WorkerSpec:
     """Return one exact configured worker assignment."""
     site = config.sites.get(site_name)
@@ -721,12 +793,13 @@ def _worker_spec(config: Config, site_name: str, worker_id: str) -> WorkerSpec:
 def _run_worker(args: argparse.Namespace) -> int:
     """Validate identity and serve the inherited control shell."""
     config_path, site, worker_id, control_fd, spawn_instance = _validated_worker_args(args)
-    config = load_config(config_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)
+        config = load_config(config_path)
     spec = _worker_spec(config, site, worker_id)
     control = WorkerControl.from_fd(
         control_fd,
         max_frame_bytes=config.daemon.max_ipc_frame_bytes,
-        send_deadline_secs=2 * config.daemon.health_interval_secs,
     )
     try:
         control.send(
@@ -734,7 +807,8 @@ def _run_worker(args: argparse.Namespace) -> int:
                 spawn_instance=spawn_instance,
                 worker_id=spec.worker_id,
                 pid=os.getpid(),
-            )
+            ),
+            deadline_secs=2 * config.daemon.health_interval_secs,
         )
         assignment = _receive_assignment(
             control,
@@ -752,9 +826,11 @@ def _run_worker(args: argparse.Namespace) -> int:
             runtime.start()
             stuck = runtime.wait()
         if stuck:
-            raise _RuntimeCommandError(f'worker shutdown deadline exceeded: {", ".join(stuck)}')
+            _report_worker_failure(f'worker shutdown deadline exceeded: {", ".join(stuck)}')
+            return 1
         if runtime.fatal_reason is not None:
-            raise _RuntimeCommandError(runtime.fatal_reason)
+            _report_worker_failure(runtime.fatal_reason)
+            return 1
         return 0
     finally:
         control.close()
@@ -947,6 +1023,8 @@ def _run(arguments: list[str]) -> int:
     """Parse one command line, dispatch it, and map anticipated failures."""
     parser = _build_parser()
     args = parser.parse_args(arguments)
+    if args.command == 'status' and args.check is not None and (args.site or args.group):
+        parser.error('--check reports global health; omit --site and --group')
     if args.version:
         return _print_version()
     if args.command is None:
@@ -972,11 +1050,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         Zero on success, including a requested supervisor or worker stop; one
         when a command ran and failed or a health check failed; two when the
         command could not run as asked; three when the supervisor's control
-        socket is unavailable or its reply is invalid; 130 when interrupted.
+        socket is unavailable, its reply is invalid, or a command's outcome is
+        unknown; 130 when interrupted.
 
     Raises:
         SystemExit: With status zero for help, or two for an argument usage
             error.
+        OSError: Standard-output setup or finalization fails for a reason other
+            than downstream closure.
     """
     if sys.stdout is None:
         # Started with standard output closed: nothing can be delivered, and the

@@ -1,30 +1,30 @@
-"""Immutable source frames, dedicated encoding, and bounded group fanout."""
-
-# pyright: reportPrivateUsage=false
+"""Immutable source frames, inline encoding, and bounded group fanout."""
 
 from __future__ import annotations
 
-import queue
+import logging
 import threading
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias
 
-from ._event_frame import event_frame_bytes
+from ._event_frame import (
+    IPC_LENGTH_BYTES,
+    SEGMENTED_FRAME_PREFIX_BYTES,
+    encode_event_header,
+    event_frame_bytes,
+)
 from ._events import Event, encode_event
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable
-    from types import TracebackType
     from typing import Self
 
     from ._group_types import LiveJoinIdentity
 
 _EncoderHaltCode: TypeAlias = Literal[
     'channel-detached',
-    'encoder-died',
     'encoder-failed',
-    'encoder-shutdown',
     'event-too-large',
     'frame-too-large',
 ]
@@ -32,7 +32,7 @@ _EncoderHaltCode: TypeAlias = Literal[
 
 FanoutMessage: TypeAlias = """(
     EventDelivery | RangeChanged |
-    StrictCapacityControl | StrictOrderingControl
+    StrictOrderingControl
 )"""
 
 
@@ -42,6 +42,7 @@ class EncodedEvent:
 
     event_id: int
     event_frame: bytes
+    header: bytes = field(init=False)
     byte_count: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -56,8 +57,10 @@ class EncodedEvent:
         if type(self.event_frame) is not bytes:
             raise TypeError('encoded event frame must be bytes')
         kind, metadata, payload = self.wire_parts()
+        header = encode_event_header(kind, metadata)
+        object.__setattr__(self, 'header', header)
         object.__setattr__(
-            self, 'byte_count', event_frame_bytes(kind, metadata, payload_byte_count=len(payload))
+            self, 'byte_count', SEGMENTED_FRAME_PREFIX_BYTES + len(header) + len(payload)
         )
 
     @classmethod
@@ -253,6 +256,7 @@ class GroupChannel:
         self._queued_bytes = 0
         self._hint_pending: RangeChanged | None = None
         self._reason: str | None = None
+        self._source_logging = False
 
     def _detach_locked(self, reason: str) -> None:
         """Detach and release all queued bodies while holding the lock."""
@@ -264,6 +268,13 @@ class GroupChannel:
         self._queued_bytes = 0
         self._hint_pending = None
         self._reason = reason
+        if self._source_logging:
+            logging.getLogger('sg_event_daemon.source').info(
+                'detached group %s from its live channel: %s',
+                self._group,
+                reason,
+                extra={'group': self._group},
+            )
 
     def activate(self, *, provisional: bool) -> None:
         """Activate this channel for one live or provisional attachment.
@@ -321,6 +332,11 @@ class GroupChannel:
             Group identity.
         """
         return self._group
+
+    def log_source_detaches(self) -> None:
+        """Enable detach records after this in-process channel joins source fanout."""
+        with self._lock:
+            self._source_logging = True
 
     def offer(self, message: FanoutMessage) -> bool:
         """Offer one frame without waiting for queue space.
@@ -452,6 +468,8 @@ class EventFanout:
             existing = self._channels.get(channel.group)
             if existing is not None and existing is not channel and existing.status.attached:
                 raise ValueError(f'group channel already attached: {channel.group}')
+            if isinstance(channel, GroupChannel):
+                channel.log_source_detaches()
             channel.activate(provisional=provisional)
             self._channels[channel.group] = channel
 
@@ -536,43 +554,14 @@ class EventFanout:
 
 
 @dataclass(frozen=True)
-class StrictCapacityControl:
-    """Carry one complete-identity body-free live-capacity halt."""
-
-    identity: LiveJoinIdentity
-    abort_limit: int
-    byte_count: int = field(init=False)
-
-    def __post_init__(self) -> None:
-        """Validate the strict identity and cache bounded frame bytes.
-
-        Raises:
-            ValueError: The identity is not strict or `abort_limit` is not an
-                exact positive integer.
-        """
-        if self.identity.join_kind != 'strict':
-            raise ValueError('strict capacity control requires a strict identity')
-        if type(self.abort_limit) is not int or self.abort_limit <= 0:
-            raise ValueError('strict capacity abort limit must be positive')
-        kind, metadata, payload = self.wire_parts()
-        object.__setattr__(
-            self, 'byte_count', event_frame_bytes(kind, metadata, payload_byte_count=len(payload))
-        )
-
-    def wire_parts(self) -> tuple[str, dict[str, object], bytes]:
-        """Return the capacity control kind, metadata, and empty payload."""
-        return 'strict-capacity', strict_control_metadata(self), b''
-
-
-@dataclass(frozen=True)
 class StrictOrderingControl:
-    """Carry one complete-identity body-free ordering halt or floor skip."""
+    """Carry one complete-identity body-free ordering halt."""
 
     identity: LiveJoinIdentity
     event_id: int
     last_delivered_id: int
     delivery_floor: int
-    action: Literal['halt', 'skip']
+    action: Literal['halt']
     byte_count: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -581,8 +570,7 @@ class StrictOrderingControl:
         Raises:
             ValueError: The identity is not strict, `event_id` is not an exact
                 positive integer, `last_delivered_id` or `delivery_floor` is
-                not an exact nonnegative integer, or `action` is neither `halt`
-                nor `skip`.
+                not an exact nonnegative integer, or `action` is not `halt`.
         """
         if self.identity.join_kind != 'strict':
             raise ValueError('strict ordering control requires a strict identity')
@@ -592,7 +580,7 @@ class StrictOrderingControl:
             raise ValueError('strict last-delivered id must be nonnegative')
         if type(self.delivery_floor) is not int or self.delivery_floor < 0:
             raise ValueError('strict delivery floor must be nonnegative')
-        if self.action not in {'halt', 'skip'}:
+        if self.action != 'halt':
             raise ValueError('strict ordering action is invalid')
         kind, metadata, payload = self.wire_parts()
         object.__setattr__(
@@ -608,18 +596,12 @@ class StrictOrderingControl:
 class _EncodeFailure:
     """Carry one normalized terminal encoder failure."""
 
-    _code: _EncoderHaltCode
-    _error: BaseException
+    code: _EncoderHaltCode
+    error: BaseException
 
 
-class EncoderWorker:
-    """Own one dedicated encoder thread with one synchronous request slot.
-
-    A terminal encoding failure makes the worker unusable for further requests.
-    Call `close()` or use the context manager to request shutdown and release
-    waiting callers. Shutdown waits only a bounded time, so an encoder blocked
-    inside the supplied encoding function may remain alive afterward.
-    """
+class EventEncoder:
+    """Encode source events inline with terminal failure and exact size checks."""
 
     def __init__(
         self,
@@ -628,53 +610,25 @@ class EncoderWorker:
         max_ipc_frame_bytes: int,
         event_encoder: Callable[[Event], bytes] = encode_event,
     ) -> None:
-        """Start the bounded dedicated encoder.
+        """Configure event and complete IPC-body byte limits.
 
         Args:
             max_event_bytes: Maximum encoded event bytes.
-            max_ipc_frame_bytes: Maximum event frame body bytes.
-            event_encoder: Pure event encoder run only by the worker thread.
+            max_ipc_frame_bytes: Maximum complete event frame body bytes.
+            event_encoder: Pure encoder called on the source thread.
 
         Raises:
             ValueError: Either byte limit is not positive.
         """
         if max_event_bytes <= 0 or max_ipc_frame_bytes <= 0:
             raise ValueError('encoder byte limits must be positive')
-        self._closed = threading.Event()
         self._event_encoder = event_encoder
-        self._call_lock = threading.Lock()
-        self._lifecycle_lock = threading.Lock()
         self._max_event_bytes = max_event_bytes
         self._max_ipc_frame_bytes = max_ipc_frame_bytes
-        self._requests: queue.Queue[_EncodeRequest | None] = queue.Queue(maxsize=1)
-        self._results: queue.Queue[EncodedEvent | _EncodeFailure] = queue.Queue(maxsize=1)
         self._terminal: _EncodeFailure | None = None
-        self._thread = threading.Thread(
-            target=self._run,
-            name='sg-event-encoder',
-            daemon=True,
-        )
-        self._thread.start()
-
-    def __enter__(self) -> Self:
-        """Return this live worker.
-
-        Returns:
-            This encoder until context exit.
-        """
-        return self
-
-    def __exit__(
-        self,
-        _exc_type: type[BaseException] | None,
-        _exc_value: BaseException | None,
-        _traceback: TracebackType | None,
-    ) -> None:
-        """Request bounded encoder shutdown at context exit."""
-        self.close()
 
     def _encode_event(self, event: Event) -> EncodedEvent | _EncodeFailure:
-        """Encode and validate one event on the dedicated worker."""
+        """Encode and validate one event on the source thread."""
         raw_id = event['id']
         if type(raw_id) is not int or raw_id <= 0:
             raise ValueError('event id must be a positive integer')
@@ -685,151 +639,53 @@ class EncoderWorker:
             return _EncodeFailure(
                 'event-too-large',
                 ValueError(
-                    f'encoded event uses {len(frame)} bytes; limit is {self._max_event_bytes}'
+                    f'event {raw_id} encoded size {len(frame)} bytes exceeds '
+                    f'source max_event_bytes ({self._max_event_bytes} bytes)'
                 ),
             )
         encoded = EncodedEvent.from_event_frame(raw_id, frame)
-        framed_bytes = encoded.byte_count - 4
+        framed_bytes = encoded.byte_count - IPC_LENGTH_BYTES
         if framed_bytes > self._max_ipc_frame_bytes:
             return _EncodeFailure(
                 'frame-too-large',
                 ValueError(
-                    f'frame body uses {framed_bytes} bytes; limit is {self._max_ipc_frame_bytes}'
+                    f'event {raw_id} frame body {framed_bytes} bytes exceeds '
+                    f'daemon.max_ipc_frame_bytes ({self._max_ipc_frame_bytes} bytes)'
                 ),
             )
         return encoded
 
     def _failure_error(self, failure: _EncodeFailure) -> EncoderHaltedError:
         """Build the public terminal error for one worker failure."""
-        message = f'{failure._code}: {failure._error}'
-        if failure._code == 'frame-too-large':
-            return _FrameTooLargeError(message, code=failure._code)
-        return EncoderHaltedError(message, code=failure._code)
-
-    def _publish_result(self, result: EncodedEvent | _EncodeFailure) -> None:
-        """Publish one result without blocking shutdown indefinitely."""
-        while not self._closed.is_set():
-            try:
-                self._results.put(result, timeout=0.01)
-            except queue.Full:
-                continue
-            else:
-                return
-
-    def _record_failure(self, failure: _EncodeFailure) -> None:
-        """Retain the first terminal worker failure."""
-        with self._lifecycle_lock:
-            if self._terminal is None:
-                self._terminal = failure
-
-    def _require_usable(self) -> None:
-        """Raise the stable reason this encoder cannot accept work."""
-        with self._lifecycle_lock:
-            if self._closed.is_set():
-                raise EncoderHaltedError('encoder-shutdown', code='encoder-shutdown')
-            failure = self._terminal
-            if failure is None and not self._thread.is_alive():
-                failure = _EncodeFailure(
-                    'encoder-died',
-                    RuntimeError('encoder worker stopped without a terminal result'),
-                )
-                self._terminal = failure
-        if failure is not None:
-            self._thread.join(timeout=0.05)
-            raise self._failure_error(failure)
-
-    def _receive(self) -> EncodedEvent:
-        """Wait interruptibly for the submitted request's result."""
-        while True:
-            try:
-                result = self._results.get(timeout=0.01)
-            except queue.Empty:
-                self._require_usable()
-            else:
-                if isinstance(result, _EncodeFailure):
-                    self._thread.join(timeout=0.05)
-                    raise self._failure_error(result)
-                return result
-
-    def _serve(self) -> None:
-        """Serve requests until shutdown or a terminal result."""
-        while not self._closed.is_set():
-            try:
-                request = self._requests.get(timeout=0.01)
-            except queue.Empty:
-                continue
-            if request is None:
-                return
-            try:
-                result = self._encode_event(request._event)
-            except BaseException as exc:
-                code = 'encoder-failed' if isinstance(exc, Exception) else 'encoder-died'
-                failure = _EncodeFailure(code, exc)
-                self._record_failure(failure)
-                self._publish_result(failure)
-                raise
-            if isinstance(result, _EncodeFailure):
-                self._record_failure(result)
-                self._publish_result(result)
-                return
-            self._publish_result(result)
-
-    def _run(self) -> None:
-        """Process requests serially on the dedicated daemon thread."""
-        try:
-            self._serve()
-        except BaseException as exc:
-            with self._lifecycle_lock:
-                failure = self._terminal
-            if failure is None or failure._error is not exc:
-                raise
-
-    def _submit(self, event: Event) -> None:
-        """Submit one event while remaining interruptible by shutdown."""
-        request = _EncodeRequest(event)
-        while True:
-            try:
-                self._requests.put(request, timeout=0.01)
-            except queue.Full:
-                self._require_usable()
-            else:
-                return
-
-    def close(self) -> None:
-        """Interrupt callers and request bounded worker shutdown."""
-        with self._lifecycle_lock:
-            if self._closed.is_set():
-                return
-            self._closed.set()
-        with suppress(queue.Full):
-            self._requests.put_nowait(None)
-        if threading.current_thread() is not self._thread:
-            self._thread.join(timeout=0.05)
+        message = f'{failure.code}: {failure.error}'
+        if failure.code == 'frame-too-large':
+            return _FrameTooLargeError(message, code=failure.code)
+        return EncoderHaltedError(message, code=failure.code)
 
     def encode(self, event: Event) -> EncodedEvent:
-        """Encode one event or raise a stable terminal halt.
+        """Encode one event under the caller's watchdog deadline.
 
         Args:
             event: Immutable provider event.
 
         Returns:
-            Immutable encoded frame and exact bounded-memory accounting.
+            Immutable frame with exact bounded-queue byte accounting.
 
         Raises:
-            EncoderHaltedError: Encoding failed, died, was interrupted, or
-                produced an event frame body that exceeds IPC policy.
+            EncoderHaltedError: Encoding failed, the event exceeds
+                `max_event_bytes`, or the frame body exceeds IPC policy.
         """
-        with self._call_lock:
-            self._require_usable()
-            self._submit(event)
-            return self._receive()
-
-
-@dataclass(frozen=True)
-class _EncodeRequest:
-    """Carry one event through the bounded encoder request slot."""
-
-    _event: Event
+        failure = self._terminal
+        if failure is None:
+            try:
+                result = self._encode_event(event)
+            except Exception as error:
+                failure = self._terminal = _EncodeFailure('encoder-failed', error)
+                raise self._failure_error(failure) from error
+            if isinstance(result, EncodedEvent):
+                return result
+            failure = self._terminal = result
+        raise self._failure_error(failure)
 
 
 def _publish_channel(
@@ -844,21 +700,16 @@ def _publish_channel(
 
 
 def strict_control_metadata(
-    control: StrictCapacityControl | StrictOrderingControl,
+    control: StrictOrderingControl,
 ) -> dict[str, object]:
     """Encode the shared strict-control fields for event and join frames.
 
     Args:
-        control: Validated capacity or ordering control.
+        control: Validated ordering control.
 
     Returns:
         Metadata in the existing event-channel field order.
     """
-    if isinstance(control, StrictCapacityControl):
-        return {
-            'abort_limit': control.abort_limit,
-            'identity': control.identity.wire_payload(),
-        }
     return {
         'action': control.action,
         'delivery_floor': control.delivery_floor,

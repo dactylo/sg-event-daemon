@@ -15,9 +15,9 @@ if TYPE_CHECKING:
 
     from ._config import CredentialConfig
 
-_PROVIDER_NAME_SEPARATOR = re.compile(r'[-_.]+')
-REQUIRED_HANDLE_METHODS = ('close', 'find', 'set_session_uuid')
 SUPPORTED_PROVIDERS = frozenset({'sg-python-api', 'shotgun-api3'})
+_PROVIDER_NAME_SEPARATOR = re.compile(r'[-_.]+')
+_REQUIRED_HANDLE_METHODS = ('close', 'find', 'set_session_uuid')
 
 
 @dataclass(frozen=True)
@@ -188,8 +188,8 @@ class Provider:
 
     name: str
     capabilities: ProviderCapabilities
-    _sync_factory: _SyncFactory = field(repr=False)
-    _async_factory: _AsyncFactory | None = field(repr=False)
+    sync_factory: _SyncFactory = field(repr=False)
+    async_factory: _AsyncFactory | None = field(repr=False)
 
     async def create_async(self, site: str, credential: CredentialConfig) -> AsyncSG:
         """Create one independently configured lazy async handle.
@@ -204,11 +204,13 @@ class Provider:
         Raises:
             ProviderError: The selected provider has no async capability or
                 returns an incompatible handle.
+            Exception: The supplied provider factory or handle configuration
+                fails.
         """
         asyncio.get_running_loop()
-        if self._async_factory is None:
+        if self.async_factory is None:
             raise ProviderError(f'provider {self.name} does not support async handles')
-        handle = self._async_factory(
+        handle = self.async_factory(
             site,
             script_name=credential.script_name,
             api_key=credential.api_key.reveal(),
@@ -230,8 +232,10 @@ class Provider:
 
         Raises:
             ProviderError: The provider returns an incompatible handle.
+            Exception: The supplied provider factory or handle configuration
+                fails.
         """
-        handle = self._sync_factory(
+        handle = self.sync_factory(
             site,
             script_name=credential.script_name,
             api_key=credential.api_key.reveal(),
@@ -285,6 +289,22 @@ def _installed_provider_names(owners: Collection[str] | None = None) -> tuple[st
     return tuple(name for name in owners if name in SUPPORTED_PROVIDERS)
 
 
+def _required_async_factory(module: object, provider_name: str) -> object:
+    """Resolve the async export only when configured groups need it."""
+    try:
+        factory = _factory(module, 'AsyncShotgun', _REQUIRED_HANDLE_METHODS)
+    except ImportError as error:
+        if provider_name == 'sg-python-api':
+            raise ProviderError(
+                'provider sg-python-api needs the sg-python-api-async extra for async groups'
+            ) from error
+        raise ProviderError(f'provider {provider_name} cannot import AsyncShotgun') from error
+    if factory is None:
+        hint = ' (install sg-python-api-async)' if provider_name == 'sg-python-api' else ''
+        raise ProviderError(f'provider {provider_name} does not export AsyncShotgun{hint}')
+    return factory
+
+
 def callable_mode(value: object) -> bool | None:
     """Classify a callable's declared execution mode without invoking it.
 
@@ -329,6 +349,8 @@ def load_provider(expected: str, required: Iterable[str]) -> Provider:
     Raises:
         ProviderError: Installation identity, attribution, or exports are
             incompatible with the configured provider and required modes.
+        ImportError: The selected provider namespace or one of its dependencies
+            cannot be imported.
     """
     expected_name = _normalize_provider_name(expected)
     if expected_name not in SUPPORTED_PROVIDERS:
@@ -358,19 +380,19 @@ def load_provider(expected: str, required: Iterable[str]) -> Provider:
         raise ProviderError(f'selected provider {expected_name} is not installed')
 
     module = import_module('shotgun_api3')
-    sync_export = _factory(module, 'Shotgun', REQUIRED_HANDLE_METHODS)
+    sync_export = _factory(module, 'Shotgun', _REQUIRED_HANDLE_METHODS)
     if sync_export is None:
         raise ProviderError(f'provider {expected_name} does not export a compatible Shotgun')
-    async_export = _factory(module, 'AsyncShotgun', REQUIRED_HANDLE_METHODS)
+    async_export = (
+        _required_async_factory(module, expected_name) if 'async' in required_names else None
+    )
     capabilities = ProviderCapabilities(
         sync=True,
         async_=async_export is not None,
     )
-    if 'async' in required_names and not capabilities.async_:
-        raise ProviderError(f'provider {expected_name} does not export AsyncShotgun')
     return Provider(
         name=expected_name,
         capabilities=capabilities,
-        _sync_factory=cast('_SyncFactory', sync_export),
-        _async_factory=cast('_AsyncFactory | None', async_export),
+        sync_factory=cast('_SyncFactory', sync_export),
+        async_factory=cast('_AsyncFactory | None', async_export),
     )

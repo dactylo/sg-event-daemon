@@ -13,7 +13,7 @@ from ._group_types import (
     manifest_from_json,
 )
 
-GroupHealthCondition: TypeAlias = Literal[
+_GroupHealthCondition: TypeAlias = Literal[
     'orphaned',
     'stream-identity-changed',
     'ordering-changed',
@@ -25,25 +25,66 @@ GroupHealthCondition: TypeAlias = Literal[
     'event-unavailable',
     'required-event',
     'ordering-anomaly',
-    'strict-capacity-exhausted',
     'late-capacity-exhausted',
 ]
-GROUP_HEALTH_CONDITIONS: tuple[GroupHealthCondition, ...] = get_args(GroupHealthCondition)
+GROUP_HEALTH_CONDITIONS: tuple[_GroupHealthCondition, ...] = get_args(_GroupHealthCondition)
 
-_OPERATIONAL_LATE_ID_KEYS_STATEMENT = """
-SELECT obligation_id, event_id
-FROM late_ids
-WHERE group_name = ? AND terminal_state = 'pending'
+GROUP_HALT_BASE_SQL = """(
+    parked OR orphaned OR stream_identity_changed OR ordering_changed
+    OR history_truncated_floor IS NOT NULL OR shape_mismatch
+    OR failure_code = 'callback-failed' OR ordering_anomaly_id IS NOT NULL
+    OR EXISTS (
+        SELECT 1 FROM late_ids WHERE late_ids.group_name = groups.group_name
+        AND terminal_state = 'capacity-pending'
+    )
+)"""
 
-"""
-
-_OPERATIONAL_LATE_ID_COUNT_REFRESH_STATEMENT = f"""
+_OPERATIONAL_LATE_ID_COUNT_REFRESH_STATEMENT = """
 UPDATE group_state
 SET operational_late_id_count = (
-    SELECT COUNT(*) FROM ({_OPERATIONAL_LATE_ID_KEYS_STATEMENT})
+    SELECT COUNT(*) FROM late_ids
+    WHERE group_name = ? AND terminal_state = 'pending'
 )
 WHERE group_name = ?
-"""  # noqa: S608
+"""
+
+
+def _conditions(
+    connection: sqlite3.Connection,
+    group_name: str,
+    row: sqlite3.Row,
+) -> tuple[_GroupHealthCondition, ...]:
+    """Project conditions from an already-read state row."""
+    conditions: list[_GroupHealthCondition] = []
+    condition_checks: tuple[tuple[bool, _GroupHealthCondition], ...] = (
+        (bool(row['orphaned']), 'orphaned'),
+        (bool(row['stream_identity_changed']), 'stream-identity-changed'),
+        (bool(row['ordering_changed']), 'ordering-changed'),
+        (bool(row['parked']), 'parked'),
+        (row['history_truncated_floor'] is not None, 'history-truncated'),
+        (row['replay_required_from'] is not None, 'replay-required'),
+        (bool(row['shape_mismatch']), 'shape-mismatch'),
+        (row['failure_code'] == 'callback-failed', 'callback-failed'),
+    )
+    for active, name in condition_checks:
+        if active:
+            conditions.append(name)
+    if row['required_event_id'] is not None:
+        conditions.extend(('event-unavailable', 'required-event'))
+    if row['ordering_anomaly_id'] is not None:
+        conditions.append('ordering-anomaly')
+    if (
+        connection.execute(
+            (
+                'SELECT 1 FROM late_ids WHERE group_name = ? AND '
+                "terminal_state = 'capacity-pending' LIMIT 1"
+            ),
+            (group_name,),
+        ).fetchone()
+        is not None
+    ):
+        conditions.append('late-capacity-exhausted')
+    return tuple(conditions)
 
 
 def _project_status(conditions: tuple[str, ...]) -> GroupStatus:
@@ -64,6 +105,9 @@ def adjust_operational_late_id_count(
         group_name: Exact group whose durable rows are accessed.
         delta: Change in the number of pending `late_ids` identities, computed
             with the corresponding row transitions in this transaction.
+
+    Raises:
+        sqlite3.Error: SQLite cannot update the pending-identity count.
     """
     if delta:
         connection.execute(
@@ -86,6 +130,7 @@ def bump_revision(connection: sqlite3.Connection, group_name: str, expected_revi
 
     Raises:
         RevisionConflictError: If no row has the expected revision.
+        sqlite3.Error: SQLite cannot update the revision.
     """
     changed = connection.execute(
         """
@@ -111,6 +156,7 @@ def check_revision(
 
     Raises:
         RevisionConflictError: If the expected revision differs.
+        sqlite3.Error: SQLite cannot read the revision.
     """
     row = connection.execute(
         'SELECT revision FROM group_state WHERE group_name = ?', (group_name,)
@@ -120,7 +166,11 @@ def check_revision(
 
 
 def clear_failure(connection: sqlite3.Connection, group_name: str) -> None:
-    """Clear callback failure evidence inside the caller's live transaction."""
+    """Clear callback failure evidence inside the caller's live transaction.
+
+    Raises:
+        sqlite3.Error: SQLite cannot clear the failure evidence.
+    """
     connection.execute(
         """
         UPDATE group_state
@@ -135,12 +185,63 @@ def clear_failure(connection: sqlite3.Connection, group_name: str) -> None:
     )
 
 
+def group_conditions(
+    connection: sqlite3.Connection,
+    group_name: str,
+) -> tuple[_GroupHealthCondition, ...]:
+    """Read delivery blockers without materializing a full group snapshot.
+
+    Returns:
+        Active conditions in the canonical group-health order, with
+        `event-unavailable` followed by `required-event` for a required event.
+
+    Raises:
+        RuntimeError: The group state is not initialized.
+        sqlite3.Error: SQLite cannot read the group state or late-id blockers.
+    """
+    cursor = connection.cursor()
+    cursor.row_factory = sqlite3.Row
+    row = cursor.execute(
+        'SELECT * FROM group_state WHERE group_name = ?', (group_name,)
+    ).fetchone()
+    if row is None:
+        raise RuntimeError('group state is not initialized')
+    return _conditions(connection, group_name, row)
+
+
+def ensure_delivery_ready(connection: sqlite3.Connection, group_name: str) -> None:
+    """Reject ordinary scheduling while lifecycle blockers remain.
+
+    Args:
+        connection: Live facade-owned transaction connection.
+        group_name: Exact group whose durable rows are accessed.
+
+    Raises:
+        InvalidTransitionError: If any lifecycle condition or event is active.
+        RuntimeError: The group state is not initialized.
+        sqlite3.Error: SQLite cannot read delivery readiness.
+    """
+    conditions = group_conditions(connection, group_name)
+    if conditions:
+        raise InvalidTransitionError(f'delivery is blocked by {", ".join(conditions)}')
+    if (
+        connection.execute(
+            'SELECT in_flight_event_id FROM group_state WHERE group_name = ?', (group_name,)
+        ).fetchone()[0]
+        is not None
+    ):
+        raise InvalidTransitionError('another event is already in flight')
+
+
 def refresh_operational_late_id_count(connection: sqlite3.Connection, group_name: str) -> None:
     """Refresh the exact operational late-id scalar inside the live transaction.
 
     Args:
         connection: Live facade-owned transaction connection.
         group_name: Exact group whose durable rows are accessed.
+
+    Raises:
+        sqlite3.Error: SQLite cannot refresh the pending-identity count.
     """
     connection.execute(_OPERATIONAL_LATE_ID_COUNT_REFRESH_STATEMENT, (group_name, group_name))
 
@@ -154,6 +255,11 @@ def snapshot(connection: sqlite3.Connection, group_name: str) -> GroupSnapshot:
 
     Returns:
         The latest committed or transaction-local group state.
+
+    Raises:
+        RuntimeError: The group state is not initialized.
+        ValueError: The stored callback manifest is invalid.
+        sqlite3.Error: SQLite cannot read the snapshot.
     """
     cursor = connection.cursor()
     cursor.row_factory = sqlite3.Row
@@ -172,7 +278,6 @@ def snapshot(connection: sqlite3.Connection, group_name: str) -> GroupSnapshot:
             s.history_truncated_floor, s.ordering_anomaly_id,
             s.strict_capacity_abort_streak,
             s.strict_capacity_attempt_token,
-            s.strict_capacity_exhausted,
             s.shape_mismatch, s.orphaned,
             s.stream_identity_changed, s.ordering_changed,
             s.reader_clock_checkpoint, s.latest_join_boundary,
@@ -185,38 +290,7 @@ def snapshot(connection: sqlite3.Connection, group_name: str) -> GroupSnapshot:
     ).fetchone()
     if row is None:
         raise RuntimeError('group state is not initialized')
-    conditions: list[GroupHealthCondition] = []
-    condition_checks: tuple[tuple[bool, GroupHealthCondition], ...] = (
-        (bool(row['orphaned']), 'orphaned'),
-        (bool(row['stream_identity_changed']), 'stream-identity-changed'),
-        (bool(row['ordering_changed']), 'ordering-changed'),
-        (bool(row['parked']), 'parked'),
-        (row['history_truncated_floor'] is not None, 'history-truncated'),
-        (row['replay_required_from'] is not None, 'replay-required'),
-        (bool(row['shape_mismatch']), 'shape-mismatch'),
-        (row['failure_code'] == 'callback-failed', 'callback-failed'),
-    )
-    for active, name in condition_checks:
-        if active:
-            conditions.append(name)
-    if row['required_event_id'] is not None:
-        conditions.extend(('event-unavailable', 'required-event'))
-    if row['ordering_anomaly_id'] is not None:
-        conditions.append('ordering-anomaly')
-    if bool(row['strict_capacity_exhausted']):
-        conditions.append('strict-capacity-exhausted')
-    if (
-        connection.execute(
-            (
-                'SELECT 1 FROM late_ids WHERE group_name = ? AND '
-                "terminal_state = 'capacity-pending' LIMIT 1"
-            ),
-            (group_name,),
-        ).fetchone()
-        is not None
-    ):
-        conditions.append('late-capacity-exhausted')
-    condition_tuple = tuple(conditions)
+    condition_tuple = _conditions(connection, group_name, row)
     manifest = (
         None if row['manifest_json'] is None else manifest_from_json(str(row['manifest_json']))
     )
@@ -322,20 +396,3 @@ def snapshot(connection: sqlite3.Connection, group_name: str) -> GroupSnapshot:
         late_id_count=int(row['operational_late_id_count']),
         epochs=epochs,
     )
-
-
-def ensure_delivery_ready(connection: sqlite3.Connection, group_name: str) -> None:
-    """Reject ordinary scheduling while lifecycle blockers remain.
-
-    Args:
-        connection: Live facade-owned transaction connection.
-        group_name: Exact group whose durable rows are accessed.
-
-    Raises:
-        InvalidTransitionError: If any lifecycle condition or event is active.
-    """
-    current = snapshot(connection, group_name)
-    if current.conditions:
-        raise InvalidTransitionError(f'delivery is blocked by {", ".join(current.conditions)}')
-    if current.in_flight_event_id is not None:
-        raise InvalidTransitionError('another event is already in flight')

@@ -13,35 +13,41 @@ contact ShotGrid.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
+import logging
 import math
 import os
 import platform
 import resource
+import select
 import shlex
 import shutil
 import sqlite3
+import struct
 import sys
 import tempfile
 import threading
 import time
+from array import array
 from collections import Counter, defaultdict
-from contextlib import contextmanager
+from collections.abc import Iterator, Sequence
+from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
-from sg_event_daemon._checkpoint import CheckpointAttempt, CheckpointBoundError, Checkpointer
+from sg_event_daemon._checkpoint import CheckpointAttempt, Checkpointer
+from sg_event_daemon._checkpoint_host import CheckpointHost
 from sg_event_daemon._config import (
     DEFAULT_CHECKPOINT_INTERVAL_SECS,
+    DEFAULT_LATE_EVENT_WINDOW_SECS,
     DEFAULT_MAX_GROUP_OBLIGATIONS,
     DEFAULT_MAX_LATE_IDS_PER_GROUP,
     DEFAULT_MAX_OPEN_RANGES,
-    DEFAULT_MAX_SOURCE_LATE_IDS,
-    DEFAULT_VISIBILITY_OVERLAP_SECS,
 )
-from sg_event_daemon._platform import ensure_secure_state_dir, spawn_child
+from sg_event_daemon._platform import SecurityError, ensure_secure_state_dir, spawn_child
 from sg_event_daemon._source_schema import (
     BUMP_INDEX_REVISION,
     BUMP_RANGE_REVISION,
@@ -50,7 +56,12 @@ from sg_event_daemon._source_schema import (
     UNRESOLVED_LATE_ID_PREFIX_SQL,
     source_identity,
 )
-from sg_event_daemon._sqlite import DatabaseError, open_database
+from sg_event_daemon._sqlite import (
+    WAL_IN_USE_LIMIT_BYTES,
+    WAL_TRIGGER_BYTES,
+    DatabaseError,
+    open_database,
+)
 from sg_event_daemon._write_lock import (
     SourceWriteLock,
     WriteLockStoppedError,
@@ -60,12 +71,24 @@ from sg_event_daemon._write_lock import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping
     from types import TracebackType
 
     from sg_event_daemon._platform import ChildProcess
     from sg_event_daemon._write_lock import WriteLockLevel
 
+_MIB = 1024 * 1024
+
+_AGGREGATED_LATENCY_METRICS = (
+    'commit_latency_ms',
+    'all_commit_latency_ms',
+    'full_lifecycle_latency_ms',
+    'acquisition_ms',
+    'service_ms',
+    'process_local_wait_ms',
+    'file_wait_ms',
+    'sqlite_wait_ms',
+)
 _BURST_SECS = 60.0
 _BURST_TOTAL_SECS = 300.0
 _CAPACITY_GROUP = 'g12'
@@ -78,7 +101,7 @@ _CAPACITY_MINIMUMS = {
 }
 _CAPACITY_REPLAY_EVERY = 60
 _CATCHUP_GROUPS = ('g09', 'g10', 'g11', 'g12')
-_CHECKPOINT_SETUP_LEAD_SECS = 0.001
+_CHECKPOINT_RESULT_FIELDS = 3
 _COUNT_SQL = {
     'source_meta': 'SELECT COUNT(*) FROM source_meta',
     'groups': 'SELECT COUNT(*) FROM groups',
@@ -97,46 +120,54 @@ _COUNT_SQL = {
     'stream_adoptions': 'SELECT COUNT(*) FROM stream_adoptions',
     'pending_adoptions': 'SELECT COUNT(*) FROM pending_adoptions',
 }
-_COUNTED_TABLES = (
-    'source_meta',
-    'groups',
-    'group_state',
-    'callback_marks',
-    'discovery_ranges',
-    'range_groups',
-    'source_late_ids',
-    'late_ids',
-    'replay_markers',
-    'epochs',
-    'join_commits',
-    'audit',
-    'conditional_park_results',
-    'disposition_audit',
-    'stream_adoptions',
-    'pending_adoptions',
-)
+# Covers even all four catch-up lanes' 384,000 writes plus ordinary lanes,
+# health reads and periodic/GC spans over 600 seconds. Retries can overflow it.
+_DIAGNOSTIC_CAP = 1_000_000
+_DIAGNOSTIC_CELL = 6
 _DRAIN_SECS = 2.0
 _DURABILITY_LIMITS: dict[str, dict[str, float]] = {
     'normal': {'p99': 20.0, 'p999': 100.0, 'max': 500.0},
     'full': {'p99': 50.0, 'p999': 250.0, 'max': 1000.0},
 }
 _EVENT_RATE = 25.0
+_FETCH_INTERVAL_SECS = 1.0
+_GAP_PROBABILITY = 0.125
+_GROUP_NAMES = tuple(f'g{index:02d}' for index in range(13))
 _HEALTH_INTERVAL_SECS = 2.0
+_LATE_ID_PROBABILITY = 0.2
+_LIMITS: dict[str, float] = {
+    'catchup_p99': 50.0,
+    'lifecycle_p99': 200.0,
+    'achieved_ratio': 0.99,
+    'uncleared_intervals': 2.0,
+    'wal_file_bytes': 64 * _MIB,
+}
 _MAX_REPEAT_RUNS = 3
-_MIB = 1024 * 1024
+_MERGE_PROBABILITY = 0.1
 _MILLISECONDS = 1000.0
 _MIN_DURATION_SECS = 600.0
 _MIN_SAMPLES = 50_000
+_ORPHAN_GROUP = 'orphan'
+_PHASE_NAMES = ('begin', 'body', 'commit', 'passive', 'truncate', 'sync')
+_PHASE_ROW = struct.Struct('<QQBB6x6d')
+_PINNED_GROUPS = ('g11', 'g12')
+_RANGE_LIFETIME_SECS = DEFAULT_LATE_EVENT_WINDOW_SECS
 _REPEAT_BAND = 0.8
 _REPEAT_PENDING_RUNS = 2
-_LIMITS: dict[str, float] = {
-    'catchup_p99': 50.0,
-    'lifecycle_p99': 100.0,
-    'achieved_ratio': 0.99,
-    'uncleared_intervals': 2.0,
-    'wal_bytes_in_use': 64 * _MIB,
-}
+_REPLAY_DISTANCE = 10_000
+_REPLAY_GROUPS = _GROUP_NAMES[:11]
+_RESTORE_CHUNK_RANGES = 18
+_RESTORE_INTERVAL_SECS = 0.5
 _RSS_KIB = 1024
+_SNAPSHOT_BLOB_BYTES = 2_048
+_SQL_BIND_RANGE = """
+INSERT INTO range_groups (obligation_id, group_name, group_generation, delivery_floor,
+ eligibility_point, obligation_state)
+SELECT :obligation, g.group_name, g.group_generation, s.delivery_floor,
+ :now + g.holdback_secs,
+ CASE WHEN s.delivery_floor < :high THEN 'pending' ELSE 'satisfied-by-floor' END
+FROM groups g JOIN group_state s USING (group_name) WHERE g.lifecycle != 'orphaned'
+"""
 _START_DELAY_SECS = 5.0
 _SUPERVISOR_POLL_INTERVAL_SECS = 1.0
 _TOPOLOGIES = {
@@ -152,26 +183,6 @@ _TOPOLOGIES = {
         ('named', ('g10', 'g11', 'g12')),
     ),
 }
-_GAP_PROBABILITY = 0.125
-_GROUP_NAMES = tuple(f'g{index:02d}' for index in range(13))
-_LATE_ID_PROBABILITY = 0.2
-_MERGE_PROBABILITY = 0.1
-_ORPHAN_GROUP = 'orphan'
-_PINNED_GROUPS = ('g11', 'g12')
-_RANGE_LIFETIME_SECS = DEFAULT_VISIBILITY_OVERLAP_SECS
-_REPLAY_DISTANCE = 10_000
-_REPLAY_GROUPS = _GROUP_NAMES[:11]
-_RESTORE_CHUNK_RANGES = 18
-_RESTORE_INTERVAL_SECS = 0.5
-_SNAPSHOT_BLOB_BYTES = 2_048
-_SQL_BIND_RANGE = """
-INSERT INTO range_groups (obligation_id, group_name, group_generation, delivery_floor,
- eligibility_point, obligation_state)
-SELECT :obligation, g.group_name, g.group_generation, s.delivery_floor,
- :now + g.holdback_secs,
- CASE WHEN s.delivery_floor < :high THEN 'pending' ELSE 'satisfied-by-floor' END
-FROM groups g JOIN group_state s USING (group_name) WHERE g.lifecycle != 'orphaned'
-"""
 
 _SQL_CAPACITY_RESTORE_INSERT_LATE_IDS = (
     'INSERT INTO late_ids (group_name, obligation_id, event_id, terminal_state, '
@@ -240,8 +251,6 @@ _SQL_LANE_MARK_UPDATE_GROUP_STATE = (
     'WHERE group_name = :group AND revision = :revision'
 )
 
-_SQL_LANE_REFRESH_SELECT_GROUPS = 'SELECT group_generation FROM groups WHERE group_name = :group'
-
 _SQL_LANE_REFRESH_SELECT_RANGE_GROUPS = (
     'SELECT r.obligation_id, d.low_id, d.high_id, d.range_state, '
     'd.source_revision, d.close_generation '
@@ -300,9 +309,7 @@ _SQL_LIFECYCLE_REPLAY_INSERT_DISPOSITION_AUDIT = (
     "'source-cleaned')"
 )
 
-_SQL_LIFECYCLE_REPLAY_SELECT_GROUPS = (
-    'SELECT group_generation FROM groups WHERE group_name = :group'
-)
+_SQL_SELECT_GROUP_GENERATION = 'SELECT group_generation FROM groups WHERE group_name = :group'
 
 _SQL_LIFECYCLE_REPLAY_SELECT_GROUP_STATE = (
     'SELECT revision, cursor FROM group_state WHERE group_name = :group'
@@ -312,7 +319,7 @@ _SQL_LIFECYCLE_REPLAY_SELECT_REPLAY_MARKERS = (
     'SELECT from_event_id FROM replay_markers WHERE group_name = :group'
 )
 
-_SQL_LIFECYCLE_REPLAY_SELECT_SOURCE_META = 'SELECT frontier FROM source_meta WHERE singleton = 1'
+_SQL_SELECT_FRONTIER = 'SELECT frontier FROM source_meta WHERE singleton = 1'
 
 _SQL_LIFECYCLE_REPLAY_UPDATE_GROUPS = (
     'UPDATE groups SET group_generation = group_generation + 1 WHERE group_name = :group'
@@ -347,9 +354,7 @@ _SQL_POLLER_MERGE_UPDATE_RANGE_GROUPS = (
     "AND obligation_state != 'scan-complete'"
 )
 
-_SQL_POLLER_OBSERVE_SELECT_SOURCE_META = (
-    'SELECT index_revision FROM source_meta WHERE singleton = 1'
-)
+_SQL_SELECT_INDEX_REVISION = 'SELECT index_revision FROM source_meta WHERE singleton = 1'
 
 _SQL_POLLER_OBSERVE_UPDATE_SOURCE_META = (
     'UPDATE source_meta SET frontier = :frontier, successful_clock = :now WHERE singleton = 1'
@@ -373,19 +378,13 @@ _SQL_POLLER_RELOAD_SELECT_REPLAY_MARKERS = (
     'SELECT group_name, group_generation FROM replay_markers'
 )
 
-_SQL_POLLER_RELOAD_SELECT_SOURCE_META = (
-    'SELECT index_revision FROM source_meta WHERE singleton = 1'
-)
-
-_SQL_POLLER_RELOAD_SELECT_SOURCE_META_2 = 'SELECT frontier FROM source_meta WHERE singleton = 1'
-
 _SQL_POPULATION_COUNTS_SELECT_DISCOVERY_RANGES = (
     "SELECT COUNT(*) FROM discovery_ranges WHERE range_state = 'open'"
 )
 
 _SQL_POPULATION_COUNTS_SELECT_GROUPS = 'SELECT group_name FROM groups'
 
-_SQL_POPULATION_COUNTS_SELECT_RANGE_GROUPS = (
+_SQL_SELECT_PENDING_RANGE_GROUP_COUNTS = (
     "SELECT group_name, COUNT(*) FROM range_groups WHERE obligation_state = 'pending' "
     'GROUP BY group_name'
 )
@@ -434,7 +433,7 @@ _SQL_SEED_AUDIT_INSERT_AUDIT = (
     "VALUES ('bench', ?, 'replay', 0.0, 0, 1, 'seed', ?, 'bench', ?)"
 )
 
-_SQL_SEED_CAP_STRESS_BEGIN_TRANSACTION = 'BEGIN IMMEDIATE'
+_SQL_BEGIN_IMMEDIATE = 'BEGIN IMMEDIATE'
 
 _SQL_SEED_CAP_STRESS_INSERT_GROUPS = (
     'INSERT INTO groups (group_name, group_generation, ordering_mode, '
@@ -456,7 +455,7 @@ _SQL_SEED_CAP_STRESS_INSERT_REPLAY_MARKERS = (
     "VALUES ('orphan', 1, 'bench-generation', 'seed-marker', 1000, 'seed-digest')"
 )
 
-_SQL_SEED_CAP_STRESS_PRAGMA_WAL_CHECKPOINT = 'PRAGMA wal_checkpoint(TRUNCATE)'
+_SQL_WAL_CHECKPOINT_TRUNCATE = 'PRAGMA wal_checkpoint(TRUNCATE)'
 
 _SQL_SEED_CAP_STRESS_UPDATE_SOURCE_META = 'UPDATE source_meta SET frontier = 1000000'
 
@@ -496,20 +495,7 @@ _SQL_STATUS_READ_SELECT_DISCOVERY_RANGES = (
     'SELECT range_state, COUNT(*) FROM discovery_ranges GROUP BY range_state'
 )
 
-_SQL_STATUS_READ_SELECT_DISPOSITION_AUDIT = 'SELECT COUNT(*) FROM disposition_audit'
-
-_SQL_STATUS_READ_SELECT_LATE_IDS = 'SELECT COUNT(*) FROM late_ids'
-
-_SQL_STATUS_READ_SELECT_RANGE_GROUPS = (
-    "SELECT group_name, COUNT(*) FROM range_groups WHERE obligation_state = 'pending' "
-    'GROUP BY group_name'
-)
-
-_SQL_STATUS_READ_SELECT_SOURCE_LATE_IDS = 'SELECT COUNT(*) FROM source_late_ids'
-
 _SQL_STATUS_READ_SELECT_SOURCE_META = 'SELECT * FROM source_meta'
-
-_SQL_STATUS_READ_SELECT_STREAM_ADOPTIONS = 'SELECT COUNT(*) FROM stream_adoptions'
 
 _SQL_STRICT_EPOCH_DELETE_EPOCHS = (
     "DELETE FROM epochs WHERE group_name = :group AND state = 'complete' "
@@ -587,6 +573,8 @@ class _LaneState:
     scan_suppressed: frozenset[str] = frozenset()
     epoch_turn: int = 0
     next_snapshot_at: float = 0.0
+    next_coordination_at: float = 0.0
+    health_late_ids: tuple[int, list[int]] | None = None
     source_ranges: dict[str, _RangeSource] = field(default_factory=dict[str, _RangeSource])
 
 
@@ -626,9 +614,8 @@ class _Scenario:
     lifecycle: bool = False
     catchup: bool = False
     poller_rate: float = 2.0
-    duration_secs: float = _MIN_DURATION_SECS
 
-    def _segments(self, lane: str, duration: float) -> list[tuple[float, float, float]]:
+    def segments(self, lane: str, duration: float) -> list[tuple[float, float, float]]:
         """Return half-open (start, end, rate) segments in seconds for one lane."""
         if not self.catchup or lane not in _CATCHUP_GROUPS:
             return [(0.0, duration, self.lane_rate)]
@@ -666,13 +653,15 @@ class _RunOptions:
 
     work_dir: Path
     duration_secs: float | None = None
-    min_samples: int = 50_000
+    min_samples: int = _MIN_SAMPLES
     checkpoint_interval_secs: float = DEFAULT_CHECKPOINT_INTERVAL_SECS
     repetition: int = 1
     device_class: str = 'unspecified'
     filesystem: str = 'unspecified'
     commit: str | None = None
     seed: str = 'bench'
+    extra_timing: bool | None = None
+    diagnostic_cap: int = _DIAGNOSTIC_CAP
 
 
 @dataclass(frozen=True)
@@ -696,16 +685,29 @@ class _ProcessSpec:
     seed: str
     scan_suppressed: tuple[str, ...]
     output_path: str
+    extra_timing: bool = False
+    diagnostic_cap: int = _DIAGNOSTIC_CAP
 
     @classmethod
-    def _from_json(cls, value: str) -> _ProcessSpec:
-        """Decode the internal JSON process specification."""
+    def from_json(cls, value: str) -> _ProcessSpec:
+        """Decode the internal JSON process specification.
+
+        Args:
+            value: JSON object containing the process fields emitted by
+                `to_json`; `lanes` and `scan_suppressed` arrays become tuples.
+
+        Raises:
+            ValueError: The process specification is not valid JSON.
+            KeyError: A required collection field is absent.
+            TypeError: The decoded fields cannot construct the process
+                specification.
+        """
         data = json.loads(value)
         data['lanes'] = tuple(data['lanes'])
         data['scan_suppressed'] = tuple(data['scan_suppressed'])
         return cls(**data)
 
-    def _to_json(self) -> str:
+    def to_json(self) -> str:
         """Encode all process fields for a child interpreter."""
         return json.dumps(asdict(self))
 
@@ -789,6 +791,239 @@ class _CapacityState:
     counts: dict[str, int] = field(default_factory=dict[str, int])
 
 
+class _PhaseRecords:
+    """Keep bounded packed call spans without retaining per-call Python graphs."""
+
+    def __init__(self, capacity: int) -> None:
+        """Preallocate all bytes before measurement; zero capacity disables recording."""
+        self.capacity = capacity
+        self.overflow = 0
+        self._data = bytearray(capacity * _PHASE_ROW.size)
+        self._count = 0
+        self._identity = 0
+        self._lock = threading.Lock()
+
+    def identity(self) -> int:
+        """Allocate a process-local correlation ID for one attempt or checkpoint."""
+        with self._lock:
+            self._identity += 1
+            return self._identity
+
+    def records(self) -> Iterator[dict[str, Any]]:
+        """Decode one phase at a time after measured owners have joined.
+
+        Yields:
+            Records in reserved-slot order with `phase_id`, `thread_id`,
+            `phase`, `outcome`, `start`, and `end`. Each clock mapping contains
+            `monotonic`, `thread_cpu`, and `process_cpu` seconds; outcome is
+            `completed` or `failed`.
+        """
+        for index in range(self._count):
+            identity, thread_id, kind, completed, *clocks = _PHASE_ROW.unpack_from(
+                self._data, index * _PHASE_ROW.size
+            )
+            yield {
+                'phase_id': identity,
+                'thread_id': thread_id,
+                'phase': _PHASE_NAMES[kind],
+                'outcome': 'completed' if completed else 'failed',
+                'start': dict(
+                    zip(('monotonic', 'thread_cpu', 'process_cpu'), clocks[:3], strict=True)
+                ),
+                'end': dict(
+                    zip(('monotonic', 'thread_cpu', 'process_cpu'), clocks[3:], strict=True)
+                ),
+            }
+
+    @contextmanager
+    def span(self, phase: str, identity: int) -> Generator[None]:
+        """Sample one call, preserving its exception and counting every dropped span.
+
+        Args:
+            phase: One of `begin`, `body`, `commit`, `passive`, `truncate`, or
+                `sync`.
+            identity: Unsigned 64-bit correlation ID shared by related phases.
+
+        Yields:
+            Control while the call runs. Disabled or full storage still runs
+            the call; full storage increments the dropped-span count.
+        """
+        if not self.capacity:
+            yield
+            return
+        with self._lock:
+            if self._count == self.capacity:
+                self.overflow += 1
+                index = -1
+            else:
+                index = self._count
+                self._count += 1
+        if index < 0:
+            yield
+            return
+        thread_id = threading.get_ident()
+        kind = _PHASE_NAMES.index(phase)
+        wall, thread, process = time.monotonic(), time.thread_time(), time.process_time()
+        completed = False
+        try:
+            yield
+            completed = True
+        finally:
+            end_wall, end_thread, end_process = (
+                time.monotonic(),
+                time.thread_time(),
+                time.process_time(),
+            )
+            _PHASE_ROW.pack_into(
+                self._data,
+                index * _PHASE_ROW.size,
+                identity,
+                thread_id,
+                kind,
+                completed,
+                wall,
+                thread,
+                process,
+                end_wall,
+                end_thread,
+                end_process,
+            )
+
+
+class _ConnectionObserver:
+    """Delegate the lock's connection calls, observing only BEGIN and COMMIT."""
+
+    def __init__(
+        self, connection: sqlite3.Connection, phases: _PhaseRecords, identity: int
+    ) -> None:
+        """Bind the existing connection to one writer attempt's phase identity."""
+        self._connection = connection
+        self._phases = phases
+        self._identity = identity
+
+    def __getattr__(self, name: str) -> object:
+        """Forward transaction state, rollback and other unchanged connection behavior."""
+        return getattr(self._connection, name)
+
+    def commit(self) -> None:
+        """Commit exactly once, retaining a failed-call return boundary on exceptions.
+
+        Raises:
+            sqlite3.Error: SQLite cannot commit the transaction.
+        """
+        with self._phases.span('commit', self._identity):
+            self._connection.commit()
+
+    def execute(self, sql: str) -> sqlite3.Cursor:
+        """Execute exactly once, enclosing each BEGIN retry in its own span.
+
+        Returns:
+            The underlying connection's cursor for the statement.
+
+        Raises:
+            sqlite3.Error: SQLite cannot execute the statement.
+        """
+        if sql == _SQL_BEGIN_IMMEDIATE:
+            with self._phases.span('begin', self._identity):
+                return self._connection.execute(sql)
+        return self._connection.execute(sql)
+
+
+class _PackedRecords(Sequence[dict[str, Any]]):
+    """Retain append-only record snapshots without per-record Python object graphs."""
+
+    def __init__(self) -> None:
+        """Allocate an empty byte buffer and unsigned record boundaries."""
+        self._data = bytearray()
+        self._offsets = array('Q', [0])
+        self._overflowed = False
+        self._lock = threading.RLock()
+
+    @overload
+    def __getitem__(self, index: int) -> dict[str, Any]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[dict[str, Any]]: ...
+
+    def __getitem__(self, index: int | slice) -> dict[str, Any] | list[dict[str, Any]]:
+        """Decode one snapshot or a slice, preserving ordinary sequence indexing."""
+        with self._lock:
+            if isinstance(index, slice):
+                return [self[position] for position in range(*index.indices(len(self)))]
+            count = len(self)
+            if index < 0:
+                index += count
+            if index < 0 or index >= count:
+                raise IndexError('packed record index out of range')
+            return cast(
+                'dict[str, Any]',
+                json.loads(self._data[self._offsets[index] : self._offsets[index + 1]]),
+            )
+
+    def __len__(self) -> int:
+        """Return the number of complete retained snapshots."""
+        return len(self._offsets) - 1
+
+    def _append(self, record: dict[str, Any], cap: int | None) -> bool:
+        """Encode a snapshot, then admit and append it without tracked allocations."""
+        encoded = json.dumps(record, separators=(',', ':')).encode()
+        with self._lock:
+            if cap is not None and len(self) >= cap:
+                return False
+            # Validate the new boundary before changing the retained byte buffer.
+            try:
+                self._offsets.append(len(self._data) + len(encoded))
+            except OverflowError:
+                self._overflowed = True
+                raise
+            try:
+                self._data.extend(encoded)
+            except BaseException:
+                self._overflowed = True
+                self._offsets.pop()
+                raise
+            return True
+
+    def append(self, record: dict[str, Any]) -> None:
+        """Snapshot a record, raising rather than dropping evidence on offset overflow.
+
+        Args:
+            record: Trusted harness values to retain with their JSON values and
+                field order.
+
+        Raises:
+            OverflowError: The buffer end cannot fit the unsigned offset
+                representation.
+        """
+        self._append(record, None)
+
+    def append_if_room(self, record: dict[str, Any], cap: int) -> bool:
+        """Encode before admission, rejecting a record if reentrant work filled the cap.
+
+        Args:
+            record: Trusted harness snapshot to retain.
+            cap: The existing per-process diagnostic record capacity.
+
+        Returns:
+            Whether the complete snapshot was retained.
+
+        Raises:
+            OverflowError: The buffer end cannot fit the unsigned offset
+                representation.
+        """
+        return self._append(record, cap)
+
+    def records(self) -> Iterator[dict[str, Any]]:
+        """Decode snapshots incrementally, refusing prior offset overflow.
+
+        Raises:
+            OverflowError: A previous append left incomplete evidence.
+        """
+        if self._overflowed:
+            raise OverflowError('packed record offsets overflowed; evidence is incomplete')
+        yield from self
+
+
 @dataclass
 class _Runtime:
     """Collect process-local records from independent connection-owning threads."""
@@ -798,19 +1033,33 @@ class _Runtime:
     stop: threading.Event = field(default_factory=threading.Event)
     go: threading.Event = field(default_factory=threading.Event)
     capacity: _CapacityState = field(default_factory=_CapacityState)
-    commits: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
-    reads: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    commits: _PackedRecords = field(default_factory=_PackedRecords)
+    reads: _PackedRecords = field(default_factory=_PackedRecords)
     checkpoints: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     samples: list[tuple[int, int]] = field(default_factory=list[tuple[int, int]])
     errors: list[str] = field(default_factory=list[str])
-    wait_timeouts: list[str] = field(default_factory=list[str])
+    expired_attempts: list[str] = field(default_factory=list[str])
     capacity_replays: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
-    offered: int = 0
     busy_timeouts: int = 0
     index_reloads: int = 0
     restore_commits: int = 0
     checkpoint_halt: str | None = None
+    checkpoint_crossings: int = 0
+    checkpoint_started_at: float | None = None
+    checkpoint_finished_at: float | None = None
     finished_at: float = 0.0
+    wal_trigger_bytes: int = WAL_TRIGGER_BYTES
+    diagnostics: _PackedRecords = field(default_factory=_PackedRecords)
+    diagnostic_overflow: int = 0
+    diagnostic_lock: threading.RLock = field(default_factory=threading.RLock)
+    phases: _PhaseRecords = field(init=False)
+    writer_attempts: dict[str, tuple[float, int]] = field(
+        default_factory=dict[str, tuple[float, int]]
+    )
+
+    def __post_init__(self) -> None:
+        """Allocate phase capacity before any measured thread is started."""
+        self.phases = _PhaseRecords(self.spec.diagnostic_cap if self.spec.extra_timing else 0)
 
 
 @dataclass(frozen=True)
@@ -824,6 +1073,7 @@ class _Writer:
     after: Callable[[sqlite3.Connection], None] | None = None
     reload: Callable[[sqlite3.Connection], None] | None = None
     maintenance: bool = False
+    wait: Callable[[float], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -868,6 +1118,24 @@ class _CellRun:
     start_at: float
     end_at: float
     population: dict[str, Any]
+    directory: Path | None = None
+
+
+def _arrival_accounting(records: list[dict[str, Any]], end: float) -> dict[str, Any]:
+    """Reconcile unique offered IDs against completions at each shared boundary."""
+    offered = {item['arrival_id'] for raw in records for item in raw['offered_arrivals']}
+    commits = [item for raw in records for item in raw['commits'] if not item.get('maintenance')]
+    accounting: dict[str, Any] = {}
+    for name, boundary in [('load_end', end), ('drain_end', end + _DRAIN_SECS)]:
+        timely = {item['arrival_id'] for item in commits if item['finished_at'] <= boundary}
+        outstanding = sorted(offered - timely)
+        accounting[name] = {
+            'offered': len(offered),
+            'completed': len(timely),
+            'outstanding': len(outstanding),
+            'outstanding_ids': outstanding,
+        }
+    return accounting
 
 
 def _arrival_times(
@@ -893,13 +1161,16 @@ def _busy_remaining(deadline: float, stop: threading.Event | None, level: WriteL
 
 
 def _busy_restore_timeout(connection: sqlite3.Connection, configured: int) -> None:
-    """Restore SQLite's timeout without replacing an acquisition error in flight."""
+    """Restore SQLite's timeout, promoting restoration failures over acquisition expiry."""
     primary = sys.exception()
     try:
         connection.execute(f'PRAGMA busy_timeout={configured}')
     except sqlite3.Error as exc:
-        if primary is None:
-            raise DatabaseError(str(exc)) from exc
+        if primary is None or isinstance(primary, WriteLockTimeoutError):
+            failure = DatabaseError(str(exc))
+            if primary is not None:
+                failure.add_note(f'write lock acquisition expiry: {primary!r}')
+            raise failure from exc
         primary.add_note(f'busy_timeout restore failure: {exc!r}')
 
 
@@ -915,7 +1186,7 @@ def _busy_begin(
         remaining = _busy_remaining(deadline, stop, 'SQLite')
         connection.execute(f'PRAGMA busy_timeout={max(1, math.floor(remaining * 1000))}')
         _busy_remaining(deadline, stop, 'SQLite')
-        connection.execute('BEGIN IMMEDIATE')
+        connection.execute(_SQL_BEGIN_IMMEDIATE)
         timing.begun_at = time.monotonic()
     finally:
         _busy_restore_timeout(connection, configured)
@@ -1004,6 +1275,10 @@ def _cell_specs(run: _CellRun, directory: Path) -> list[_ProcessSpec]:
             run.options.seed,
             suppressed,
             str(directory / f'{role}-records.json'),
+            run.options.extra_timing
+            if run.options.extra_timing is not None
+            else cell.number == _DIAGNOSTIC_CELL,
+            run.options.diagnostic_cap,
         )
         for role, lanes in _TOPOLOGIES[cell.topology]
     ]
@@ -1018,18 +1293,35 @@ def _checkpoint_summary(
     for attempt in attempts:
         finished = float(attempt['finished_at'])
         longest = max(longest, finished - cleared)
-        if attempt['outcome'] in {'complete', 'reset-observed'}:
+        if attempt['outcome'] in {'complete', 'reset-observed'} or attempt['reuse'] == 'reused':
             cleared = finished
     longest = max(longest, end_at - cleared)
     return {
         'attempts': len(attempts),
-        'outcomes': dict(Counter(item['outcome'] for item in attempts)),
+        'outcomes': dict(
+            Counter(outcome for item in attempts for outcome in (item['outcome'], item['reuse']))
+        ),
         'longest_uncleared_secs': longest,
         'longest_uncleared_intervals': longest / interval,
         'peak_log_frames': max(
             (item['result'][1] for item in attempts if item['outcome'] != 'contended'), default=0
         ),
     }
+
+
+def _clock_sample() -> dict[str, float]:
+    """Sample one correlation clock and two separate cumulative CPU clocks."""
+    return {
+        'monotonic': time.monotonic(),
+        'process_cpu': time.process_time(),
+        'thread_cpu': time.thread_time(),
+    }
+
+
+def _default_duration(scenario: _Scenario, min_samples: int) -> float:
+    """Run long enough for both the time and offered-sample minimums."""
+    rate = len(_GROUP_NAMES) * scenario.lane_rate + scenario.poller_rate
+    return max(_MIN_DURATION_SECS, min_samples / rate)
 
 
 def _eligible_for_verdict(result: dict[str, Any]) -> bool:
@@ -1045,7 +1337,9 @@ def _eligible_for_verdict(result: dict[str, Any]) -> bool:
 
 def _evaluation_status(evaluations: list[dict[str, Any]]) -> int:
     """Fail until every selected gated cell passes."""
-    return int(any(item['verdict'] not in {'pass', 'reported'} for item in evaluations))
+    return int(
+        any(item['qualification_verdict'] not in {'pass', 'reported'} for item in evaluations)
+    )
 
 
 def _lane_resume(connection: sqlite3.Connection, lane: _LaneState) -> None:
@@ -1091,11 +1385,13 @@ def _lane_source_ranges(
         previous = lane.source_ranges.get(obligation)
         if state == 'closed' and previous is not None and previous.version == version:
             sources[obligation] = previous
-        else:
+        elif state == 'closed':
             late_ids = connection.execute(
                 _SQL_LANE_REFRESH_SELECT_SOURCE_LATE_IDS, {'obligation': obligation}
             ).fetchall()
             sources[obligation] = _RangeSource(version, tuple(row[0] for row in late_ids))
+        else:
+            sources[obligation] = _RangeSource(version, ())
     return sources
 
 
@@ -1108,14 +1404,14 @@ def _lifecycle_replay(connection: sqlite3.Connection, group_name: str, now: floa
     if row is None:
         raise ValueError(f'unknown group: {group_name}')
     prior = int(row[0])
-    frontier = int(connection.execute(_SQL_LIFECYCLE_REPLAY_SELECT_SOURCE_META).fetchone()[0])
+    frontier = int(connection.execute(_SQL_SELECT_FRONTIER).fetchone()[0])
     connection.execute(
         _SQL_LIFECYCLE_REPLAY_SELECT_REPLAY_MARKERS,
         {'group': group_name},
     ).fetchone()
     old = int(
         connection.execute(
-            _SQL_LIFECYCLE_REPLAY_SELECT_GROUPS,
+            _SQL_SELECT_GROUP_GENERATION,
             {'group': group_name},
         ).fetchone()[0]
     )
@@ -1211,7 +1507,7 @@ def _limit_checks(result: dict[str, Any]) -> list[tuple[str, float, float]]:
             )
         )
     checks.append(
-        ('peak_wal_bytes_in_use', result['peak_wal_bytes_in_use'], _LIMITS['wal_bytes_in_use'])
+        ('peak_wal_file_bytes', result['peak_wal_file_bytes'], _LIMITS['wal_file_bytes'])
     )
     checks.extend(
         (
@@ -1231,8 +1527,10 @@ def _hard_failures(result: dict[str, Any]) -> list[str]:
         failures.append('achieved_ratio')
     if result['backlog_at_end']:
         failures.append('backlog_at_end')
-    if result['busy_timeouts'] or any(result['wait_timeouts'].values()):
+    if result['busy_timeouts'] or any(result['expired_attempts'].values()):
         failures.append('timeouts')
+    if any(checkpoint['bound_crossings'] for checkpoint in result['checkpointers']):
+        failures.append('checkpoint_bound_crossings')
     if any(checkpoint['halt'] for checkpoint in result['checkpointers']):
         failures.append('checkpoint_halt')
     if any(process['exit_status'] for process in result['processes']):
@@ -1270,20 +1568,14 @@ def _merge_worst_checkpointers(worst: dict[str, Any], result: dict[str, Any]) ->
             earlier['longest_uncleared_intervals'], checkpointer['longest_uncleared_intervals']
         )
         earlier['halt'] = earlier['halt'] or checkpointer['halt']
+        earlier['bound_crossings'] = max(
+            earlier['bound_crossings'], checkpointer['bound_crossings']
+        )
 
 
 def _merge_worst_latencies(worst: dict[str, Any], result: dict[str, Any]) -> None:
     """Raise each latency percentile to the worst repeat observation."""
-    for name in (
-        'commit_latency_ms',
-        'all_commit_latency_ms',
-        'full_lifecycle_latency_ms',
-        'acquisition_ms',
-        'service_ms',
-        'process_local_wait_ms',
-        'file_wait_ms',
-        'sqlite_wait_ms',
-    ):
+    for name in _AGGREGATED_LATENCY_METRICS:
         if name not in worst or name not in result:
             continue
         if worst[name] is not None and result[name] is not None:
@@ -1293,6 +1585,13 @@ def _merge_worst_latencies(worst: dict[str, Any], result: dict[str, Any]) -> Non
         earlier = worst.setdefault('commit_latency_ms_by_class', {}).setdefault(kind, {})
         for metric, value in metrics.items():
             earlier[metric] = max(earlier.get(metric, 0), value)
+
+
+def _metric_list(value: object, path: Path, name: str) -> list[Any]:
+    """Require a JSON array before inspecting retained records."""
+    if not isinstance(value, list):
+        raise _InvalidResultError(f'{path}: invalid result {name}: expected list')
+    return cast('list[Any]', value)
 
 
 def _metric_mapping(value: object, path: Path, field: str) -> dict[str, Any]:
@@ -1313,19 +1612,24 @@ def _metric_number(value: object, path: Path, field: str) -> None:
         raise ValueError(f'{path}: invalid result {field}: expected finite nonnegative number')
 
 
-def _offered_count(spec: _ProcessSpec) -> int:
-    """Count every offered schedule even when startup or a writer fails early."""
+def _offered_arrivals(spec: _ProcessSpec) -> list[dict[str, Any]]:
+    """Derive identities after measurement from the original immutable schedules."""
     scenario = _SCENARIOS[spec.scenario]
     duration = spec.end_at - spec.start_at
-    segments = [scenario._segments(group, duration) for group in spec.lanes]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    schedules = {group: scenario.segments(group, duration) for group in spec.lanes}
     if spec.poller:
-        segments.append([(0, duration, scenario.poller_rate)])
+        schedules['poller'] = [(0, duration, scenario.poller_rate)]
     if spec.lifecycle:
-        segments.append([(0, duration, 1)])
-    return sum(
-        sum(1 for _ in _arrival_times(schedule, spec.start_at, spec.end_at))
-        for schedule in segments
-    )
+        schedules['lifecycle'] = [(0, duration, 1)]
+    return [
+        {
+            'arrival_id': f'{spec.role}:{writer}:{ordinal}',
+            'writer': writer,
+            'scheduled_at': scheduled,
+        }
+        for writer, segments in schedules.items()
+        for ordinal, scheduled in enumerate(_arrival_times(segments, spec.start_at, spec.end_at))
+    ]
 
 
 def _overlap_chains(intervals: list[tuple[float, float]]) -> tuple[int, float]:
@@ -1373,6 +1677,21 @@ def _capacity_summary(cell: _Cell, records: list[dict[str, Any]]) -> dict[str, A
     }
 
 
+def _persist_cell_result(result: dict[str, Any], output: Path) -> None:
+    """Copy a portable evidence bundle and save relative manifest paths after measurement."""
+    persisted = json.loads(json.dumps(result))
+    directory = output.parent / f'{output.stem}-evidence'
+    directory.mkdir(parents=True, exist_ok=True)
+    for entry in persisted.get('record_manifest', []):
+        for kind in ('spec', 'raw'):
+            source = Path(entry[f'{kind}_path'])
+            target = directory / f'{entry["role"]}-{kind}.json'
+            if source.exists():
+                shutil.copyfile(source, target)
+            entry[f'{kind}_path'] = str(target.relative_to(output.parent))
+    output.write_text(json.dumps(persisted, indent=2) + '\n')
+
+
 def _poller_close(connection: sqlite3.Connection, closed: tuple[str, list[int]]) -> None:
     """Close one expired range and record its deterministic late ids."""
     obligation, event_ids = closed
@@ -1417,9 +1736,9 @@ def _poller_open(
 
 def _poller_observe(
     connection: sqlite3.Connection, poller: _PollerState, plan: _PollPlan, now: float
-) -> None:
-    """Apply one guarded source observation inside a write transaction."""
-    row = connection.execute(_SQL_POLLER_OBSERVE_SELECT_SOURCE_META).fetchone()
+) -> bool:
+    """Apply a guarded source observation and report whether its commit needs a hint."""
+    row = connection.execute(_SQL_SELECT_INDEX_REVISION).fetchone()
     if row is None or row[0] != poller.index_revision:
         raise _IndexChangedError
     connection.execute(
@@ -1433,7 +1752,8 @@ def _poller_observe(
     for closed in plan.closed:
         _poller_close(connection, closed)
     retired_ids = {str(row[0]) for row in connection.execute(_SQL_RETIRE).fetchall()}
-    if plan.opened or plan.merged is not None or plan.closed or retired_ids:
+    range_changed = bool(plan.opened or plan.merged is not None or plan.closed or retired_ids)
+    if range_changed:
         connection.execute(BUMP_RANGE_REVISION)
     closed_ids = {obligation for obligation, _ in plan.closed}
     poller.open_ranges = [
@@ -1449,13 +1769,13 @@ def _poller_observe(
     poller.next_range += len(plan.opened)
     poller.frontier = plan.frontier
     poller.cycle += 1
+    return range_changed
 
 
 def _population_counts(connection: sqlite3.Connection) -> dict[str, int]:
     """Count every schema table and each group's pending obligations."""
     counts = {
-        table: int(connection.execute(_COUNT_SQL[table]).fetchone()[0])
-        for table in _COUNTED_TABLES
+        table: int(connection.execute(sql).fetchone()[0]) for table, sql in _COUNT_SQL.items()
     }
     counts['open_ranges'] = int(
         connection.execute(_SQL_POPULATION_COUNTS_SELECT_DISCOVERY_RANGES).fetchone()[0]
@@ -1469,43 +1789,112 @@ def _population_counts(connection: sqlite3.Connection) -> dict[str, int]:
     counts.update(
         {
             f'pending:{group}': int(count)
-            for group, count in connection.execute(_SQL_POPULATION_COUNTS_SELECT_RANGE_GROUPS)
+            for group, count in connection.execute(_SQL_SELECT_PENDING_RANGE_GROUP_COUNTS)
         }
     )
     return counts
 
 
-def _population_summary(reads: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+def _population_summary(reads: Sequence[dict[str, Any]]) -> dict[str, dict[str, int]]:
     """Reduce recorded status counts to each tracked quantity's observed extrema."""
     values: dict[str, list[int]] = defaultdict(list)
     for record in reads:
-        if record['kind'] == 'status':
+        if record['kind'] == 'status' and record.get('outcome') != 'failed':
             for name, value in record['counts'].items():
                 values[name].append(value)
     return {name: {'min': min(samples), 'max': max(samples)} for name, samples in values.items()}
 
 
-def _print_verdicts(evaluations: list[dict[str, Any]]) -> None:
-    """Print a compact verdict table for selected cells."""
-    print('Cell  Verdict       Runs')
-    for evaluation in evaluations:
-        print(f'{evaluation["cell"]:>4}  {evaluation["verdict"]:<12}  {evaluation["runs"]}')
+def _process_arrival_evidence(
+    spec: dict[str, Any], raw: dict[str, Any], duration_secs: float
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Validate one retained process's offered and successful arrival identities."""
+    offered: dict[str, float] = {}
+    completed: dict[str, float] = {}
+    start, end = spec['start_at'], spec['end_at']
+    for name, value in [
+        ('start_at', start),
+        ('end_at', end),
+        ('finished_at', raw['finished_at']),
+    ]:
+        _metric_number(value, Path('<evidence>'), name)
+    if end - start != duration_secs or raw['finished_at'] < end:
+        raise ValueError('incomplete measurement interval')
+    arrivals = _metric_list(raw['offered_arrivals'], Path('<evidence>'), 'offered_arrivals')
+    if type(raw['offered']) is not int or raw['offered'] != len(arrivals):
+        raise ValueError('offered count does not match retained arrivals')
+    local_ids: set[str] = set()
+    for item in arrivals:
+        arrival = _metric_mapping(item, Path('<evidence>'), 'arrival')
+        identity, scheduled = arrival['arrival_id'], arrival['scheduled_at']
+        _metric_number(scheduled, Path('<evidence>'), 'scheduled_at')
+        if (
+            not isinstance(identity, str)
+            or not identity.startswith(f'{raw["role"]}:')
+            or identity in offered
+            or not start <= scheduled < end
+        ):
+            raise ValueError('invalid or duplicate offered arrival')
+        offered[identity] = scheduled
+        local_ids.add(identity)
+    for item in _metric_list(raw['commits'], Path('<evidence>'), 'commits'):
+        commit = _metric_mapping(item, Path('<evidence>'), 'commit')
+        if commit.get('maintenance') is True:
+            continue
+        identity, finished = commit['arrival_id'], commit['finished_at']
+        _metric_number(finished, Path('<evidence>'), 'commit.finished_at')
+        if identity not in local_ids or identity in completed or finished < offered[identity]:
+            raise ValueError('unaccounted or duplicate completed arrival')
+        completed[identity] = finished
+    return offered, completed
 
 
-def _process_records(runtime: _Runtime) -> dict[str, Any]:
-    """Encode process records and resource peaks at the JSON boundary."""
+def _process_record_fields(runtime: _Runtime) -> dict[str, Any]:
+    """Build ordered process fields with incremental retained-record iterators."""
+    arrivals = _offered_arrivals(runtime.spec)
+    identities = {(item['writer'], item['scheduled_at']): item['arrival_id'] for item in arrivals}
+
+    def commits() -> Iterator[dict[str, Any]]:
+        for commit in runtime.commits.records():
+            if not commit.get('maintenance'):
+                commit['arrival_id'] = identities.get(
+                    (commit['writer'], commit['scheduled_at']), commit.get('arrival_id')
+                )
+            yield commit
+
+    evidence_errors = (
+        [f'diagnostic overflow: {runtime.diagnostic_overflow}']
+        if runtime.diagnostic_overflow
+        else []
+    )
+    if runtime.phases.overflow:
+        evidence_errors.append(f'phase overflow: {runtime.phases.overflow}')
     return {
+        'phases': runtime.phases.records(),
+        'phase_cap': runtime.phases.capacity,
+        'phase_overflow': runtime.phases.overflow,
         'role': runtime.spec.role,
         'lanes': runtime.spec.lanes,
         'exit_status': int(bool(runtime.errors)),
         'errors': runtime.errors,
-        'commits': runtime.commits,
-        'reads': runtime.reads,
+        'commits': commits(),
+        'offered_arrivals': arrivals,
+        'diagnostics': runtime.diagnostics.records(),
+        'diagnostic_cap': runtime.spec.diagnostic_cap,
+        'diagnostic_overflow': runtime.diagnostic_overflow,
+        'extra_timing': runtime.spec.extra_timing,
+        'evidence_complete': not evidence_errors,
+        'evidence_errors': evidence_errors,
+        'reads': runtime.reads.records(),
         'checkpoints': runtime.checkpoints,
         'checkpoint_halt': runtime.checkpoint_halt,
-        'wait_timeouts': dict(Counter(runtime.wait_timeouts)),
+        'checkpoint_started_at': runtime.checkpoint_started_at,
+        'checkpoint_finished_at': runtime.checkpoint_finished_at,
+        'checkpoint_crossings': runtime.checkpoint_crossings,
+        'checkpoint_owner': runtime.spec.poller,
+        'expired_attempts': dict(Counter(runtime.expired_attempts)),
         'busy_timeouts': runtime.busy_timeouts,
-        'offered': runtime.offered,
+        'offered': len(arrivals),
         'index_reloads': runtime.index_reloads,
         'capacity_replays': runtime.capacity_replays,
         'restore_commits': runtime.restore_commits,
@@ -1518,19 +1907,276 @@ def _process_records(runtime: _Runtime) -> dict[str, Any]:
     }
 
 
-def _child_result(spec: _ProcessSpec, process: ChildProcess) -> dict[str, Any]:
-    """Wait for a child and retain missing output as an explicit process failure."""
-    status = process.wait()
-    path = Path(spec.output_path)
-    if path.exists():
-        result: dict[str, Any] = json.loads(path.read_text())
-        result['exit_status'] = status or result['exit_status']
-        return result
-    runtime = _Runtime(spec, _BusyOnlyLock(timeout_secs=1))
-    runtime.errors.append(f'child exited {status} without records')
-    runtime.finished_at = time.monotonic()
-    runtime.offered = _offered_count(spec)
-    return _process_records(runtime)
+def _process_records(runtime: _Runtime) -> dict[str, Any]:
+    """Materialize process records for in-memory callers after measurement."""
+    return {
+        key: list(cast('Iterator[dict[str, Any]]', value))
+        if isinstance(value, Iterator)
+        else value
+        for key, value in _process_record_fields(runtime).items()
+    }
+
+
+def _publish_range_hints(fds: tuple[int, ...]) -> None:
+    """Notify every lane after commit, dropping hints when a pipe is already full."""
+    for fd in fds:
+        with suppress(BlockingIOError):
+            os.write(fd, b'\0')
+
+
+def _qualification_failures(
+    worst: dict[str, Any], failures: list[str], *, capacity_only: bool
+) -> tuple[list[str], list[str]]:
+    """Partition capacity and binding failures, separating busy timeouts from expiries."""
+    capacity = [
+        name
+        for name in failures
+        if capacity_only
+        and (
+            name.startswith(
+                (
+                    'commit_latency_ms.',
+                    'all_commit_latency_ms.',
+                    'full_lifecycle_latency_ms.',
+                    'checkpointers[',
+                )
+            )
+            or name in {'achieved_ratio', 'backlog_at_end', 'peak_wal_file_bytes'}
+        )
+    ]
+    safety = [name for name in failures if name not in capacity and name != 'timeouts']
+    if capacity_only and worst['peak_wal_file_bytes'] > WAL_IN_USE_LIMIT_BYTES:
+        safety.append('wal_runtime_size')
+    if worst['busy_timeouts']:
+        safety.append('busy_timeouts')
+    if any(worst['expired_attempts'].values()):
+        (capacity if capacity_only else safety).append('expired_attempts')
+    return capacity, safety
+
+
+def _qualification_summary(evaluations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Label selected-cell outcomes without claiming complete deployment qualification."""
+    qualification = evaluations[0]['qualification']
+    return {
+        'qualification': qualification,
+        'qualification_label': (
+            'NORMAL on m7i-flex.large; FULL capacity not qualified'
+            if qualification == 'normal-m7i-flex.large'
+            else 'all modes'
+        ),
+        'qualification_verdict': 'fail' if _evaluation_status(evaluations) else 'pass',
+        'matrix_complete': {item['cell'] for item in evaluations}
+        == set(range(1, len(_CELLS) + 1)),
+        'repeat': [item['cell'] for item in evaluations if item['repeat_required']],
+    }
+
+
+def _print_verdicts(evaluations: list[dict[str, Any]]) -> None:
+    """Print raw and selected-scope verdicts with explicit matrix coverage."""
+    summary = _qualification_summary(evaluations)
+    print(summary['qualification_label'])
+    print('Cell  Raw           Qualification  Runs  Repeat required')
+    for evaluation in evaluations:
+        print(
+            f'{evaluation["cell"]:>4}  {evaluation["verdict"]:<12}  '
+            f'{evaluation["qualification_verdict"]:<13}  {evaluation["runs"]}  '
+            f'{evaluation["repeat_required"]}'
+        )
+        if evaluation['failures']:
+            print(f'      failures: {", ".join(evaluation["failures"])}')
+        if evaluation.get('evidence_errors'):
+            print(f'      evidence: {", ".join(evaluation["evidence_errors"])}')
+    if not summary['matrix_complete']:
+        print('Selected cells only: incomplete matrix; no complete qualification.')
+    elif summary['qualification'] == 'normal-m7i-flex.large':
+        print('Storage matrix only; live load and host probe acceptance are separate checks.')
+
+
+def _reader_summary(reads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize read transaction durations and transitive concurrency."""
+    count, span = _overlap_chains([(record['start'], record['end']) for record in reads])
+    return {
+        'durations_ms': {
+            kind: _percentiles(
+                [
+                    (record['end'] - record['start']) * _MILLISECONDS
+                    for record in reads
+                    if record['kind'] == kind
+                ]
+            )
+            for kind in ('health-projection', 'snapshot', 'status')
+        },
+        'longest_overlap_chain': {'readers': count, 'span_secs': span},
+    }
+
+
+def _reconcile_arrival_evidence(
+    result: dict[str, Any], records: list[tuple[dict[str, Any], dict[str, Any]]]
+) -> None:
+    """Recompute load and drain counts from unique offered and committed arrival identities."""
+    offered: dict[str, float] = {}
+    completed: dict[str, float] = {}
+    ends: set[float] = set()
+    for spec, raw in records:
+        local_offered, local_completed = _process_arrival_evidence(
+            spec, raw, result['duration_secs']
+        )
+        offered.update(local_offered)
+        completed.update(local_completed)
+        ends.add(spec['end_at'])
+    if len(ends) != 1 or not offered:
+        raise ValueError('missing or inconsistent measurement boundaries')
+    end = ends.pop()
+    for name, boundary in [('load_end', end), ('drain_end', end + _DRAIN_SECS)]:
+        timely = {identity for identity, finished in completed.items() if finished <= boundary}
+        outstanding = set(offered) - timely
+        counts = result['arrival_accounting'][name]
+        for key, value in [
+            ('offered', len(offered)),
+            ('completed', len(timely)),
+            ('outstanding', len(outstanding)),
+        ]:
+            if type(counts[key]) is not int or counts[key] != value:
+                raise ValueError(f'{name}: inconsistent {key}')
+        if (
+            not isinstance(counts['outstanding_ids'], list)
+            or len(counts['outstanding_ids']) != len(outstanding)
+            or set(counts['outstanding_ids']) != outstanding
+        ):
+            raise ValueError(f'{name}: unaccounted arrivals')
+    drain = result['arrival_accounting']['drain_end']
+    if (
+        result['backlog_at_end'] != drain['outstanding']
+        or result['offered_commits'] != drain['offered']
+        or result['achieved_commits'] != drain['completed']
+        or result['achieved_ratio'] != drain['completed'] / drain['offered']
+    ):
+        raise ValueError('aggregate arrival metrics do not reconcile')
+
+
+def _record_checkpoint(runtime: _Runtime, attempt: CheckpointAttempt, frame_bytes: int) -> None:
+    """Retain a classified checkpoint, including a bound-crossing attempt."""
+    runtime.checkpoints.append(
+        {
+            **asdict(attempt),
+            'frame_bytes': frame_bytes,
+            'wal_file_bytes': attempt.wal_bytes,
+        }
+    )
+
+
+def _record_diagnostic(
+    runtime: _Runtime, record: dict[str, Any], *, required: bool = False
+) -> None:
+    """Append within the per-process cap, counting every omitted diagnostic."""
+    if not runtime.spec.extra_timing and not required:
+        return
+    record.update(
+        role=runtime.spec.role,
+        pid=os.getpid(),
+        thread_id=threading.get_ident(),
+        thread_name=threading.current_thread().name,
+    )
+    with runtime.diagnostic_lock:
+        if not runtime.diagnostics.append_if_room(record, runtime.spec.diagnostic_cap):
+            runtime.diagnostic_overflow += 1
+
+
+@contextmanager
+def _diagnostic_span(runtime: _Runtime, kind: str, **details: object) -> Generator[dict[str, Any]]:
+    """Retain named boundaries on success and exception without changing the operation."""
+    record: dict[str, Any] = {'kind': kind, **details}
+    if not runtime.spec.extra_timing:
+        try:
+            yield record
+        finally:
+            if kind == 'writer-attempt' and record.get('outcome') != 'committed':
+                _record_diagnostic(runtime, record, required=True)
+        return
+    record['start'] = _clock_sample()
+    record['outcome'] = 'failed'
+    try:
+        yield record
+        if record['outcome'] == 'failed':
+            record['outcome'] = 'completed'
+    finally:
+        record['end'] = _clock_sample()
+        _record_diagnostic(runtime, record)
+
+
+def _checkpoint_factory(runtime: _Runtime, frame_bytes: int) -> Callable[..., Checkpointer]:
+    """Record production host attempts and newly crossed bounds without changing policy."""
+
+    class _Observed(Checkpointer):
+        """Retain the real checkpointer's outcome and bound transitions."""
+
+        def close(self) -> None:
+            """Record the owner thread's final close, even after an attempt failure."""
+            try:
+                super().close()
+            finally:
+                runtime.checkpoint_finished_at = time.monotonic()
+
+        def _checkpoint(self, mode: Literal['PASSIVE', 'TRUNCATE']) -> tuple[int, int, int]:
+            """Observe the SQLite call and result fetch, excluding timeout setup/restore."""
+            with runtime.phases.span(mode.lower(), self._phase_id):
+                return super()._checkpoint(mode)
+
+        def _sync(self) -> None:
+            """Observe fallback WAL sync, including its lazy descriptor open if needed."""
+            with runtime.phases.span('sync', self._phase_id):
+                super()._sync()
+
+        def run_once(self) -> CheckpointAttempt:
+            """Run production maintenance and append this attempt's gate measurements.
+
+            Returns:
+                The production checkpoint result after its measurements are
+                recorded.
+
+            Raises:
+                DatabaseError: A SQLite checkpoint operation fails.
+                OSError: The WAL file cannot be inspected or synchronized.
+                OverflowError: Retained diagnostic records exceed the unsigned
+                    offset representation.
+            """
+            crossed = self.crossed
+            self._phase_id = runtime.phases.identity()
+            with _diagnostic_span(runtime, 'checkpoint') as record:
+                if runtime.spec.extra_timing:
+                    record['phase_id'] = self._phase_id
+                attempt = super().run_once()
+            runtime.checkpoint_crossings += len(self.crossed - crossed)
+            _record_checkpoint(runtime, attempt, frame_bytes)
+            return attempt
+
+    def create(*args: object, **kwargs: object) -> Checkpointer:
+        checkpointer = cast('Callable[..., Checkpointer]', _Observed)(*args, **kwargs)
+        runtime.checkpoint_started_at = time.monotonic()
+        return checkpointer
+
+    return create
+
+
+@contextmanager
+def _diagnostic_session(runtime: _Runtime) -> Generator[None]:
+    """Scope GC callbacks to this process run and retain process boundary CPU samples."""
+    if not runtime.spec.extra_timing:
+        yield
+        return
+
+    def callback(phase: str, info: dict[str, int]) -> None:
+        _record_diagnostic(
+            runtime,
+            {'kind': 'gc', 'phase': phase, 'generation': info['generation'], **_clock_sample()},
+        )
+
+    gc.callbacks.append(callback)
+    try:
+        with _diagnostic_span(runtime, 'process'):
+            yield
+    finally:
+        gc.callbacks.remove(callback)
 
 
 @contextmanager
@@ -1565,17 +2211,24 @@ def _capacity_counts(connection: sqlite3.Connection) -> dict[str, int]:
 
 
 def _health_projection_read(
-    connection: sqlite3.Connection, group_name: str
+    connection: sqlite3.Connection,
+    group_name: str,
+    *,
+    late_ids: tuple[int, list[int]] | None = None,
 ) -> tuple[int, list[int], int, int]:
-    """Read missing count and ordered prefix, pending count, and audit count together."""
+    """Read current pending/audit counts with refreshed or cached late-ID display."""
     parameters = {'group': group_name}
     with _read_transaction(connection):
-        missing_count = connection.execute(UNRESOLVED_LATE_ID_COUNT_SQL, (group_name,)).fetchone()[
-            0
-        ]
-        missing_prefix = [
-            row[0] for row in connection.execute(UNRESOLVED_LATE_ID_PREFIX_SQL, (group_name, 100))
-        ]
+        if late_ids is None:
+            missing_count = connection.execute(
+                UNRESOLVED_LATE_ID_COUNT_SQL, (group_name,)
+            ).fetchone()[0]
+            missing_prefix = [
+                row[0]
+                for row in connection.execute(UNRESOLVED_LATE_ID_PREFIX_SQL, (group_name, 100))
+            ]
+        else:
+            missing_count, missing_prefix = late_ids
         pending = connection.execute(
             _SQL_HEALTH_PROJECTION_READ_SELECT_RANGE_GROUPS,
             parameters,
@@ -1592,7 +2245,7 @@ def _lane_refresh(connection: sqlite3.Connection, lane: _LaneState) -> bool:
         revision = int(connection.execute(_SQL_LANE_REFRESH_SELECT_SOURCE_META).fetchone()[0])
         generation = int(
             connection.execute(
-                _SQL_LANE_REFRESH_SELECT_GROUPS,
+                _SQL_SELECT_GROUP_GENERATION,
                 {'group': lane.group_name},
             ).fetchone()[0]
         )
@@ -1613,30 +2266,39 @@ def _lane_refresh(connection: sqlite3.Connection, lane: _LaneState) -> bool:
     return True
 
 
-def _lane_prepare(connection: sqlite3.Connection, lane: _LaneState) -> None:
-    """Refresh scan work and reset local delivery state when replay changes generation."""
+def _lane_prepare(
+    connection: sqlite3.Connection,
+    lane: _LaneState,
+    *,
+    now: float,
+    hinted: bool = False,
+    force: bool = False,
+) -> None:
+    """Service due coordination and rearm from completion, including replay recovery."""
+    if now < lane.next_coordination_at and not hinted and not force:
+        return
     generation = lane.generation
-    _lane_refresh(connection, lane)
-    if lane.generation != generation:
-        _lane_resume(connection, lane)
-        lane.arrivals = 0
-        lane.epoch_turn = 0
-        lane.next_snapshot_at = 0.0
+    try:
+        _lane_refresh(connection, lane)
+        if lane.generation != generation:
+            _lane_resume(connection, lane)
+            lane.arrivals = 0
+            lane.epoch_turn = 0
+            lane.next_snapshot_at = 0.0
+            lane.health_late_ids = None
+    finally:
+        lane.next_coordination_at = time.monotonic() + _FETCH_INTERVAL_SECS
 
 
 def _poller_reload(connection: sqlite3.Connection, poller: _PollerState) -> None:
     """Reload the poller's full source index in one read transaction."""
     with _read_transaction(connection):
-        poller.index_revision = int(
-            connection.execute(_SQL_POLLER_RELOAD_SELECT_SOURCE_META).fetchone()[0]
-        )
+        poller.index_revision = int(connection.execute(_SQL_SELECT_INDEX_REVISION).fetchone()[0])
         rows = connection.execute(_SQL_POLLER_RELOAD_SELECT_DISCOVERY_RANGES).fetchall()
         connection.execute(_SQL_POLLER_RELOAD_SELECT_RANGE_GROUPS).fetchall()
         connection.execute(_SQL_POLLER_RELOAD_SELECT_REPLAY_MARKERS).fetchall()
         connection.execute(_SQL_POLLER_RELOAD_SELECT_GROUPS).fetchall()
-        poller.frontier = int(
-            connection.execute(_SQL_POLLER_RELOAD_SELECT_SOURCE_META_2).fetchone()[0]
-        )
+        poller.frontier = int(connection.execute(_SQL_SELECT_FRONTIER).fetchone()[0])
     poller.open_ranges = [
         (str(identifier), int(low), int(high), float(deadline))
         for identifier, low, high, _, deadline, state in rows
@@ -1652,45 +2314,54 @@ def _poller_reload(connection: sqlite3.Connection, poller: _PollerState) -> None
     )
 
 
-def _reader_summary(reads: list[dict[str, Any]]) -> dict[str, Any]:
-    """Summarize read transaction durations and transitive concurrency."""
-    count, span = _overlap_chains([(record['start'], record['end']) for record in reads])
-    return {
-        'durations_ms': {
-            kind: _percentiles(
-                [
-                    (record['end'] - record['start']) * _MILLISECONDS
-                    for record in reads
-                    if record['kind'] == kind
-                ]
-            )
-            for kind in ('health-projection', 'snapshot', 'status')
-        },
-        'longest_overlap_chain': {'readers': count, 'span_secs': span},
-    }
-
-
-def _record_checkpoint(
-    runtime: _Runtime, checkpointer: Checkpointer, attempt: CheckpointAttempt, wal: Path
-) -> None:
-    """Retain a classified checkpoint, including a bound-crossing attempt."""
-    runtime.checkpoints.append(
-        {
-            **asdict(attempt),
-            'frame_bytes': checkpointer.frame_bytes,
-            'wal_file_bytes': wal.stat().st_size if wal.exists() else 0,
-        }
-    )
+@contextmanager
+def _range_hint_pipe(database_path: str, group: str) -> Generator[int]:
+    """Open one ephemeral body-free notification pipe shared by the cell's processes."""
+    path = Path(f'{database_path}.{group}.range-hint')
+    with suppress(FileExistsError):
+        os.mkfifo(path, mode=0o600)
+    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 
 def _record_read(runtime: _Runtime, kind: str, operation: Callable[[], object]) -> object:
-    """Time one complete read transaction and retain optional status counts."""
+    """Time complete reads, retaining both successful and exceptional exits."""
     started = time.monotonic()
-    result = operation()
-    runtime.reads.append(
-        {'kind': kind, 'start': started, 'end': time.monotonic(), 'counts': result}
-    )
-    return result
+    result: object = None
+    outcome = 'failed'
+    try:
+        with _diagnostic_span(runtime, 'read', reader=kind):
+            result = operation()
+        outcome = 'completed'
+        return result
+    finally:
+        runtime.reads.append(
+            {
+                'kind': kind,
+                'start': started,
+                'end': time.monotonic(),
+                'counts': result,
+                'outcome': outcome,
+            }
+        )
+
+
+def _record_rows(raw: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    """Require an array of objects without normalizing malformed evidence."""
+    return [
+        _metric_mapping(item, Path('<records>'), name)
+        for item in _metric_list(raw[name], Path('<records>'), name)
+    ]
+
+
+def _record_strings(value: object, name: str) -> None:
+    """Require an actual string array at a retained-record boundary."""
+    values = _metric_list(value, Path('<records>'), name)
+    if any(not isinstance(item, str) for item in values):
+        raise ValueError(f'invalid {name}: expected strings')
 
 
 def _repeat_identity(result: dict[str, Any]) -> dict[str, Any]:
@@ -1713,7 +2384,14 @@ def _repeat_identity(result: dict[str, Any]) -> dict[str, Any]:
     for name in ('environment', 'model', 'population'):
         if not isinstance(result[name], dict) or not result[name]:
             raise ValueError(f'invalid repeat identity {name}')
-    return {field: result[field] for field in fields}
+    identity = {field: result[field] for field in fields}
+    scenario = _SCENARIOS[result['cell']['scenario']]
+    nominal = _default_duration(scenario, _MIN_SAMPLES)
+    if not result['duration_override'] and math.isclose(
+        result['duration_secs'], nominal, rel_tol=0.0, abs_tol=1e-6
+    ):
+        identity['duration_secs'] = nominal
+    return identity
 
 
 def _result_eligible(result: dict[str, Any]) -> bool:
@@ -1721,10 +2399,12 @@ def _result_eligible(result: dict[str, Any]) -> bool:
     cell = result['cell']
     population = result['population']
     scenario = _SCENARIOS[cell['scenario']]
-    offered_rate = len(_GROUP_NAMES) * scenario.lane_rate + scenario.poller_rate
-    duration = max(_MIN_DURATION_SECS, _MIN_SAMPLES / offered_rate)
+    duration = _default_duration(scenario, _MIN_SAMPLES)
     if (
-        result['duration_secs'] < duration
+        (
+            result['duration_secs'] < duration
+            and not math.isclose(result['duration_secs'], duration, rel_tol=0.0, abs_tol=1e-6)
+        )
         or result.get('duration_override', False)
         or result['min_samples'] != _MIN_SAMPLES
         or result['checkpoint_interval_secs'] != DEFAULT_CHECKPOINT_INTERVAL_SECS
@@ -1732,8 +2412,14 @@ def _result_eligible(result: dict[str, Any]) -> bool:
         or population.get('population') != cell['population']
         or any(process['exit_status'] for process in result['processes'])
         or any('late-start' in process['errors'] for process in result['processes'])
+        or len(result['checkpointers']) != 1
         or any(
-            checkpoint['attempts'] < _MIN_DURATION_SECS for checkpoint in result['checkpointers']
+            checkpoint['halt'] is not None
+            or checkpoint['host_started_at'] is None
+            or checkpoint['host_started_at'] > result['start_at']
+            or checkpoint['host_finished_at'] is None
+            or checkpoint['host_finished_at'] < result['end_at']
+            for checkpoint in result['checkpointers']
         )
     ):
         return False
@@ -1746,56 +2432,95 @@ def _result_eligible(result: dict[str, Any]) -> bool:
     return _capacity_shape_eligible(shape, replay, result['duration_secs'])
 
 
+def _retained_process_records(
+    result: dict[str, Any],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Verify expected roles and hashes before consuming retained process evidence."""
+    expected = dict(_TOPOLOGIES[result['cell']['topology']])
+    manifest = _metric_list(result['record_manifest'], Path('<evidence>'), 'record_manifest')
+    if len(manifest) != len(expected):
+        raise ValueError('incomplete record_manifest')
+    records: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    seen: set[str] = set()
+    for item in manifest:
+        entry = _metric_mapping(item, Path('<evidence>'), 'manifest entry')
+        role = entry['role']
+        if role not in expected or role in seen:
+            raise ValueError('unexpected or duplicate manifest role')
+        seen.add(role)
+        pair: list[dict[str, Any]] = []
+        for kind in ('spec', 'raw'):
+            content = Path(entry[f'{kind}_path']).read_bytes()
+            if hashlib.sha256(content).hexdigest() != entry[f'{kind}_sha256']:
+                raise ValueError(f'{role}: {kind} hash mismatch')
+            data = _metric_mapping(json.loads(content), Path(entry[f'{kind}_path']), kind)
+            if data['role'] != role or tuple(data['lanes']) != expected[role]:
+                raise ValueError(f'{role}: {kind} identity mismatch')
+            pair.append(data)
+        records.append((pair[0], pair[1]))
+    return records
+
+
+def _retention_summary(run: _CellRun, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Check every expected process output against the exact collected records."""
+    errors: list[str] = []
+    manifest: list[dict[str, Any]] = []
+    if run.directory is None:
+        return {
+            'evidence_complete': False,
+            'evidence_errors': ['no retained directory'],
+            'record_manifest': manifest,
+        }
+    specs = _cell_specs(run, run.directory)
+    by_role = {record['role']: record for record in records}
+    if len(records) != len(specs) or len(by_role) != len(records):
+        errors.append('incomplete or duplicate collected process roles')
+    for spec in specs:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            'child',
+            '--spec',
+            str(run.directory / f'{spec.role}-spec.json'),
+        ]
+        entry: dict[str, Any] = {
+            'role': spec.role,
+            'command': command if spec.role != 'site' else [sys.executable, *sys.argv],
+            'entry_point': '_run_process',
+        }
+        for kind, path in [
+            ('spec', run.directory / f'{spec.role}-spec.json'),
+            ('raw', Path(spec.output_path)),
+        ]:
+            entry[f'{kind}_path'] = str(path.resolve())
+            try:
+                content = path.read_bytes()
+                entry[f'{kind}_sha256'] = hashlib.sha256(content).hexdigest()
+            except OSError as exc:
+                errors.append(f'{spec.role}: {kind}: {exc}')
+        raw = by_role.get(spec.role, {})
+        errors.extend(f'{spec.role}: {error}' for error in raw.get('evidence_errors', []))
+        if raw.get('errors') or raw.get('exit_status'):
+            errors.append(f'{spec.role}: process failed')
+        manifest.append(entry)
+    return {
+        'evidence_complete': not errors,
+        'evidence_errors': errors,
+        'record_manifest': manifest,
+    }
+
+
 def _retryable_failure(runtime: _Runtime, timing: WriteTiming, exc: DatabaseError) -> bool:
     """Count only acquisition failures as recoverable without advancing model state."""
     if not math.isnan(timing.begun_at):
         return False
     if isinstance(exc, WriteLockTimeoutError):
-        runtime.wait_timeouts.append(exc.level)
+        runtime.expired_attempts.append(exc.level)
         return True
     if 'database is locked' in str(exc).lower():
         runtime.busy_timeouts += 1
         return True
     return isinstance(exc, WriteLockStoppedError) and runtime.stop.is_set()
-
-
-def _attempt_write(
-    runtime: _Runtime, connection: sqlite3.Connection, writer: _Writer, scheduled: float
-) -> bool:
-    """Record one committed arrival or safely classify a pre-BEGIN failure."""
-    timing = WriteTiming()
-    deadline = runtime.spec.end_at + _DRAIN_SECS
-    try:
-        if writer.before is not None:
-            writer.before(connection, scheduled)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or runtime.stop.is_set():
-            return False
-        budget = min(
-            remaining,
-            write_lock_timeout_secs(_HEALTH_INTERVAL_SECS, _SUPERVISOR_POLL_INTERVAL_SECS),
-        )
-        with runtime.lock.transaction(
-            connection, timing=timing, budget_secs=budget, stop=runtime.stop
-        ):
-            kind = writer.perform(
-                connection, runtime.spec.harness_clock_start + scheduled - runtime.spec.start_at
-            )
-    except DatabaseError as exc:
-        if _retryable_failure(runtime, timing, exc):
-            return False
-        raise
-    if timing.finished_at > deadline:
-        return False
-    if writer.maintenance:
-        runtime.restore_commits += 1
-    else:
-        runtime.commits.append(
-            {'writer': writer.name, 'class': kind, 'scheduled_at': scheduled, **asdict(timing)}
-        )
-    if writer.after is not None:
-        writer.after(connection)
-    return True
 
 
 def _revision(connection: sqlite3.Connection, group_name: str) -> int:
@@ -1929,7 +2654,7 @@ def _seed_closed_ranges(connection: sqlite3.Connection) -> None:
                 for group in _GROUP_NAMES
             ],
         )
-        first = index * DEFAULT_MAX_SOURCE_LATE_IDS // closed_count
+        first = index * DEFAULT_MAX_LATE_IDS_PER_GROUP // closed_count
         last = (index + 1) * DEFAULT_MAX_LATE_IDS_PER_GROUP // closed_count
         late = [(obligation, low + 2 + offset) for offset in range(last - first)]
         connection.executemany(
@@ -1958,7 +2683,7 @@ def _seed_cap_stress(path: Path) -> None:
     )
     connection = handle.connection
     try:
-        connection.execute(_SQL_SEED_CAP_STRESS_BEGIN_TRANSACTION)
+        connection.execute(_SQL_BEGIN_IMMEDIATE)
         try:
             _seed_base(connection, strict_groups=_STRICT_GROUPS)
             connection.execute(_SQL_SEED_CAP_STRESS_UPDATE_SOURCE_META)
@@ -1972,7 +2697,7 @@ def _seed_cap_stress(path: Path) -> None:
         except BaseException:
             connection.rollback()
             raise
-        checkpoint = connection.execute(_SQL_SEED_CAP_STRESS_PRAGMA_WAL_CHECKPOINT).fetchone()
+        checkpoint = connection.execute(_SQL_WAL_CHECKPOINT_TRUNCATE).fetchone()
         if checkpoint is None or checkpoint[0] != 0:
             raise RuntimeError('cap-stress WAL checkpoint was busy')
     finally:
@@ -1994,14 +2719,26 @@ def _snapshot_read(connection: sqlite3.Connection, group_name: str) -> None:
 
 
 def _lane_health(runtime: _Runtime, connection: sqlite3.Connection, lane: _LaneState) -> None:
-    """Project health after each commit, refreshing its full snapshot when due."""
+    """Keep cheap fields current and refresh late-ID display on the projection grid."""
     now = time.monotonic()
-    if now >= lane.next_snapshot_at:
+    due = now >= lane.next_snapshot_at
+    if due:
         _record_read(runtime, 'snapshot', lambda: _snapshot_read(connection, lane.group_name))
-        lane.next_snapshot_at = time.monotonic() + _HEALTH_INTERVAL_SECS
-    _record_read(
-        runtime, 'health-projection', lambda: _health_projection_read(connection, lane.group_name)
-    )
+
+    def project() -> tuple[int, list[int], int, int]:
+        projection = _health_projection_read(
+            connection, lane.group_name, late_ids=None if due else lane.health_late_ids
+        )
+        lane.health_late_ids = projection[:2]
+        return projection
+
+    _record_read(runtime, 'health-projection', project)
+    if due:
+        if lane.next_snapshot_at <= 0.0:
+            lane.next_snapshot_at = now + _HEALTH_INTERVAL_SECS
+        else:
+            intervals = math.floor((now - lane.next_snapshot_at) / _HEALTH_INTERVAL_SECS) + 1
+            lane.next_snapshot_at += intervals * _HEALTH_INTERVAL_SECS
 
 
 def _status_read(connection: sqlite3.Connection) -> dict[str, int]:
@@ -2009,12 +2746,12 @@ def _status_read(connection: sqlite3.Connection) -> dict[str, int]:
     with _read_transaction(connection):
         meta = connection.execute(_SQL_STATUS_READ_SELECT_SOURCE_META).fetchall()
         audit = connection.execute(_SQL_STATUS_READ_SELECT_AUDIT).fetchall()
-        disposition = connection.execute(_SQL_STATUS_READ_SELECT_DISPOSITION_AUDIT).fetchone()
-        adoptions = connection.execute(_SQL_STATUS_READ_SELECT_STREAM_ADOPTIONS).fetchone()
+        disposition = connection.execute(_COUNT_SQL['disposition_audit']).fetchone()
+        adoptions = connection.execute(_COUNT_SQL['stream_adoptions']).fetchone()
         ranges = connection.execute(_SQL_STATUS_READ_SELECT_DISCOVERY_RANGES).fetchall()
-        pending = connection.execute(_SQL_STATUS_READ_SELECT_RANGE_GROUPS).fetchall()
-        source_late = connection.execute(_SQL_STATUS_READ_SELECT_SOURCE_LATE_IDS).fetchone()
-        late = connection.execute(_SQL_STATUS_READ_SELECT_LATE_IDS).fetchone()
+        pending = connection.execute(_SQL_SELECT_PENDING_RANGE_GROUP_COUNTS).fetchall()
+        source_late = connection.execute(_COUNT_SQL['source_late_ids']).fetchone()
+        late = connection.execute(_COUNT_SQL['late_ids']).fetchone()
     counts = {
         'source_meta': len(meta),
         'audit': sum(int(count) for _, count in audit),
@@ -2095,12 +2832,10 @@ def _lane_arrival(connection: sqlite3.Connection, lane: _LaneState, now: float) 
 
 def _lane_guarded_arrival(connection: sqlite3.Connection, lane: _LaneState, now: float) -> str:
     """Validate prepared delivery and scan state inside the write transaction."""
-    generation, revision = connection.execute(
-        'SELECT g.group_generation, s.range_revision FROM groups g CROSS JOIN source_meta s '
-        'WHERE g.group_name = ? AND s.singleton = 1',
-        (lane.group_name,),
-    ).fetchone()
-    if generation != lane.generation or revision != lane.revision_seen:
+    generation = connection.execute(
+        _SQL_SELECT_GROUP_GENERATION, {'group': lane.group_name}
+    ).fetchone()[0]
+    if generation != lane.generation:
         raise _LaneChangedError
     return _lane_arrival(connection, lane, now)
 
@@ -2146,6 +2881,8 @@ def _summary_metadata(run: _CellRun) -> dict[str, Any]:
         'population': run.population,
         'gate_eligible': False,
         'repetition': run.options.repetition,
+        'start_at': run.start_at,
+        'end_at': run.end_at,
         'duration_secs': run.end_at - run.start_at,
         'duration_override': run.options.duration_secs is not None,
         'min_samples': run.options.min_samples,
@@ -2154,7 +2891,7 @@ def _summary_metadata(run: _CellRun) -> dict[str, Any]:
     if run.cell.scenario == 'catchup':
         result['catchup_burst_secs'] = sum(
             end - start
-            for start, end, rate in _SCENARIOS['catchup']._segments(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+            for start, end, rate in _SCENARIOS['catchup'].segments(
                 _CATCHUP_GROUPS[0], run.end_at - run.start_at
             )
             if rate > _SCENARIOS['catchup'].lane_rate
@@ -2162,109 +2899,30 @@ def _summary_metadata(run: _CellRun) -> dict[str, Any]:
     return result
 
 
-def _summarize(run: _CellRun, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate every process's samples without excluding offered drain arrivals."""
-    commits = [commit for record in records for commit in record['commits']]
-    reads = [read for record in records for read in record['reads']]
-    checkpoints = [attempt for record in records for attempt in record['checkpoints']]
-    ordinary = [commit for commit in commits if commit['class'] != 'lifecycle']
-    offered = sum(record['offered'] for record in records)
-    timeouts: Counter[str] = Counter()
-    for record in records:
-        timeouts.update(record['wait_timeouts'])
-    result = _summary_metadata(run)
-    result.update(
-        {
-            'drain_secs': min(
-                _DRAIN_SECS,
-                max(
-                    0.0,
-                    max((record['finished_at'] for record in records), default=run.end_at)
-                    - run.end_at,
-                ),
-            ),
-            'commit_latency_ms': _metric(ordinary, 'finished_at', 'scheduled_at'),
-            'all_commit_latency_ms': _metric(commits, 'finished_at', 'scheduled_at'),
-            'commit_latency_ms_by_class': {
-                kind: _metric(
-                    [record for record in commits if record['class'] == kind],
-                    'finished_at',
-                    'scheduled_at',
-                )
-                for kind in sorted({record['class'] for record in commits})
-            },
-            'wait_timeouts': dict(timeouts),
-            'busy_timeouts': sum(record['busy_timeouts'] for record in records),
-            'offered_commits': offered,
-            'achieved_commits': len(commits),
-            'achieved_ratio': len(commits) / offered if offered else 0.0,
-            'backlog_at_end': offered - len(commits),
-            'index_reloads': sum(record['index_reloads'] for record in records),
-            'full_lifecycle_latency_ms': _metric(
-                [record for record in commits if record['class'] == 'lifecycle'],
-                'finished_at',
-                'scheduled_at',
-            )
-            if run.cell.scenario == 'lifecycle'
-            else None,
-        }
-    )
-    for key, finish, start in [
-        ('acquisition_ms', 'begun_at', 'started_at'),
-        ('service_ms', 'finished_at', 'begun_at'),
-        ('process_local_wait_ms', 'local_acquired_at', 'started_at'),
-        ('file_wait_ms', 'file_acquired_at', 'local_acquired_at'),
-        ('sqlite_wait_ms', 'begun_at', 'file_acquired_at'),
-    ]:
-        result[key] = _metric(commits, finish, start)
-    result.update(
-        {
-            'checkpointers': [
-                {
-                    'role': record['role'],
-                    **_checkpoint_summary(
-                        record['checkpoints'],
-                        run.start_at,
-                        min(run.end_at, record['finished_at']),
-                        run.options.checkpoint_interval_secs,
-                    ),
-                    'halt': record['checkpoint_halt'],
-                }
-                for record in records
-            ],
-            'peak_wal_bytes_in_use': max(
-                (
-                    attempt['result'][1] * attempt['frame_bytes']
-                    for attempt in checkpoints
-                    if attempt['outcome'] != 'contended'
-                ),
-                default=0,
-            ),
-            'peak_wal_file_bytes': max(
-                (attempt['wal_file_bytes'] for attempt in checkpoints), default=0
-            ),
-            'readers': _reader_summary(reads),
-            'population_during_run': _population_summary(reads),
-            'capacity_replays': _capacity_summary(run.cell, records),
-            'processes': [
-                {
-                    key: record[key]
-                    for key in (
-                        'role',
-                        'lanes',
-                        'exit_status',
-                        'peak_rss_bytes',
-                        'peak_open_fds',
-                        'errors',
-                        'health_projection_reads',
-                    )
-                }
-                for record in records
-            ],
-        }
-    )
-    result['gate_eligible'] = _result_eligible(result)
-    return result
+def _take_range_hint(fd: int) -> bool:
+    """Coalesce queued notifications without making durable refresh depend on them."""
+    try:
+        return bool(os.read(fd, 65536))
+    except BlockingIOError:
+        return False
+
+
+def _lane_wait(
+    runtime: _Runtime,
+    connection: sqlite3.Connection,
+    lane: _LaneState,
+    hint_fd: int,
+    scheduled: float,
+) -> bool:
+    """Service idle coordination ticks and hints without changing offered arrivals."""
+    while not runtime.stop.is_set():
+        now = time.monotonic()
+        if now >= scheduled:
+            return True
+        _lane_prepare(connection, lane, now=now, hinted=_take_range_hint(hint_fd))
+        delay = max(0.0, min(scheduled, lane.next_coordination_at) - time.monotonic())
+        select.select([hint_fd], [], [], min(delay, 0.1))
+    return False
 
 
 def _thread_entry(runtime: _Runtime, job: _ThreadJob) -> None:
@@ -2274,6 +2932,123 @@ def _thread_entry(runtime: _Runtime, job: _ThreadJob) -> None:
             _run_thread_job(runtime, job)
         finally:
             job.ready.set()
+
+
+def _timed_write(
+    runtime: _Runtime,
+    connection: sqlite3.Connection,
+    writer: _Writer,
+    scheduled: float,
+    record: dict[str, Any],
+) -> bool:
+    """Capture exposed timing only, with transaction exit as the release upper bound."""
+    timing = WriteTiming()
+    deadline = runtime.spec.end_at + _DRAIN_SECS
+    record.update(drain_deadline=deadline, acquisition_deadline=None, level='pre-acquisition')
+    try:
+        if writer.before is not None:
+            writer.before(connection, scheduled)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or runtime.stop.is_set():
+            record['outcome'] = 'stopped' if runtime.stop.is_set() else 'drain-terminated'
+            return False
+        budget = min(
+            remaining,
+            write_lock_timeout_secs(_HEALTH_INTERVAL_SECS, _SUPERVISOR_POLL_INTERVAL_SECS),
+        )
+        record['acquisition_deadline'] = time.monotonic() + budget
+        try:
+            observed = (
+                cast(
+                    'sqlite3.Connection',
+                    _ConnectionObserver(connection, runtime.phases, record['phase_id']),
+                )
+                if runtime.spec.extra_timing
+                else connection
+            )
+            with runtime.lock.transaction(
+                observed, timing=timing, budget_secs=budget, stop=runtime.stop
+            ):
+                record['level'] = 'transaction'
+                if runtime.spec.extra_timing:
+                    record['ownership_observed'] = _clock_sample()
+                with runtime.phases.span('body', record.get('phase_id', 0)):
+                    kind = writer.perform(
+                        connection,
+                        runtime.spec.harness_clock_start + scheduled - runtime.spec.start_at,
+                    )
+        finally:
+            record['release_upper_bound'] = time.monotonic()
+            if not math.isnan(timing.started_at):
+                record['acquisition_deadline'] = timing.started_at + budget
+        record['outcome'] = 'committed' if timing.finished_at <= deadline else 'late-commit'
+    except (_IndexChangedError, _LaneChangedError):
+        record['outcome'] = 'rejected'
+        record['level'] = 'transaction'
+        raise
+    except DatabaseError as exc:
+        record['level'] = getattr(exc, 'level', 'unexposed')
+        record['outcome'] = (
+            'acquisition-expired'
+            if isinstance(exc, WriteLockTimeoutError)
+            else 'stopped'
+            if isinstance(exc, WriteLockStoppedError)
+            else 'database-error'
+        )
+        if _retryable_failure(runtime, timing, exc):
+            return False
+        raise
+    finally:
+        record['timing'] = {
+            key: None if math.isnan(value) else value for key, value in asdict(timing).items()
+        }
+    if writer.maintenance:
+        runtime.restore_commits += int(timing.finished_at <= deadline)
+    else:
+        runtime.commits.append(
+            {
+                'writer': writer.name,
+                'class': kind,
+                'scheduled_at': scheduled,
+                'arrival_id': record['arrival_id'],
+                **asdict(timing),
+            }
+        )
+    if writer.after is not None:
+        writer.after(connection)
+    return timing.finished_at <= deadline
+
+
+def _attempt_write(
+    runtime: _Runtime,
+    connection: sqlite3.Connection,
+    writer: _Writer,
+    scheduled: float,
+    ordinal: int = 0,
+) -> bool:
+    """Keep every attempted arrival and every commit, including a late completion."""
+    previous, number = runtime.writer_attempts.get(writer.name, (scheduled, 0))
+    number = number + 1 if previous == scheduled else 1
+    runtime.writer_attempts[writer.name] = (scheduled, number)
+    identity = f'{runtime.spec.role}:{writer.name}:{ordinal}'
+    with _diagnostic_span(
+        runtime,
+        'writer-attempt',
+        writer=writer.name,
+        arrival_id=identity,
+        scheduled_at=scheduled,
+        attempt=number,
+    ) as record:
+        if runtime.spec.extra_timing:
+            record['phase_id'] = runtime.phases.identity()
+        return _timed_write(runtime, connection, writer, scheduled, record)
+
+
+def _record_integer(value: object, name: str, *, minimum: int = 0) -> int:
+    """Reject booleans and noninteger record counts before arithmetic."""
+    if type(value) is not int or value < minimum:
+        raise ValueError(f'invalid {name}: expected integer >= {minimum}')
+    return value
 
 
 def _unit(seed: str, index: int) -> float:
@@ -2317,6 +3092,140 @@ def _poller_plan(poller: _PollerState, now: float) -> _PollPlan:
     return plan
 
 
+def _validate_child_reads(raw: dict[str, Any]) -> None:
+    """Validate read spans and status counts before reader/population summaries."""
+    for read in _record_rows(raw, 'reads'):
+        if not isinstance(read['kind'], str):
+            raise TypeError('invalid read kind')
+        for name in ('start', 'end'):
+            _metric_number(read[name], Path('<records>'), name)
+        if read['kind'] == 'status' and read.get('outcome') != 'failed':
+            for count in _metric_mapping(read['counts'], Path('<records>'), 'counts').values():
+                _record_integer(count, 'status count')
+
+
+def _validate_child_rows(raw: dict[str, Any]) -> None:
+    """Validate nested workload rows used before evidence reconciliation."""
+    for commit in _record_rows(raw, 'commits'):
+        for name in ('writer', 'class', 'arrival_id'):
+            if not isinstance(commit[name], str):
+                raise TypeError(f'invalid commit {name}')
+        for name in (
+            'scheduled_at',
+            'started_at',
+            'local_acquired_at',
+            'file_acquired_at',
+            'begun_at',
+            'finished_at',
+        ):
+            _metric_number(commit[name], Path('<records>'), name)
+    for arrival in _record_rows(raw, 'offered_arrivals'):
+        if not isinstance(arrival['arrival_id'], str):
+            raise TypeError('invalid arrival identity')
+        _metric_number(arrival['scheduled_at'], Path('<records>'), 'scheduled_at')
+    _validate_child_reads(raw)
+    for replay in _record_rows(raw, 'capacity_replays'):
+        for name in ('finished_at', 'scheduled_at', 'late_ids', 'pending'):
+            _metric_number(replay[name], Path('<records>'), name)
+
+
+def _validate_clock_sample(value: object) -> dict[str, Any]:
+    """Require finite nonnegative values from each separately named clock."""
+    sample = _metric_mapping(value, Path('<diagnostics>'), 'clock sample')
+    for key in ('monotonic', 'process_cpu', 'thread_cpu'):
+        _metric_number(sample[key], Path('<diagnostics>'), key)
+    return sample
+
+
+def _validate_diagnostic_outcome(record: dict[str, Any]) -> None:
+    """Require producer outcome names even when extra timing was disabled."""
+    if record['kind'] in ('gc', 'process-sample'):
+        return
+    outcomes = (
+        (
+            'committed',
+            'late-commit',
+            'rejected',
+            'acquisition-expired',
+            'stopped',
+            'drain-terminated',
+            'database-error',
+            'failed',
+        )
+        if record['kind'] == 'writer-attempt'
+        else ('completed', 'failed')
+    )
+    if record['outcome'] not in outcomes:
+        raise ValueError('invalid diagnostic outcome')
+
+
+def _validate_diagnostic_record(record: dict[str, Any], role: str, *, enabled: bool) -> None:
+    """Check identities and exposed timing boundaries without inferring hidden phases."""
+    kind = record['kind']
+    if kind not in ('process', 'writer-attempt', 'read', 'checkpoint', 'gc', 'process-sample'):
+        raise ValueError('unknown diagnostic kind')
+    if record['role'] != role or not isinstance(record['thread_name'], str):
+        raise ValueError('invalid diagnostic identity')
+    for key in ('pid', 'thread_id'):
+        _record_integer(record[key], key, minimum=1)
+    _validate_diagnostic_outcome(record)
+    if not enabled:
+        if kind != 'writer-attempt' or record['outcome'] == 'committed':
+            raise ValueError('unexpected disabled-timing record')
+        return
+    if kind in ('gc', 'process-sample'):
+        _validate_clock_sample(record)
+        if kind == 'gc' and (
+            record['phase'] not in ('start', 'stop')
+            or _record_integer(record['generation'], 'GC generation') not in (0, 1, 2)
+        ):
+            raise ValueError('invalid GC record')
+        return
+    start = _validate_clock_sample(record['start'])
+    end = _validate_clock_sample(record['end'])
+    if any(end[key] < start[key] for key in ('monotonic', 'process_cpu', 'thread_cpu')):
+        raise ValueError('reversed diagnostic span')
+
+
+def _diagnostic_records(spec: dict[str, Any], raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate diagnostic configuration and bounded storage independently of flags."""
+    if type(spec['extra_timing']) is not bool or raw['extra_timing'] is not spec['extra_timing']:
+        raise ValueError('inconsistent diagnostic timing configuration')
+    cap = _record_integer(spec['diagnostic_cap'], 'spec diagnostic cap', minimum=1)
+    if _record_integer(raw['diagnostic_cap'], 'raw diagnostic cap', minimum=1) != cap:
+        raise ValueError('inconsistent diagnostic cap')
+    _record_integer(raw['diagnostic_overflow'], 'diagnostic overflow')
+    if type(raw['evidence_complete']) is not bool:
+        raise ValueError('invalid raw evidence completeness')
+    _record_strings(raw['evidence_errors'], 'evidence_errors')
+    records = _record_rows(raw, 'diagnostics')
+    if len(records) > cap:
+        raise ValueError('diagnostic record count exceeds cap')
+    for record in records:
+        _validate_diagnostic_record(record, raw['role'], enabled=spec['extra_timing'])
+    return records
+
+
+def _validate_diagnostic_evidence(
+    spec: dict[str, Any],
+    raw: dict[str, Any],
+    *,
+    required: bool,
+) -> None:
+    """Reject truncated, contradictory or absent required timing in retained evidence."""
+    records = _diagnostic_records(spec, raw)
+    if (
+        raw['diagnostic_overflow']
+        or raw['evidence_complete'] is not True
+        or raw['evidence_errors']
+    ):
+        raise ValueError('incomplete raw diagnostic evidence')
+    if required and not spec['extra_timing']:
+        raise ValueError(f'cell {_DIAGNOSTIC_CELL} requires diagnostic timing')
+    if spec['extra_timing'] and not any(record['kind'] == 'process' for record in records):
+        raise ValueError('missing process timing span')
+
+
 def _validate_external_capacity(result: dict[str, Any], path: Path) -> None:
     """Validate cap-shape and replay values consumed by eligibility checks."""
     if result['cell']['population'] != 'cap-stress':
@@ -2348,15 +3257,7 @@ def _validate_external_latencies(result: dict[str, Any], path: Path) -> None:
         value = _metric_mapping(result.get(name), path, name)
         for key in keys:
             _metric_number(value.get(key), path, f'{name}.{key}')
-    for name in (
-        *required,
-        'full_lifecycle_latency_ms',
-        'acquisition_ms',
-        'service_ms',
-        'process_local_wait_ms',
-        'file_wait_ms',
-        'sqlite_wait_ms',
-    ):
+    for name in _AGGREGATED_LATENCY_METRICS:
         if result.get(name) is not None:
             _validate_numeric_mapping(result[name], path, name)
     for kind, value in _metric_mapping(
@@ -2367,11 +3268,17 @@ def _validate_external_latencies(result: dict[str, Any], path: Path) -> None:
 
 def _validate_external_metrics(result: dict[str, Any], path: Path) -> None:
     """Validate nested values used by gate eligibility and repeat aggregation."""
-    for name in ('achieved_ratio', 'backlog_at_end', 'busy_timeouts', 'peak_wal_bytes_in_use'):
+    for name in (
+        'start_at',
+        'end_at',
+        'achieved_ratio',
+        'backlog_at_end',
+        'busy_timeouts',
+        'peak_wal_bytes_in_use',
+        'peak_wal_file_bytes',
+    ):
         _metric_number(result.get(name), path, name)
-    if 'peak_wal_file_bytes' in result:
-        _metric_number(result['peak_wal_file_bytes'], path, 'peak_wal_file_bytes')
-    _validate_numeric_mapping(result.get('wait_timeouts'), path, 'wait_timeouts')
+    _validate_numeric_mapping(result.get('expired_attempts'), path, 'expired_attempts')
     checkpoints = result.get('checkpointers')
     if not isinstance(checkpoints, list):
         raise _InvalidResultError(f'{path}: invalid result checkpointers: expected list')
@@ -2379,6 +3286,9 @@ def _validate_external_metrics(result: dict[str, Any], path: Path) -> None:
         field = f'checkpointers[{index}]'
         checkpoint = _metric_mapping(item, path, field)
         _metric_number(checkpoint.get('longest_uncleared_intervals'), path, field)
+        _metric_number(checkpoint.get('host_started_at'), path, field + '.host_started_at')
+        _metric_number(checkpoint.get('host_finished_at'), path, field + '.host_finished_at')
+        _metric_number(checkpoint.get('bound_crossings'), path, field + '.bound_crossings')
         if 'halt' not in checkpoint or not isinstance(checkpoint['halt'], (str, type(None))):
             raise ValueError(f'{path}: invalid result {field}.halt')
     _validate_external_latencies(result, path)
@@ -2431,6 +3341,13 @@ def _read_result_files(paths: list[Path]) -> list[dict[str, Any]]:
     results = [json.loads(file.read_text()) for file in files]
     for path, result in zip(files, results, strict=True):
         _validate_external_result(result, path)
+        manifest = result.get('record_manifest')
+        for item in cast('list[Any]', manifest) if isinstance(manifest, list) else []:
+            if isinstance(item, dict):
+                entry = cast('dict[str, Any]', item)
+                for key in ('spec_path', 'raw_path'):
+                    if isinstance(entry.get(key), str):
+                        entry[key] = str(path.parent / entry[key])
     return results
 
 
@@ -2488,7 +3405,7 @@ def _validate_repeat_sections(identity: dict[str, Any]) -> None:
 def _validate_repetitions(results: list[dict[str, Any]]) -> None:
     """Require distinct numbered runs before a cell can reach a final verdict."""
     if len(results) > _MAX_REPEAT_RUNS:
-        raise ValueError('at most three results per cell')
+        raise ValueError(f'at most {_MAX_REPEAT_RUNS} results per cell')
     identities = [_repeat_identity(result) for result in results]
     if len(identities) > 1:
         for identity in identities:
@@ -2502,13 +3419,323 @@ def _validate_repetitions(results: list[dict[str, Any]]) -> None:
         type(number) is not int or number not in range(1, _MAX_REPEAT_RUNS + 1)
         for number in repetitions
     ):
-        raise ValueError('result repetitions must be numbered 1, 2, or 3')
+        raise ValueError(f'result repetitions must be numbered 1 through {_MAX_REPEAT_RUNS}')
     if len(set(repetitions)) != len(repetitions):
         raise ValueError('duplicate result repetition for one cell')
     if len(results) == _MAX_REPEAT_RUNS and set(repetitions) != set(
         range(1, _MAX_REPEAT_RUNS + 1)
     ):
-        raise ValueError('three results require repetitions 1, 2, and 3')
+        raise ValueError(
+            f'{_MAX_REPEAT_RUNS} results require repetitions 1 through {_MAX_REPEAT_RUNS}'
+        )
+
+
+def _validated_checkpoint_records(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate retained checkpoint fields before reconstructing eligibility and WAL metrics."""
+    attempts = _metric_list(raw['checkpoints'], Path('<evidence>'), 'checkpoints')
+    records: list[dict[str, Any]] = []
+    previous = 0.0
+    for value in attempts:
+        attempt = _metric_mapping(value, Path('<evidence>'), 'checkpoint')
+        for name in ('finished_at', 'wal_file_bytes', 'frame_bytes'):
+            _metric_number(attempt[name], Path('<evidence>'), f'checkpoint.{name}')
+        frames = _metric_list(attempt['result'], Path('<evidence>'), 'checkpoint.result')
+        if len(frames) != _CHECKPOINT_RESULT_FIELDS or any(
+            type(number) is not int or number < -1 for number in frames
+        ):
+            raise ValueError('invalid checkpoint result')
+        if attempt['outcome'] not in {
+            'complete',
+            'reset-observed',
+            'contended',
+            'partial-no-progress',
+            'partial-progress',
+        } or attempt['reuse'] not in {'reused', 'reuse-busy'}:
+            raise ValueError('invalid checkpoint outcome')
+        if attempt['finished_at'] < previous or attempt['frame_bytes'] <= 0:
+            raise ValueError('invalid checkpoint ordering or frame size')
+        previous = attempt['finished_at']
+        records.append(attempt)
+    return records
+
+
+def _reconcile_checkpoint_evidence(
+    result: dict[str, Any], records: list[tuple[dict[str, Any], dict[str, Any]]]
+) -> None:
+    """Recompute the owner's checkpoint summary and WAL peaks from retained observations."""
+    interval = result['checkpoint_interval_secs']
+    _metric_number(interval, Path('<evidence>'), 'checkpoint_interval_secs')
+    if interval <= 0 or len(result['checkpointers']) != 1:
+        raise ValueError('invalid checkpoint interval or owner summary')
+    summary = result['checkpointers'][0]
+    for spec, raw in records:
+        owner = raw['role'] == 'site'
+        if raw['checkpoint_owner'] is not owner:
+            raise ValueError('invalid checkpoint ownership')
+        attempts = _validated_checkpoint_records(raw)
+        if not owner:
+            if attempts:
+                raise ValueError('unexpected non-owner checkpoint records')
+            continue
+        if not attempts or type(summary['attempts']) is not int:
+            raise ValueError('missing checkpoints or invalid checkpoint attempt count')
+        expected = _checkpoint_summary(
+            attempts, spec['start_at'], min(spec['end_at'], raw['finished_at']), interval
+        )
+        if any(summary.get(key) != value for key, value in expected.items()):
+            raise ValueError('checkpoint summary does not reconcile')
+        if (
+            summary.get('host_started_at') != raw['checkpoint_started_at']
+            or summary.get('host_finished_at') != raw['checkpoint_finished_at']
+            or summary.get('halt') != raw['checkpoint_halt']
+        ):
+            raise ValueError('checkpoint host lifespan does not reconcile')
+        peaks = {
+            'peak_wal_file_bytes': max(attempt['wal_file_bytes'] for attempt in attempts),
+            'peak_wal_bytes_in_use': max(
+                (
+                    attempt['result'][1] * attempt['frame_bytes']
+                    for attempt in attempts
+                    if attempt['outcome'] != 'contended'
+                ),
+                default=0,
+            ),
+        }
+        if any(result[key] != value for key, value in peaks.items()):
+            raise ValueError('checkpoint WAL summary does not reconcile')
+
+
+def _summarize(run: _CellRun, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate every process's samples without excluding offered drain arrivals."""
+    commits = [
+        commit
+        for record in records
+        for commit in record['commits']
+        if commit['finished_at'] <= run.end_at + _DRAIN_SECS
+    ]
+    reads = [read for record in records for read in record['reads']]
+    checkpoints = [attempt for record in records for attempt in record['checkpoints']]
+    ordinary = [commit for commit in commits if commit['class'] != 'lifecycle']
+    timeouts: Counter[str] = Counter()
+    for record in records:
+        timeouts.update(record['expired_attempts'])
+    result = _summary_metadata(run)
+    result.update(
+        {
+            'drain_secs': min(
+                _DRAIN_SECS,
+                max(
+                    0.0,
+                    max((record['finished_at'] for record in records), default=run.end_at)
+                    - run.end_at,
+                ),
+            ),
+            'commit_latency_ms': _metric(ordinary, 'finished_at', 'scheduled_at'),
+            'all_commit_latency_ms': _metric(commits, 'finished_at', 'scheduled_at'),
+            'commit_latency_ms_by_class': {
+                kind: _metric(
+                    [record for record in commits if record['class'] == kind],
+                    'finished_at',
+                    'scheduled_at',
+                )
+                for kind in sorted({record['class'] for record in commits})
+            },
+            'expired_attempts': dict(timeouts),
+            'busy_timeouts': sum(record['busy_timeouts'] for record in records),
+            'index_reloads': sum(record['index_reloads'] for record in records),
+            'full_lifecycle_latency_ms': _metric(
+                [record for record in commits if record['class'] == 'lifecycle'],
+                'finished_at',
+                'scheduled_at',
+            )
+            if run.cell.scenario == 'lifecycle'
+            else None,
+        }
+    )
+    for key, finish, start in [
+        ('acquisition_ms', 'begun_at', 'started_at'),
+        ('service_ms', 'finished_at', 'begun_at'),
+        ('process_local_wait_ms', 'local_acquired_at', 'started_at'),
+        ('file_wait_ms', 'file_acquired_at', 'local_acquired_at'),
+        ('sqlite_wait_ms', 'begun_at', 'file_acquired_at'),
+    ]:
+        result[key] = _metric(commits, finish, start)
+    result.update(
+        {
+            'checkpointers': [
+                {
+                    'role': record['role'],
+                    **_checkpoint_summary(
+                        record['checkpoints'],
+                        run.start_at,
+                        min(run.end_at, record['finished_at']),
+                        run.options.checkpoint_interval_secs,
+                    ),
+                    'halt': record['checkpoint_halt'],
+                    'host_started_at': record['checkpoint_started_at'],
+                    'host_finished_at': record['checkpoint_finished_at'],
+                    'bound_crossings': record['checkpoint_crossings'],
+                }
+                for record in records
+                if record['checkpoint_owner']
+            ],
+            'peak_wal_bytes_in_use': max(
+                (
+                    attempt['result'][1] * attempt['frame_bytes']
+                    for attempt in checkpoints
+                    if attempt['outcome'] != 'contended'
+                ),
+                default=0,
+            ),
+            'peak_wal_file_bytes': max(
+                (attempt['wal_file_bytes'] for attempt in checkpoints), default=0
+            ),
+            'readers': _reader_summary(reads),
+            'population_during_run': _population_summary(reads),
+            'capacity_replays': _capacity_summary(run.cell, records),
+            'processes': [
+                {
+                    key: record[key]
+                    for key in (
+                        'role',
+                        'lanes',
+                        'exit_status',
+                        'peak_rss_bytes',
+                        'peak_open_fds',
+                        'errors',
+                        'health_projection_reads',
+                    )
+                }
+                for record in records
+            ],
+        }
+    )
+    result['arrival_accounting'] = _arrival_accounting(records, run.end_at)
+    drain = result['arrival_accounting']['drain_end']
+    result.update(
+        offered_commits=drain['offered'],
+        achieved_commits=drain['completed'],
+        backlog_at_end=drain['outstanding'],
+        achieved_ratio=drain['completed'] / drain['offered'] if drain['offered'] else 0.0,
+    )
+    result.update(_retention_summary(run, records))
+    if result['evidence_complete']:
+        try:
+            directory = cast(
+                'Path', run.directory
+            )  # A complete manifest has a retained directory.
+            collected = [
+                (json.loads(json.dumps(asdict(spec))), raw)
+                for spec, raw in zip(_cell_specs(run, directory), records, strict=True)
+            ]
+            for spec, raw in collected:
+                _validate_diagnostic_evidence(spec, raw, required=False)
+            _reconcile_arrival_evidence(result, collected)
+            _reconcile_checkpoint_evidence(result, collected)
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            result['evidence_complete'] = False
+            result['evidence_errors'].append(f'reconciliation: {exc}')
+    result['gate_eligible'] = _result_eligible(result) and result['evidence_complete']
+    return result
+
+
+def _validate_child_record(spec: _ProcessSpec, raw: dict[str, Any]) -> None:
+    """Check every field consumed by aggregation before admitting a child record."""
+    if raw['role'] != spec.role or raw['lanes'] != list(spec.lanes):
+        raise ValueError('child identity mismatch')
+    for name in (
+        'exit_status',
+        'offered',
+        'busy_timeouts',
+        'checkpoint_crossings',
+        'index_reloads',
+        'restore_commits',
+        'peak_rss_bytes',
+        'peak_open_fds',
+        'health_projection_reads',
+    ):
+        _record_integer(raw[name], name)
+    _record_strings(raw['errors'], 'errors')
+    _metric_number(raw['finished_at'], Path('<records>'), 'finished_at')
+    if raw['checkpoint_owner'] is not spec.poller or not isinstance(
+        raw['checkpoint_halt'], str | type(None)
+    ):
+        raise ValueError('invalid child checkpoint ownership or halt')
+    for count in _metric_mapping(
+        raw['expired_attempts'], Path('<records>'), 'expired_attempts'
+    ).values():
+        _record_integer(count, 'expired_attempts')
+    _validate_child_rows(raw)
+    _validated_checkpoint_records(raw)
+    _diagnostic_records(asdict(spec), raw)
+
+
+def _child_result(spec: _ProcessSpec, process: ChildProcess) -> dict[str, Any]:
+    """Wait for a child and retain missing output as an explicit process failure."""
+    status = process.wait()
+    path = Path(spec.output_path)
+    try:
+        result = _metric_mapping(json.loads(path.read_text()), path, 'raw')
+        _validate_child_record(spec, result)
+        result['exit_status'] = status or result['exit_status']
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        failure = f'child exited {status} without usable records: {exc}'
+    else:
+        return result
+    runtime = _Runtime(spec, _BusyOnlyLock(timeout_secs=1))
+    runtime.errors.append(failure)
+    runtime.finished_at = time.monotonic()
+    return _process_records(runtime)
+
+
+def _validate_qualification_evidence(result: dict[str, Any]) -> None:
+    """Check the retained measurement, process safety, and arrival accounting contract."""
+    if result['evidence_complete'] is not True or result['evidence_errors'] != []:
+        raise ValueError('incomplete evidence')
+    records = _retained_process_records(result)
+    processes = result['processes']
+    expected_roles = {raw['role'] for _, raw in records}
+    _reconcile_checkpoint_evidence(result, records)
+    if (
+        len(processes) != len(records)
+        or {process['role'] for process in processes} != expected_roles
+    ):
+        raise ValueError('incomplete process summary')
+    for process in [*processes, *(raw for _, raw in records)]:
+        if (
+            type(process['exit_status']) is not int
+            or process['exit_status']
+            or process['errors'] != []
+        ):
+            raise ValueError('process execution failure')
+    for spec, raw in records:
+        _validate_diagnostic_evidence(
+            spec, raw, required=result['cell']['number'] == _DIAGNOSTIC_CELL
+        )
+        if any(spec[key] != result['cell'][key] for key in ('scenario', 'synchronous')):
+            raise ValueError('process specification does not match cell')
+        if (
+            raw['busy_timeouts'] != 0
+            or raw['checkpoint_crossings'] != 0
+            or raw['checkpoint_halt'] is not None
+        ):
+            raise ValueError('retained process safety failure')
+    if (
+        len(result['checkpointers']) != 1
+        or result['checkpointers'][0]['role'] != 'site'
+        or not _result_eligible(result)
+    ):
+        raise ValueError('measurement eligibility is not established')
+    _reconcile_arrival_evidence(result, records)
+
+
+def _qualification_evidence_errors(result: dict[str, Any]) -> list[str]:
+    """Turn missing or invalid retained evidence into an explicit safety failure."""
+    try:
+        _validate_qualification_evidence(result)
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        return [f'qualification evidence: {error}']
+    return []
 
 
 def _wait_until(arrival: float, stop: threading.Event) -> bool:
@@ -2517,29 +3744,39 @@ def _wait_until(arrival: float, stop: threading.Event) -> bool:
 
 
 def _checkpoint_loop(runtime: _Runtime, connection: sqlite3.Connection) -> None:
-    """Attempt phase-aligned checkpoints on the process's dedicated connection."""
+    """Register early enough for the production host's first attempt to align with the cell."""
     spec = runtime.spec
-    if not _wait_until(spec.start_at - _CHECKPOINT_SETUP_LEAD_SECS, runtime.stop):
+    register_at = spec.start_at - spec.checkpoint_interval_secs
+    if time.monotonic() >= register_at:
+        raise ValueError(
+            f'checkpoint interval {spec.checkpoint_interval_secs}s leaves no registration lead'
+        )
+    if not _wait_until(register_at, runtime.stop):
         return
-    checkpointer = Checkpointer(
-        connection, Path(spec.database_path), interval_secs=spec.checkpoint_interval_secs
-    )
-    wal = Path(f'{spec.database_path}-wal')
-    for scheduled in _arrival_times(
-        [(0, spec.end_at - spec.start_at, 1 / spec.checkpoint_interval_secs)],
-        spec.start_at,
-        spec.end_at,
-    ):
-        if not _wait_until(scheduled, runtime.stop):
-            break
-        try:
-            attempt = checkpointer.run_once()
-        except DatabaseError as exc:
-            runtime.checkpoint_halt = str(exc)
-            if isinstance(exc, CheckpointBoundError):
-                _record_checkpoint(runtime, checkpointer, exc.attempt, wal)
-            raise
-        _record_checkpoint(runtime, checkpointer, attempt, wal)
+    frame_bytes = int(connection.execute('PRAGMA page_size').fetchone()[0]) + 24
+
+    def on_failure(reason: str) -> None:
+        runtime.checkpoint_halt = reason
+        runtime.errors.append(reason)
+        runtime.stop.set()
+
+    with closing(
+        CheckpointHost(
+            interval_secs=spec.checkpoint_interval_secs,
+            synchronous=spec.synchronous,
+            on_failure=on_failure,
+            logger=logging.getLogger('sg_event_daemon.source'),
+            checkpointer_factory=_checkpoint_factory(runtime, frame_bytes),
+            wal_trigger_bytes=runtime.wal_trigger_bytes,
+        )
+    ) as host:
+        host.register(
+            Path(spec.database_path),
+            source_identity('bench', 'source'),
+            SOURCE_SCHEMA,
+            log_extra={},
+        )
+        _wait_until(spec.end_at, runtime.stop)
 
 
 def _resource_sampler(runtime: _Runtime, _connection: sqlite3.Connection) -> None:
@@ -2550,6 +3787,8 @@ def _resource_sampler(runtime: _Runtime, _connection: sqlite3.Connection) -> Non
     ):
         if not _wait_until(scheduled, runtime.stop):
             break
+        if spec.extra_timing:
+            _record_diagnostic(runtime, {'kind': 'process-sample', **_clock_sample()})
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         runtime.samples.append(
             (
@@ -2568,8 +3807,8 @@ def _restore_capacity(runtime: _Runtime, connection: sqlite3.Connection) -> None
             continue
         generation = int(
             connection.execute(
-                'SELECT group_generation FROM groups WHERE group_name=?',
-                (_CAPACITY_GROUP,),
+                _SQL_SELECT_GROUP_GENERATION,
+                {'group': _CAPACITY_GROUP},
             ).fetchone()[0]
         )
         tick = time.monotonic()
@@ -2625,66 +3864,154 @@ def _worst_of(results: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             worst[name] = max(worst[name], result[name])
         worst['achieved_ratio'] = min(worst['achieved_ratio'], result['achieved_ratio'])
-        for level, count in result['wait_timeouts'].items():
-            worst['wait_timeouts'][level] = max(worst['wait_timeouts'].get(level, 0), count)
+        for level, count in result['expired_attempts'].items():
+            worst['expired_attempts'][level] = max(worst['expired_attempts'].get(level, 0), count)
         _merge_worst_checkpointers(worst, result)
         worst['processes'].extend(result['processes'])
     return worst
 
 
-def _evaluate(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Apply one cell's eligibility, repeat rule, and hard thresholds."""
+def _evaluate(
+    results: list[dict[str, Any]], *, qualification: str = 'all-modes'
+) -> dict[str, Any]:
+    """Keep raw thresholds separate from the selected qualification and repeat coverage."""
+    if qualification not in {'all-modes', 'normal-m7i-flex.large'}:
+        raise ValueError(f'unknown qualification: {qualification}')
     if not results:
         raise ValueError('at least one result is required')
     cell = results[0]['cell']
     if any(result['cell']['number'] != cell['number'] for result in results):
         raise ValueError('all results must be for one cell')
     _validate_repetitions(results)
+    evaluation: dict[str, Any] = {
+        'cell': cell['number'],
+        'verdict': 'reported',
+        'runs': len(results),
+        'failures': [],
+        'near_limits': [],
+        'qualification': qualification,
+        'qualification_verdict': 'reported',
+        'capacity_failures': [],
+        'safety_failures': [],
+        'repeat_required': False,
+    }
     if not cell['gated']:
-        return {'cell': cell['number'], 'verdict': 'reported', 'runs': len(results)}
-    if any(
+        return evaluation
+    process_failed = any(
         process['exit_status'] for result in results for process in result.get('processes', [])
-    ):
-        return {
-            'cell': cell['number'],
-            'verdict': 'fail',
-            'runs': len(results),
-            'failures': ['process_exit_status'],
-        }
-    if any(not _eligible_for_verdict(result) for result in results):
-        return {'cell': cell['number'], 'verdict': 'not-eligible', 'runs': len(results)}
-    if len(results) == _REPEAT_PENDING_RUNS:
-        return {'cell': cell['number'], 'verdict': 'incomplete', 'runs': _REPEAT_PENDING_RUNS}
-    if len(results) == 1 and results[0]['repetition'] != 1:
-        return {'cell': cell['number'], 'verdict': 'incomplete', 'runs': 1}
+    )
+    eligible = all(_eligible_for_verdict(result) for result in results)
+    if not eligible:
+        verdict = 'fail' if process_failed else 'not-eligible'
+        evaluation.update(
+            verdict=verdict,
+            qualification_verdict=verdict,
+            failures=['process_exit_status'] if process_failed else [],
+            safety_failures=['process_exit_status']
+            if process_failed
+            else ['measurement_eligibility'],
+        )
+        evaluation['evidence_errors'] = [
+            error for result in results for error in result.get('evidence_errors', [])
+        ]
+        return evaluation
+    scoped = qualification == 'normal-m7i-flex.large'
+    evidence_errors: list[str] = []
+    if scoped:
+        for result in results:
+            _validate_external_result(result, Path('<result>'))
+            evidence_errors.extend(_qualification_evidence_errors(result))
     worst = _worst_of(results)
     failures = _hard_failures(worst)
     near = [name for name, value, limit in _limit_checks(worst) if value > limit * _REPEAT_BAND]
-    verdict = 'fail' if failures else 'repeat' if len(results) == 1 and near else 'pass'
-    return {
-        'cell': cell['number'],
-        'verdict': verdict,
-        'runs': len(results),
-        'failures': failures,
-        'near_limits': near,
-    }
+    first = next((result for result in results if result['repetition'] == 1), None)
+    first_near = (
+        [name for name, value, limit in _limit_checks(first) if value > limit * _REPEAT_BAND]
+        if first is not None
+        else []
+    )
+    capacity_only = scoped and cell['number'] in {7, 8, 11}
+    capacity, safety = _qualification_failures(worst, failures, capacity_only=capacity_only)
+    if evidence_errors:
+        safety.append('qualification_evidence')
+    binding_near = [
+        name for name in first_near if not capacity_only or name == 'peak_wal_file_bytes'
+    ]
+    incomplete = len(results) == _REPEAT_PENDING_RUNS or first is None
+    repeat_required = len(results) < _MAX_REPEAT_RUNS and (bool(binding_near) or incomplete)
+    raw_verdict = (
+        'fail'
+        if failures
+        else 'incomplete'
+        if incomplete
+        else 'repeat'
+        if len(results) == 1 and first_near
+        else 'pass'
+    )
+    qualified = (
+        'fail'
+        if safety
+        else 'incomplete'
+        if incomplete
+        else 'repeat'
+        if repeat_required
+        else 'pass'
+    )
+    evaluation.update(
+        verdict=raw_verdict,
+        failures=failures,
+        near_limits=near,
+        qualification_verdict=qualified,
+        capacity_failures=capacity,
+        safety_failures=safety,
+        repeat_required=repeat_required,
+    )
+    if evidence_errors:
+        evaluation['evidence_errors'] = evidence_errors
+    return evaluation
 
 
-def _evaluate_files(paths: list[Path]) -> list[dict[str, Any]]:
-    """Group result files by cell and apply the repeat rule."""
+def _evaluate_files(
+    paths: list[Path], *, qualification: str = 'all-modes'
+) -> list[dict[str, Any]]:
+    """Group result files by cell and apply the selected qualification and repeat rule."""
     groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for result in _read_result_files(paths):
         groups[int(result['cell']['number'])].append(result)
-    return [_evaluate(groups[number]) for number in sorted(groups)]
+    return [_evaluate(groups[number], qualification=qualification) for number in sorted(groups)]
+
+
+def _write_process_records(runtime: _Runtime) -> None:
+    """Write the existing JSON bytes while retaining only one decoded row at a time."""
+    with Path(runtime.spec.output_path).open('w', encoding='utf-8') as stream:
+        stream.write('{')
+        for index, (key, value) in enumerate(_process_record_fields(runtime).items()):
+            if index:
+                stream.write(', ')
+            stream.write(json.dumps(key) + ': ')
+            if isinstance(value, (Iterator, list, tuple)):
+                stream.write('[')
+                for row_index, record in enumerate(cast('Iterable[object]', value)):
+                    if row_index:
+                        stream.write(', ')
+                    stream.write(json.dumps(record))
+                stream.write(']')
+            else:
+                stream.write(json.dumps(value))
+        stream.write('}')
 
 
 def _write_with_reload(
-    runtime: _Runtime, connection: sqlite3.Connection, writer: _Writer, scheduled: float
+    runtime: _Runtime,
+    connection: sqlite3.Connection,
+    writer: _Writer,
+    scheduled: float,
+    ordinal: int = 0,
 ) -> bool:
     """Replan an optimistic index conflict while retaining its original arrival."""
     while not runtime.stop.is_set() and time.monotonic() < runtime.spec.end_at + _DRAIN_SECS:
         try:
-            return _attempt_write(runtime, connection, writer, scheduled)
+            return _attempt_write(runtime, connection, writer, scheduled, ordinal)
         except (_IndexChangedError, _LaneChangedError) as exc:
             if writer.reload is None:
                 raise
@@ -2699,14 +4026,16 @@ def _execute_arrivals(runtime: _Runtime, connection: sqlite3.Connection, writer:
     arrivals = tuple(
         t for t in writer.arrivals if runtime.spec.start_at <= t < runtime.spec.end_at
     )
-    if not writer.maintenance:
-        runtime.offered += len(arrivals)
-    for scheduled in arrivals:
-        if not _wait_until(scheduled, runtime.stop):
+    wait: Callable[[float], bool] = writer.wait or (lambda when: _wait_until(when, runtime.stop))
+    for ordinal, scheduled in enumerate(arrivals):
+        if not wait(scheduled):
             break
         if time.monotonic() >= runtime.spec.end_at + _DRAIN_SECS:
             break
-        _write_with_reload(runtime, connection, writer, scheduled)
+        identity_ordinal = (
+            round(scheduled - runtime.spec.start_at) if writer.name == 'lifecycle' else ordinal
+        )
+        _write_with_reload(runtime, connection, writer, scheduled, identity_ordinal)
 
 
 def _lane_writer(runtime: _Runtime, connection: sqlite3.Connection, group: str) -> None:
@@ -2716,16 +4045,21 @@ def _lane_writer(runtime: _Runtime, connection: sqlite3.Connection, group: str) 
         group, strict=group in _STRICT_GROUPS, scan_suppressed=frozenset(spec.scan_suppressed)
     )
     _lane_resume(connection, lane)
-    segments = _SCENARIOS[spec.scenario]._segments(group, spec.end_at - spec.start_at)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    writer = _Writer(
-        group,
-        tuple(_arrival_times(segments, spec.start_at, spec.end_at)),
-        lambda conn, now: _lane_guarded_arrival(conn, lane, now),
-        before=lambda conn, _now: _lane_prepare(conn, lane),
-        after=lambda conn: _lane_health(runtime, conn, lane),
-        reload=lambda conn: _lane_prepare(conn, lane),
-    )
-    _execute_arrivals(runtime, connection, writer)
+    segments = _SCENARIOS[spec.scenario].segments(group, spec.end_at - spec.start_at)
+    with _range_hint_pipe(spec.database_path, group) as hint_fd:
+        writer = _Writer(
+            group,
+            tuple(_arrival_times(segments, spec.start_at, spec.end_at)),
+            lambda conn, now: _lane_guarded_arrival(conn, lane, now),
+            before=lambda conn, _scheduled: _lane_prepare(
+                conn, lane, now=time.monotonic(), hinted=_take_range_hint(hint_fd)
+            ),
+            after=lambda conn: _lane_health(runtime, conn, lane),
+            reload=lambda conn: _lane_prepare(conn, lane, now=time.monotonic(), force=True),
+            wait=lambda scheduled: _lane_wait(runtime, connection, lane, hint_fd, scheduled),
+        )
+        _execute_arrivals(runtime, connection, writer)
+        _lane_wait(runtime, connection, lane, hint_fd, spec.end_at)
 
 
 def _lifecycle_writer(runtime: _Runtime, connection: sqlite3.Connection) -> None:
@@ -2767,13 +4101,16 @@ def _poller_writer(runtime: _Runtime, connection: sqlite3.Connection) -> None:
     poller = _PollerState(seed=spec.seed, hold_open=spec.population == 'cap-stress')
     _poller_reload(connection, poller)
     plan = _PollPlan(0)
+    range_changed = False
 
     def prepare(_connection: sqlite3.Connection, scheduled: float) -> None:
-        nonlocal plan
+        nonlocal plan, range_changed
+        range_changed = False
         plan = _poller_plan(poller, spec.harness_clock_start + scheduled - spec.start_at)
 
     def perform(conn: sqlite3.Connection, now: float) -> str:
-        _poller_observe(conn, poller, plan, now)
+        nonlocal range_changed
+        range_changed = _poller_observe(conn, poller, plan, now)
         return 'poller'
 
     arrivals = _arrival_times(
@@ -2781,14 +4118,25 @@ def _poller_writer(runtime: _Runtime, connection: sqlite3.Connection) -> None:
         spec.start_at,
         spec.end_at,
     )
-    writer = _Writer(
-        'poller',
-        tuple(arrivals),
-        perform,
-        before=prepare,
-        reload=lambda conn: _poller_reload(conn, poller),
-    )
-    _execute_arrivals(runtime, connection, writer)
+    with ExitStack() as stack:
+        hint_fds = tuple(
+            stack.enter_context(_range_hint_pipe(spec.database_path, group))
+            for group in _GROUP_NAMES
+        )
+
+        def committed(_connection: sqlite3.Connection) -> None:
+            if range_changed:
+                _publish_range_hints(hint_fds)
+
+        writer = _Writer(
+            'poller',
+            tuple(arrivals),
+            perform,
+            before=prepare,
+            after=committed,
+            reload=lambda conn: _poller_reload(conn, poller),
+        )
+        _execute_arrivals(runtime, connection, writer)
 
 
 def _thread_jobs(spec: _ProcessSpec) -> list[_ThreadJob]:
@@ -2802,6 +4150,7 @@ def _thread_jobs(spec: _ProcessSpec) -> list[_ThreadJob]:
         jobs.append(_ThreadJob(group, run, spec.synchronous))
     optional = [
         (spec.poller, 'poller', _poller_writer, spec.synchronous),
+        (spec.poller, 'checkpoint', _checkpoint_loop, spec.synchronous),
         (spec.lifecycle, 'lifecycle', _lifecycle_writer, 'FULL'),
         (spec.status_reader, 'status', _status_reader, spec.synchronous),
         (
@@ -2816,12 +4165,7 @@ def _thread_jobs(spec: _ProcessSpec) -> list[_ThreadJob]:
         for enabled, name, run, synchronous in optional
         if enabled
     )
-    jobs.extend(
-        (
-            _ThreadJob('checkpoint', _checkpoint_loop, spec.synchronous),
-            _ThreadJob('resources', _resource_sampler, spec.synchronous),
-        )
-    )
+    jobs.extend((_ThreadJob('resources', _resource_sampler, spec.synchronous),))
     return jobs
 
 
@@ -2852,23 +4196,30 @@ def _run_threads(runtime: _Runtime) -> None:
         runtime.stop.set()
 
 
-def _run_process(spec: _ProcessSpec) -> dict[str, Any]:
-    """Run one process's synchronized threads and return JSON-compatible records."""
+def _run_process(
+    spec: _ProcessSpec, *, wal_trigger_bytes: int = WAL_TRIGGER_BYTES, persist: bool = False
+) -> dict[str, Any]:
+    """Run synchronized threads, optionally exporting before releasing the runtime."""
     budget = write_lock_timeout_secs(_HEALTH_INTERVAL_SECS, _SUPERVISOR_POLL_INTERVAL_SECS)
-    runtime = _Runtime(spec, _BusyOnlyLock(timeout_secs=budget))
-    with _FailureBoundary(runtime, 'setup'):
+    runtime = _Runtime(
+        spec, _BusyOnlyLock(timeout_secs=budget), wal_trigger_bytes=wal_trigger_bytes
+    )
+    with _diagnostic_session(runtime), _FailureBoundary(runtime, 'setup'):
         if spec.arbitration != 'busy-only':
             runtime.lock = SourceWriteLock(
                 Path(f'{spec.database_path}.write-lock'),
+                database_path=Path(spec.database_path),
                 timeout_secs=budget,
                 wait_phase_grace_secs=_HEALTH_INTERVAL_SECS,
             )
         _run_threads(runtime)
     runtime.finished_at = time.monotonic()
     runtime.lock.close()
-    result = _process_records(runtime)
-    result['offered'] = _offered_count(spec)
-    return result
+    _wait_until(spec.end_at + _DRAIN_SECS, threading.Event())
+    if persist:
+        _write_process_records(runtime)
+        return {'exit_status': int(bool(runtime.errors))}
+    return _process_records(runtime)
 
 
 def _child_main(argv: list[str]) -> int:
@@ -2877,9 +4228,8 @@ def _child_main(argv: list[str]) -> int:
     parser.add_argument('command', choices=['child'])
     parser.add_argument('--spec', type=Path, required=True)
     args = parser.parse_args(argv)
-    spec = _ProcessSpec._from_json(args.spec.read_text())  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    result = _run_process(spec)
-    Path(spec.output_path).write_text(json.dumps(result))
+    spec = _ProcessSpec.from_json(args.spec.read_text())
+    result = _run_process(spec, persist=True)
     return int(result['exit_status'])
 
 
@@ -2899,13 +4249,10 @@ def _run_cell(cell: _Cell, population: Path, options: _RunOptions) -> dict[str, 
     duration = (
         options.duration_secs
         if options.duration_secs is not None
-        else max(
-            scenario.duration_secs,
-            options.min_samples / (len(_GROUP_NAMES) * scenario.lane_rate + scenario.poller_rate),
-        )
+        else _default_duration(scenario, options.min_samples)
     )
     start = time.monotonic() + _START_DELAY_SECS
-    run = _CellRun(cell, options, start, start + duration, metadata)
+    run = _CellRun(cell, options, start, start + duration, metadata, directory)
     specs = _cell_specs(run, directory)
     env = dict(os.environ)
     src = str(Path(__file__).resolve().parents[1] / 'src')
@@ -2913,7 +4260,7 @@ def _run_cell(cell: _Cell, population: Path, options: _RunOptions) -> dict[str, 
     children: list[tuple[_ProcessSpec, ChildProcess]] = []
     for spec in specs:
         path = directory / f'{spec.role}-spec.json'
-        path.write_text(spec._to_json())  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        path.write_text(spec.to_json())
         if spec.role != 'site':
             children.append(
                 (
@@ -2930,16 +4277,18 @@ def _run_cell(cell: _Cell, population: Path, options: _RunOptions) -> dict[str, 
                     ),
                 )
             )
-    records = [_run_process(specs[0])]
+    _run_process(specs[0], persist=True)
+    # The compact runtime is gone before loading the shared-key JSON object graph.
+    records = [json.loads(Path(specs[0].output_path).read_text())]
     records.extend(_child_result(spec, process) for spec, process in children)
     return _summarize(run, records)
 
 
-def _run_command(args: argparse.Namespace) -> dict[str, Any]:
-    """Run one cell, save its JSON result, and attach its verdict."""
+def _run_command(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one cell, save its JSON result, and return its one evaluation."""
     cell_number = int(args.cell)
     if cell_number not in range(1, len(_CELLS) + 1):
-        raise ValueError('cell must be between 1 and 12')
+        raise ValueError(f'cell must be between 1 and {len(_CELLS)}')
     if args.duration_secs is not None and args.duration_secs <= 0:
         raise ValueError('duration seconds must be positive')
     if args.min_samples <= 0 or args.checkpoint_interval_secs <= 0 or args.repetition <= 0:
@@ -2955,10 +4304,11 @@ def _run_command(args: argparse.Namespace) -> dict[str, Any]:
         args.commit,
     )
     result = _run_cell(_CELLS[cell_number - 1], args.population, options)
-    result['verdict'] = _evaluate([result])['verdict']
+    evaluation = _evaluate([result], qualification=args.qualification)
+    result.update({key: value for key, value in evaluation.items() if key not in {'cell', 'runs'}})
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + '\n')
-    return result
+    _persist_cell_result(result, args.output)
+    return result, evaluation
 
 
 def _seed_representative(path: Path, warmup_secs: float) -> dict[str, Any]:
@@ -2967,7 +4317,7 @@ def _seed_representative(path: Path, warmup_secs: float) -> dict[str, Any]:
         path, source_identity('bench', 'source'), SOURCE_SCHEMA, synchronous='NORMAL'
     )
     try:
-        handle.connection.execute('BEGIN IMMEDIATE')
+        handle.connection.execute(_SQL_BEGIN_IMMEDIATE)
         _seed_base(handle.connection, strict_groups=_STRICT_GROUPS)
         handle.connection.commit()
     finally:
@@ -2999,7 +4349,7 @@ def _seed_representative(path: Path, warmup_secs: float) -> dict[str, Any]:
         path, source_identity('bench', 'source'), SOURCE_SCHEMA, synchronous='NORMAL'
     )
     try:
-        checkpoint = handle.connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        checkpoint = handle.connection.execute(_SQL_WAL_CHECKPOINT_TRUNCATE).fetchone()
         if checkpoint is None or checkpoint[0] != 0:
             raise RuntimeError('representative WAL checkpoint was busy')
         counts = _population_counts(handle.connection)
@@ -3055,7 +4405,7 @@ def _gate_command(args: argparse.Namespace, command_line: list[str]) -> list[dic
         else [int(value) for value in args.cells.split(',')]
     )
     if not selected or any(number not in range(1, len(_CELLS) + 1) for number in selected):
-        raise ValueError('cells must be a comma-separated list from 1 to 12')
+        raise ValueError(f'cells must be a comma-separated list from 1 to {len(_CELLS)}')
     seeds = {
         population: args.work_dir / f'{population}.db'
         for population in ('representative', 'cap-stress')
@@ -3079,13 +4429,14 @@ def _gate_command(args: argparse.Namespace, command_line: list[str]) -> list[dic
             min_samples=_MIN_SAMPLES,
             checkpoint_interval_secs=DEFAULT_CHECKPOINT_INTERVAL_SECS,
             commit=args.commit,
+            qualification=args.qualification,
         )
-        result = _run_command(run_args)
+        result, evaluation = _run_command(run_args)
         environment = result['environment']
-        evaluations.append(_evaluate([result]))
+        evaluations.append(evaluation)
     summary = {
         'cells': evaluations,
-        'repeat': [item['cell'] for item in evaluations if item['verdict'] == 'repeat'],
+        **_qualification_summary(evaluations),
         'environment': environment,
     }
     (args.results_dir / 'gate-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
@@ -3098,20 +4449,8 @@ def _gate_command(args: argparse.Namespace, command_line: list[str]) -> list[dic
     return evaluations
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Dispatch storage gate commands and map expected errors to exit status 2.
-
-    Args:
-        argv: Command arguments without the program name; `None` uses the
-            process command line.
-
-    Returns:
-        Zero for successful seeding, help, or evaluations containing only
-        passing or report-only cells. Returns one when an evaluated gated cell
-        has any other verdict, and two for argument errors or caught operating
-        system, validation, or database failures. The internal child command
-        returns its recorded process exit status.
-    """
+def _main(argv: Sequence[str] | None = None) -> int:
+    """Dispatch storage gate commands and map expected errors to exit status 2."""
     parser = argparse.ArgumentParser(description='Per-source storage contention gate')
     commands = parser.add_subparsers(dest='command', required=True)
     seed = commands.add_parser('seed')
@@ -3142,6 +4481,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     gate.add_argument('--commit')
     evaluate = commands.add_parser('evaluate')
     evaluate.add_argument('files', nargs='+', type=Path)
+    for command in (run, gate, evaluate):
+        command.add_argument(
+            '--qualification', choices=('all-modes', 'normal-m7i-flex.large'), default='all-modes'
+        )
     child = commands.add_parser('child')
     child.add_argument('--spec', type=Path, required=True)
     arguments = list(argv) if argv is not None else sys.argv[1:]
@@ -3153,18 +4496,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             _seed_command(args.population, args.output, args.warmup_secs)
             return 0
         if args.command == 'run':
-            result = _run_command(args)
-            _print_verdicts([_evaluate([result])])
-            return _evaluation_status([_evaluate([result])])
+            evaluations = [_run_command(args)[1]]
+            _print_verdicts(evaluations)
+            return _evaluation_status(evaluations)
         if args.command == 'gate':
             evaluations = _gate_command(args, arguments)
         else:
-            evaluations = _evaluate_files(args.files)
+            evaluations = _evaluate_files(args.files, qualification=args.qualification)
         _print_verdicts(evaluations)
         return _evaluation_status(evaluations)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
-    except (OSError, ValueError, DatabaseError) as error:
+    except (OSError, ValueError, DatabaseError, SecurityError) as error:
         print(f'error: {error}', file=sys.stderr)
         return 2
 
@@ -3195,4 +4538,4 @@ _CELLS: tuple[_Cell, ...] = (
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_main())

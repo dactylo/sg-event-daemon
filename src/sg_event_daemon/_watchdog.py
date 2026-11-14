@@ -23,24 +23,27 @@ if TYPE_CHECKING:
 GroupPhase: TypeAlias = Literal[
     'callback', 'idle', 'internal', 'setup', 'shutdown', 'startup', 'write-hold', 'write-lock-wait'
 ]
-OperatorWatchdogPhase: TypeAlias = Literal['idle', 'internal', 'shutdown']
+_OperatorWatchdogPhase: TypeAlias = Literal['idle', 'internal', 'shutdown']
 SourceWatchdogPhase: TypeAlias = Literal[
     'internal', 'provider-query', 'shutdown', 'startup', 'wait', 'write-hold', 'write-lock-wait'
 ]
 WatchdogKind: TypeAlias = Literal['source', 'lane', 'operator']
-WatchdogPhase: TypeAlias = GroupPhase | SourceWatchdogPhase | OperatorWatchdogPhase
+WatchdogPhase: TypeAlias = GroupPhase | SourceWatchdogPhase | _OperatorWatchdogPhase
 GROUP_PHASES: tuple[GroupPhase, ...] = get_args(GroupPhase)
-OPERATOR_WATCHDOG_PHASES: tuple[OperatorWatchdogPhase, ...] = get_args(OperatorWatchdogPhase)
 SOURCE_WATCHDOG_PHASES: tuple[SourceWatchdogPhase, ...] = get_args(SourceWatchdogPhase)
 WATCHDOG_KINDS: tuple[WatchdogKind, ...] = get_args(WatchdogKind)
+_OPERATOR_WATCHDOG_PHASES: tuple[_OperatorWatchdogPhase, ...] = get_args(_OperatorWatchdogPhase)
+
 WATCHDOG_PHASES: tuple[WatchdogPhase, ...] = tuple(
-    sorted({*GROUP_PHASES, *SOURCE_WATCHDOG_PHASES, *OPERATOR_WATCHDOG_PHASES})
+    sorted({*GROUP_PHASES, *SOURCE_WATCHDOG_PHASES, *_OPERATOR_WATCHDOG_PHASES})
 )
 WATCHDOG_RULES: dict[WatchdogKind, tuple[tuple[WatchdogPhase, ...], WatchdogPhase]] = {
     'source': (SOURCE_WATCHDOG_PHASES, 'startup'),
     'lane': (GROUP_PHASES, 'startup'),
-    'operator': (OPERATOR_WATCHDOG_PHASES, 'idle'),
+    'operator': (_OPERATOR_WATCHDOG_PHASES, 'idle'),
 }
+
+_WATCHDOG_GRACE_FLOOR_SECS = 0.5
 
 
 class _ProviderBudget(Protocol):
@@ -212,9 +215,10 @@ class ComponentWatchdog:
 
         Args:
             phase: New component phase.
-            deadline_at: Absolute monotonic deadline for the phase.
+            deadline_at: Absolute monotonic deadline, or None for no deadline.
             **identities: Optional in-flight event, plugin, callback, delivery,
-                or operator identities.
+                or operator identities; omitted identities are cleared for the
+                new phase.
 
         Raises:
             ValueError: The phase is invalid for this component kind.
@@ -236,11 +240,17 @@ class ComponentWatchdog:
     ) -> Generator[None]:
         """Publish one watched phase while its operation runs.
 
+        On exit, restore the previous phase and identities while advancing its
+        heartbeat. Renew an idle phase's original budget; extend an internal,
+        startup, or wait deadline by the scoped duration. Other deadlines are
+        restored unchanged.
+
         Args:
             phase: Scoped component phase.
-            deadline_at: Absolute monotonic deadline for the phase.
+            deadline_at: Absolute monotonic deadline, or None for no deadline.
             **identities: Optional in-flight event, plugin, callback, delivery,
-                or operator identities.
+                or operator identities; omitted identities are cleared for the
+                scoped phase.
 
         Yields:
             Control while the watched operation runs without the cell lock.
@@ -255,20 +265,24 @@ class ComponentWatchdog:
                 deadline_at=deadline_at,
                 identities=identities,
             )
+            entry_time = self._sample.heartbeat_at
         try:
             yield
         finally:
             with self._lock:
                 current = self._sample
+                exit_time = self._clock()
                 heartbeat_at = max(
                     previous.heartbeat_at,
                     current.heartbeat_at,
-                    self._clock(),
+                    exit_time,
                 )
                 deadline_at = previous.deadline_at
                 if previous.phase == 'idle' and deadline_at is not None:
                     idle_budget = max(0.0, deadline_at - previous.heartbeat_at)
                     deadline_at = heartbeat_at + idle_budget
+                elif previous.phase in {'internal', 'startup', 'wait'} and deadline_at is not None:
+                    deadline_at += exit_time - entry_time
                 self._sample = replace(
                     previous,
                     transition_sequence=current.transition_sequence + 1,
@@ -328,10 +342,15 @@ def internal_stall_deadline_secs(
     return 2 * max(5 * health_interval_secs, provider_budget_secs(credential))
 
 
+def shutdown_slice_secs(shutdown_deadline_secs: float) -> float:
+    """Bound an uninterruptible wait to a quarter of shutdown, at most one second."""
+    return min(1.0, shutdown_deadline_secs / 4)
+
+
 def watchdog_grace_secs(health_interval_secs: float) -> float:
-    """Return the five-health-interval allowance for idle and wait deadlines.
+    """Return five health intervals, at least 0.5 seconds, for idle and wait deadlines.
 
     Args:
         health_interval_secs: Worker health publication interval in seconds.
     """
-    return 5 * health_interval_secs
+    return max(5 * health_interval_secs, _WATCHDOG_GRACE_FLOOR_SECS)

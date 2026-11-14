@@ -15,12 +15,14 @@ from sg_event_daemon._config import (
     Config,
     ConfigError,
     CredentialConfig,
-    DaemonConfig,
     GroupConfig,
     SecretRef,
     SecretValue,
     SourceConfig,
     WorkerConfig,
+    _DaemonConfig,
+    _positive_float,
+    _positive_int,
     _strict_group_holdback_secs,
     evidence_warnings,
     load_acceptance_evidence,
@@ -66,9 +68,9 @@ _DURATION_FIELDS = (
     ('group', 'callback_deadline_secs'),
     ('group', 'strict_holdback_secs'),
     ('source', 'fetch_interval_secs'),
+    ('source', 'late_event_window_secs'),
     ('source', 'poll_retry_base_secs'),
     ('source', 'poll_retry_max_secs'),
-    ('source', 'visibility_overlap_secs'),
     ('worker', 'healthy_reset_secs'),
     ('worker', 'restart_window_secs'),
 )
@@ -501,7 +503,7 @@ def test_callback_deadline_below_provider_budget_warns(
         group_extra='callback_deadline_secs = 33.0',
     )
 
-    with pytest.warns(UserWarning, match='callback deadline 33.0.*provider budget 34.0'):
+    with pytest.warns(UserWarning, match=r'callback_deadline_secs \(33.0\).*retries \(34.0s\)'):
         load_config(_write(tmp_path, text))
 
 
@@ -788,8 +790,8 @@ def test_explicit_defaults_resolve_like_omitted_and_direct_construction(
                 credential_extra=(
                     'timeout_secs = 30.0\nmax_rpc_attempts = 3\nrpc_attempt_interval_secs = 3.0'
                 ),
-                source_extra='visibility_overlap_secs = 300.0\nqueue_max_events = 1000',
-                group_extra='ordering = "strict"\nstrict_holdback_secs = 300.0',
+                source_extra='late_event_window_secs = 300.0\nqueue_max_events = 1000',
+                group_extra='ordering = "strict"\nstrict_holdback_secs = 2.0',
                 worker_table='[sites.test.workers.pool]\nrestart_limit = 5',
             ),
             name='explicit.toml',
@@ -801,7 +803,7 @@ def test_explicit_defaults_resolve_like_omitted_and_direct_construction(
     direct_source = SourceConfig('admin', 'admin')
     direct_group = GroupConfig('noop', 'admin', (), 'admin', ordering='strict')
     direct_worker = WorkerConfig('pool')
-    direct_daemon = DaemonConfig(tmp_path / 'state', 'shotgun-api3')
+    direct_daemon = _DaemonConfig(tmp_path / 'state', 'shotgun-api3')
 
     assert (
         (
@@ -835,20 +837,20 @@ def test_explicit_defaults_resolve_like_omitted_and_direct_construction(
     )
     assert (
         (
-            omitted_site.sources['admin'].visibility_overlap_secs,
+            omitted_site.sources['admin'].late_event_window_secs,
             omitted_site.sources['admin'].queue_max_events,
         )
         == (
-            explicit_site.sources['admin'].visibility_overlap_secs,
+            explicit_site.sources['admin'].late_event_window_secs,
             explicit_site.sources['admin'].queue_max_events,
         )
-        == (direct_source.visibility_overlap_secs, direct_source.queue_max_events)
+        == (direct_source.late_event_window_secs, direct_source.queue_max_events)
         == (300.0, 1_000)
     )
     assert (
         omitted_site.groups['noop'].strict_holdback_secs
         == explicit_site.groups['noop'].strict_holdback_secs
-        == 300.0
+        == 2.0
     )
     assert direct_group.strict_holdback_secs is None
     assert (
@@ -860,8 +862,24 @@ def test_explicit_defaults_resolve_like_omitted_and_direct_construction(
     assert explicit_site.workers['pool'].restart_limit == direct_worker.restart_limit == 5
 
 
+def test_explicit_long_strict_hold_remains_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv('SG_EVENT_ADMIN_KEY', 'secret')
+    plugin_path = _plugin_file(tmp_path)
+    config = load_config(
+        _write(
+            tmp_path,
+            _config_text(
+                plugin_path, group_extra='ordering = "strict"\nstrict_holdback_secs = 300.0'
+            ),
+        )
+    )
+    assert config.sites['test'].groups['noop'].strict_holdback_secs == 300.0
+
+
 def test_group_storage_holdback_stays_positive_when_eager_registration_is_zero() -> None:
-    source = SourceConfig('events', 'source', visibility_overlap_secs=45.0)
+    source = SourceConfig('events', 'source', late_event_window_secs=45.0)
     eager = GroupConfig(
         name='eager',
         source='events',
@@ -990,12 +1008,13 @@ def test_load_config_resolves_defaults_references_and_plugin_order(
         'commit_batch_max_bytes': 67_108_864,
         'credentials': 'admin',
         'fetch_interval_secs': 1.0,
+        'late_event_window_secs': 300.0,
         'max_event_bytes': 4_194_304,
         'max_late_ids_per_group': 50_000,
-        'max_open_ranges': 100,
-        'max_pending_group_obligations': 1_300,
+        'max_open_ranges': 500,
+        'max_pending_group_obligations': 6_500,
         'max_range_query_pages': 100,
-        'max_source_late_ids': 50_000,
+        'max_source_late_ids': 500_000,
         'name': 'events',
         'poll_retry_base_secs': 1.0,
         'poll_retry_jitter_fraction': 0.2,
@@ -1005,7 +1024,6 @@ def test_load_config_resolves_defaults_references_and_plugin_order(
         'queue_max_events': 1_000,
         'strict_max_bytes': 268_435_456,
         'strict_max_events': 20_000,
-        'visibility_overlap_secs': 300.0,
     }
     worker = alpha.workers['pool']
     assert worker.restart_limit == 5
@@ -1027,7 +1045,7 @@ def test_load_config_resolves_defaults_references_and_plugin_order(
         'editorial',
         'admin',
     )
-    assert alpha.groups['strict'].strict_holdback_secs == 300.0
+    assert alpha.groups['strict'].strict_holdback_secs == 2.0
     assert alpha.groups['strict'].worker == 'pool'
 
 
@@ -1058,7 +1076,7 @@ def test_names_longer_than_64_characters_are_rejected(
     long_name = 'a' * 65
     text = _config_text(plugin_path).replace('[sites.test]', f'[sites.{long_name}]', 1)
 
-    with pytest.raises(ConfigError, match='invalid site name'):
+    with pytest.raises(ConfigError, match=r'invalid site name.*1-64 lowercase'):
         load_config(_write(tmp_path, text))
 
 
@@ -1096,13 +1114,25 @@ def test_plugin_config_rejects_canonical_bytes_above_cap(
     plugin_path = _plugin_file(tmp_path)
     oversized = 'x' * 262_145
 
-    with pytest.raises(ConfigError, match=r'plugin config.*262144 bytes'):
+    with pytest.raises(ConfigError, match=r'plugin config.*daemon.max_plugin_config_bytes'):
         load_config(
             _write(
                 tmp_path,
                 _config_text(plugin_path, plugin_config=f'value = "{oversized}"'),
             )
         )
+
+
+@pytest.mark.parametrize('value', [0, float('nan')])
+def test_positive_float_rejects_non_positive_and_non_finite_values(value: object) -> None:
+    with pytest.raises(ConfigError, match=r'test\.limit.*positive and finite'):
+        _positive_float({'limit': value}, 'limit', 'test', 1.0)
+
+
+@pytest.mark.parametrize('value', [0, float('nan')])
+def test_positive_int_rejects_non_positive_and_non_integer_values(value: object) -> None:
+    with pytest.raises(ConfigError, match=r'test\.limit.*integer.*at least 1'):
+        _positive_int({'limit': value}, 'limit', 'test', 1)
 
 
 @pytest.mark.parametrize(
@@ -1199,11 +1229,9 @@ def test_probe_port_rejects_values_outside_strict_integer_range(
 
 
 @pytest.mark.parametrize(('location', 'field'), _COUNT_FIELDS)
-@pytest.mark.parametrize('value', ['0', 'nan', 'inf', '-inf'])
 def test_count_and_byte_limits_must_be_positive_integers(
     location: str,
     field: str,
-    value: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1214,17 +1242,15 @@ def test_count_and_byte_limits_must_be_positive_integers(
         load_config(
             _write(
                 tmp_path,
-                _numeric_config(plugin_path, location, f'{field} = {value}'),
+                _numeric_config(plugin_path, location, f'{field} = 0'),
             )
         )
 
 
 @pytest.mark.parametrize(('location', 'field'), _DURATION_FIELDS)
-@pytest.mark.parametrize('value', ['0', 'nan', 'inf', '-inf'])
 def test_durations_must_be_positive_and_finite(
     location: str,
     field: str,
-    value: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1235,7 +1261,7 @@ def test_durations_must_be_positive_and_finite(
         load_config(
             _write(
                 tmp_path,
-                _numeric_config(plugin_path, location, f'{field} = {value}'),
+                _numeric_config(plugin_path, location, f'{field} = 0'),
             )
         )
 

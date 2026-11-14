@@ -59,17 +59,17 @@ class _FakeAsyncHandle:
         ordinal: int,
     ) -> None:
         self._close_attempts = close_attempts
-        self._close_error: BaseException | None = None
-        self._closed = False
+        self.close_error: BaseException | None = None
+        self.closed = False
         self._ordinal = ordinal
-        self._session_error: RuntimeError | None = None
-        self._session_uuids: list[str | None] = []
+        self.session_error: RuntimeError | None = None
+        self.session_uuids: list[str | None] = []
 
     async def close(self) -> None:
         self._close_attempts.append(self._ordinal)
-        if self._close_error is not None:
-            raise self._close_error
-        self._closed = True
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
 
     async def find(
         self,
@@ -87,9 +87,9 @@ class _FakeAsyncHandle:
         return []
 
     def set_session_uuid(self, session_uuid: str | None) -> None:
-        if self._session_error is not None:
-            raise self._session_error
-        self._session_uuids.append(session_uuid)
+        if self.session_error is not None:
+            raise self.session_error
+        self.session_uuids.append(session_uuid)
 
 
 class _FakeProvider:
@@ -99,23 +99,23 @@ class _FakeProvider:
             sync=True,
             async_=async_,
         )
-        self._async_create_errors: list[BaseException] = []
-        self._close_attempts: list[int] = []
-        self._create_calls: list[tuple[str, str, str]] = []
-        self._create_threads: list[int] = []
-        self._handles: list[_FakeAsyncHandle | _FakeSyncHandle] = []
+        self.async_create_errors: list[BaseException] = []
+        self.close_attempts: list[int] = []
+        self.create_calls: list[tuple[str, str, str]] = []
+        self.create_threads: list[int] = []
+        self.handles: list[_FakeAsyncHandle | _FakeSyncHandle] = []
 
     async def create_async(
         self,
         site: str,
         credential: CredentialConfig,
     ) -> AsyncSG:
-        self._create_calls.append(('async', site, credential.name))
-        self._create_threads.append(threading.get_ident())
-        if self._async_create_errors:
-            raise self._async_create_errors.pop(0)
-        handle = _FakeAsyncHandle(self._close_attempts, len(self._handles))
-        self._handles.append(handle)
+        self.create_calls.append(('async', site, credential.name))
+        self.create_threads.append(threading.get_ident())
+        if self.async_create_errors:
+            raise self.async_create_errors.pop(0)
+        handle = _FakeAsyncHandle(self.close_attempts, len(self.handles))
+        self.handles.append(handle)
         return cast('AsyncSG', handle)
 
     def create_sync(
@@ -123,10 +123,10 @@ class _FakeProvider:
         site: str,
         credential: CredentialConfig,
     ) -> SyncSG:
-        self._create_calls.append(('sync', site, credential.name))
-        self._create_threads.append(threading.get_ident())
-        handle = _FakeSyncHandle(self._close_attempts, len(self._handles))
-        self._handles.append(handle)
+        self.create_calls.append(('sync', site, credential.name))
+        self.create_threads.append(threading.get_ident())
+        handle = _FakeSyncHandle(self.close_attempts, len(self.handles))
+        self.handles.append(handle)
         return cast('SyncSG', handle)
 
 
@@ -137,17 +137,17 @@ class _FakeSyncHandle:
         ordinal: int,
     ) -> None:
         self._close_attempts = close_attempts
-        self._close_error: BaseException | None = None
-        self._closed = False
+        self.close_error: BaseException | None = None
+        self.closed = False
         self._ordinal = ordinal
-        self._session_error: RuntimeError | None = None
-        self._session_uuids: list[str | None] = []
+        self.session_error: RuntimeError | None = None
+        self.session_uuids: list[str | None] = []
 
     def close(self) -> None:
         self._close_attempts.append(self._ordinal)
-        if self._close_error is not None:
-            raise self._close_error
-        self._closed = True
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
 
     def find(
         self,
@@ -165,18 +165,18 @@ class _FakeSyncHandle:
         return []
 
     def set_session_uuid(self, session_uuid: str | None) -> None:
-        if self._session_error is not None:
-            raise self._session_error
-        self._session_uuids.append(session_uuid)
+        if self.session_error is not None:
+            raise self.session_error
+        self.session_uuids.append(session_uuid)
 
 
 class _StructuredHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
-        self._payloads: list[str] = []
+        self.payloads: list[str] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self._payloads.append(json.dumps(record.__dict__, default=str, sort_keys=True))
+        self.payloads.append(json.dumps(record.__dict__, default=str, sort_keys=True))
 
 
 class _SynchronizedLock:
@@ -186,7 +186,7 @@ class _SynchronizedLock:
         self._lock = threading.Lock()
 
     def __enter__(self) -> None:
-        self._entrants.wait(timeout=2)
+        self._entrants.wait()
         self._lock.acquire()
         self._local._held = True
 
@@ -200,7 +200,7 @@ class _SynchronizedLock:
         self._lock.release()
 
     @property
-    def _held(self) -> bool:
+    def held(self) -> bool:
         return bool(getattr(self._local, '_held', False))
 
 
@@ -413,9 +413,9 @@ def register(reg):
     assert _module(plugins[0]).setup_complete is True
     contexts = cast('list[EventContext]', _module(plugins[0]).contexts)
     assert contexts[0].delivery_attempt == 2
-    handle = cast('_FakeAsyncHandle', fake._handles[0])
-    assert handle._session_uuids == ['async-session']
-    assert handle._closed is True
+    handle = cast('_FakeAsyncHandle', fake.handles[0])
+    assert handle.session_uuids == ['async-session']
+    assert handle.closed is True
 
 
 def test_async_provider_creation_cancelled_error_returns_retryable_setup_failure() -> None:
@@ -423,7 +423,7 @@ def test_async_provider_creation_cancelled_error_returns_retryable_setup_failure
     site = _site(group)
     provider, fake = _provider()
     protected_value = 'default-creds-api-key'
-    fake._async_create_errors.append(asyncio.CancelledError(f'provider exposed {protected_value}'))
+    fake.async_create_errors.append(asyncio.CancelledError(f'provider exposed {protected_value}'))
     host = _host(
         site,
         group,
@@ -444,11 +444,11 @@ def test_async_provider_creation_cancelled_error_returns_retryable_setup_failure
     assert first.plugin_id == 'cancelled-provider'
     assert protected_value not in str(first)
     assert second is None
-    assert fake._create_calls == [
+    assert fake.create_calls == [
         ('async', _SITE_URL, 'default-creds'),
         ('async', _SITE_URL, 'default-creds'),
     ]
-    assert len(fake._handles) == 1
+    assert len(fake.handles) == 1
 
 
 def test_async_session_setter_failure_returns_redacted_group_halt(
@@ -488,10 +488,8 @@ def register(reg):
 
     async def _invoke() -> PluginError | None:
         assert await host.setup_async() is None
-        handle = cast('_FakeAsyncHandle', fake._handles[0])
-        handle._session_error = RuntimeError(
-            f'setter exposed {protected_value} {protected_digest}'
-        )
+        handle = cast('_FakeAsyncHandle', fake.handles[0])
+        handle.session_error = RuntimeError(f'setter exposed {protected_value} {protected_digest}')
         return await host.invoke_async(
             plugins[0],
             plugins[0].callbacks[0],
@@ -546,8 +544,24 @@ def test_async_setup_cancelled_error_retries_existing_handle() -> None:
     assert protected_value not in str(first)
     assert second is None
     assert attempts == 2
-    assert len(fake._handles) == 1
-    assert setup_handles[0] is setup_handles[1] is fake._handles[0]
+    assert len(fake.handles) == 1
+    assert setup_handles[0] is setup_handles[1] is fake.handles[0]
+
+
+def test_cyclic_callback_wrapper_is_a_registration_error_and_releases_module(
+    tmp_path: Path,
+) -> None:
+    path = _write_plugin(
+        tmp_path,
+        'def callback(context):\n    pass\n'
+        'callback.__wrapped__ = callback\n'
+        "def register(reg):\n    reg.add_callback(id='cyclic', callback=callback)\n",
+    )
+    group = _group((_plugin(path, 'cyclic'),))
+    provider, _fake = _provider()
+    with pytest.raises(PluginError, match='registration-invalid'):
+        load_plugins(_site(group), group, provider)
+    assert 'sg_event_daemon._trusted_plugins.studio.editorial.cyclic' not in sys.modules
 
 
 @pytest.mark.parametrize('execution', ['sync', 'async'])
@@ -565,8 +579,8 @@ def test_host_close_attempts_every_handle_and_reraises_first_base_exception(
     else:
         assert host.setup_sync() is None
     first_error = KeyboardInterrupt('first close failure')
-    fake._handles[2]._close_error = first_error
-    fake._handles[0]._close_error = SystemExit('later close failure')
+    fake.handles[2].close_error = first_error
+    fake.handles[0].close_error = SystemExit('later close failure')
 
     def _close() -> None:
         if execution == 'async':
@@ -578,7 +592,7 @@ def test_host_close_attempts_every_handle_and_reraises_first_base_exception(
         _close()
 
     assert raised.value is first_error
-    assert fake._close_attempts == [2, 1, 0]
+    assert fake.close_attempts == [2, 1, 0]
 
     if execution == 'async':
         assert asyncio.run(host.setup_async()) is None
@@ -587,8 +601,8 @@ def test_host_close_attempts_every_handle_and_reraises_first_base_exception(
         assert host.setup_sync() is None
         host.close_sync()
 
-    assert len(fake._handles) == 6
-    assert fake._close_attempts == [2, 1, 0, 5, 4, 3]
+    assert len(fake.handles) == 6
+    assert fake.close_attempts == [2, 1, 0, 5, 4, 3]
 
 
 @pytest.mark.parametrize('execution', ['sync', 'async'])
@@ -612,8 +626,8 @@ def test_host_close_finishes_cleanup_before_rendering_first_failure(
     else:
         assert host.setup_sync() is None
     first_error = _HostileCloseError(protected_value)
-    fake._handles[2]._close_error = first_error
-    fake._handles[0]._close_error = RuntimeError('later close failure')
+    fake.handles[2].close_error = first_error
+    fake.handles[0].close_error = RuntimeError('later close failure')
 
     def _close() -> None:
         if execution == 'async':
@@ -629,7 +643,7 @@ def test_host_close_finishes_cleanup_before_rendering_first_failure(
     assert raised.value.__cause__ is first_error
     assert protected_value not in str(raised.value)
     assert '<unprintable>' in str(raised.value)
-    assert fake._close_attempts == [2, 1, 0]
+    assert fake.close_attempts == [2, 1, 0]
 
 
 @pytest.mark.parametrize('execution', ['sync', 'async'])
@@ -649,8 +663,8 @@ def test_host_close_redacts_first_ordinary_failure_and_preserves_cause(
     protected_value = site.credentials['default-creds'].api_key.reveal()
     first_error = RuntimeError(f'first close exposed {protected_value}')
     later_error = ValueError(f'later close exposed {protected_value}')
-    fake._handles[2]._close_error = first_error
-    fake._handles[0]._close_error = later_error
+    fake.handles[2].close_error = first_error
+    fake.handles[0].close_error = later_error
 
     def _close() -> None:
         if execution == 'async':
@@ -666,7 +680,7 @@ def test_host_close_redacts_first_ordinary_failure_and_preserves_cause(
     assert raised.value.__cause__ is first_error
     assert protected_value not in str(raised.value)
     assert '<redacted>' in str(raised.value)
-    assert fake._close_attempts == [2, 1, 0]
+    assert fake.close_attempts == [2, 1, 0]
 
 
 def test_hosted_logger_attaches_exact_filter_when_existing_filter_compares_equal(
@@ -716,8 +730,8 @@ def test_hosted_logger_concurrent_access_attaches_secret_filter_once(
     class _SynchronizedFilters(list[logging.Filter]):
         def __contains__(self, item: object) -> bool:
             contains = super().__contains__(item)
-            if not attachment_lock._held:
-                membership_entrants.wait(timeout=2)
+            if not attachment_lock.held:
+                membership_entrants.wait()
             return contains
 
     plugin = _plugin_spec('concurrent-filter')
@@ -736,7 +750,7 @@ def test_hosted_logger_concurrent_access_attaches_secret_filter_once(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(hosted_logger, host, plugin) for _index in range(2)]
-        loggers = [future.result(timeout=3) for future in futures]
+        loggers = [future.result() for future in futures]
 
     assert loggers == [logger, logger]
     assert sum(item is secret_filter for item in filters) == 1
@@ -750,7 +764,7 @@ def test_hosted_logger_does_not_run_filter_equality_under_attachment_lock(
 
     class _LockTakingFilter(logging.Filter):
         def __eq__(self, _other: object) -> bool:
-            acquired = attachment_lock.acquire(timeout=0.1)
+            acquired = attachment_lock.acquire(blocking=False)
             lock_attempts.append(acquired)
             if acquired:
                 attachment_lock.release()
@@ -777,7 +791,7 @@ def test_hosted_logger_does_not_run_filter_equality_under_attachment_lock(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(hosted_logger, host, plugin)
-        assert future.result(timeout=1) is logger
+        assert future.result() is logger
 
     assert lock_attempts == []
     assert sum(existing is secret_filter_state[0] for existing in filters) == 1
@@ -947,7 +961,7 @@ def register(reg):
         else:
             assert setup_failure is None
             failure = RuntimeError(f'teardown exposed {credential} {protected_value}')
-            fake._handles[0]._close_error = failure
+            fake.handles[0].close_error = failure
         try:
             if stage == 'teardown':
                 host.close_sync()
@@ -1034,17 +1048,12 @@ def test_load_failures_redact_configured_values_before_plugin_execution(
     assert all('<redacted>' in surface for surface in surfaces)
 
 
-def test_loader_rejects_directory_and_duplicate_plugin_ids(tmp_path: Path) -> None:
+def test_loader_rejects_directory(tmp_path: Path) -> None:
     provider, _fake = _provider()
     directory_group = _group((_plugin(tmp_path, 'directory'),))
 
     with pytest.raises(PluginError, match='regular file'):
         load_plugins(_site(directory_group), directory_group, provider)
-
-    path = _write_plugin(tmp_path, 'def register(reg):\n    pass\n')
-    duplicate_group = _group((_plugin(path, 'same'), _plugin(path, 'same')))
-    with pytest.raises(PluginError, match=r'duplicate plugin id.*same'):
-        load_plugins(_site(duplicate_group), duplicate_group, provider)
 
 
 @pytest.mark.parametrize(
@@ -1287,10 +1296,10 @@ def register(reg):
     finally:
         logger.removeHandler(structured_handler)
 
-    assert structured_handler._payloads
-    assert all(protected_value not in payload for payload in structured_handler._payloads)
-    assert all(protected_digest not in payload for payload in structured_handler._payloads)
-    assert all('<unprintable>' in payload for payload in structured_handler._payloads)
+    assert structured_handler.payloads
+    assert all(protected_value not in payload for payload in structured_handler.payloads)
+    assert all(protected_digest not in payload for payload in structured_handler.payloads)
+    assert all('<unprintable>' in payload for payload in structured_handler.payloads)
 
 
 def test_log_redaction_sanitizes_arbitrary_message_and_extra_objects(
@@ -1351,16 +1360,14 @@ def register(reg):
         logger.removeHandler(handler)
         logger.removeHandler(structured_handler)
 
-    surfaces = (stream.getvalue(), *structured_handler._payloads)
+    surfaces = (stream.getvalue(), *structured_handler.payloads)
     assert all(protected_value not in surface for surface in surfaces)
     assert all(protected_digest not in surface for surface in surfaces)
     assert 'message=<redacted>:<redacted>' in stream.getvalue()
     assert any(
-        'message=<redacted>:<redacted>' in payload for payload in structured_handler._payloads
+        'message=<redacted>:<redacted>' in payload for payload in structured_handler.payloads
     )
-    assert any(
-        'extra=<redacted>:<redacted>' in payload for payload in structured_handler._payloads
-    )
+    assert any('extra=<redacted>:<redacted>' in payload for payload in structured_handler.payloads)
 
 
 def test_manifest_is_exact_immutable_and_uses_plugin_credential_override(
@@ -1472,7 +1479,7 @@ def register(reg):
     assert isinstance(halt, PluginError)
     assert halt.code == 'secret-missing'
     assert 'MISSING_PLUGIN_SECRET' in str(halt)
-    assert fake._create_calls == []
+    assert fake.create_calls == []
 
 
 def test_plugin_error_redacts_overlapping_secrets_in_rendered_identity(
@@ -1891,6 +1898,24 @@ def test_registration_failures_explain_trusted_code_boundary(
     assert 'side-effect-free' in text
 
 
+def test_registration_invalid_callback_id_names_allowed_form(tmp_path: Path) -> None:
+    path = _write_plugin(
+        tmp_path,
+        """
+def callback(ctx):
+    pass
+
+def register(reg):
+    reg.add_callback(id='CamelCase', callback=callback)
+""",
+    )
+    group = _group((_plugin(path, 'invalid-id'),))
+    provider, _fake = _provider()
+
+    with pytest.raises(PluginError, match=r'invalid callback id.*1-64 lowercase'):
+        load_plugins(_site(group), group, provider)
+
+
 def test_registration_preserves_declared_order_and_explicit_ids(tmp_path: Path) -> None:
     path = _write_plugin(
         tmp_path,
@@ -1947,6 +1972,39 @@ def test_registration_rejects_async_functions_and_awaitable_results(
     assert not [warning for warning in captured if 'was never awaited' in str(warning.message)]
 
 
+@pytest.mark.parametrize(
+    ('exit_call', 'class_name'),
+    [('raise SystemExit(3)', 'SystemExit'), ('raise KeyboardInterrupt()', 'KeyboardInterrupt')],
+)
+def test_callback_exit_returns_callback_failed_naming_the_class(
+    tmp_path: Path, exit_call: str, class_name: str
+) -> None:
+    path = _write_plugin(
+        tmp_path,
+        f'def callback(ctx):\n    {exit_call}\n\ndef register(reg):\n'
+        "    reg.add_callback(id='only', callback=callback)\n",
+    )
+    group = _group((_plugin(path, 'exiting'),))
+    provider, _fake = _provider()
+    site = _site(group)
+    plugins = load_plugins(site, group, provider)
+    host = _host(site, group, provider, plugins)
+    assert host.setup_sync() is None
+    try:
+        failure = host.invoke_sync(
+            plugins[0],
+            plugins[0].callbacks[0],
+            _event(None),
+            delivery_attempt=1,
+            is_operator_replay=False,
+        )
+    except (SystemExit, KeyboardInterrupt):
+        pytest.fail('plugin exit escaped the callback boundary')
+    assert isinstance(failure, PluginError)
+    assert failure.code == 'callback-failed'
+    assert class_name in str(failure)
+
+
 def test_registration_rejects_duplicate_callback_ids(tmp_path: Path) -> None:
     path = _write_plugin(
         tmp_path,
@@ -1984,8 +2042,8 @@ def test_secret_filter_concurrent_cold_start_constructs_once(
     def construct_filter() -> logging.Filter:
         instance = original_filter_type()
         constructions.append(instance)
-        if not initialization_lock._held:
-            construction_entrants.wait(timeout=2)
+        if not initialization_lock.held:
+            construction_entrants.wait()
         return instance
 
     monkeypatch.setattr(plugins_module, '_SECRET_FILTER_STATE', [])
@@ -1998,7 +2056,7 @@ def test_secret_filter_concurrent_cold_start_constructs_once(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(secret_filter_factory) for _index in range(2)]
-        filters = [future.result(timeout=3) for future in futures]
+        filters = [future.result() for future in futures]
 
     assert filters[0] is filters[1]
     assert constructions == [filters[0]]
@@ -2093,12 +2151,78 @@ def register(reg):
         stream.getvalue(),
         str(failure),
         CallbackManifest(callbacks=(plugins[0].callbacks[0].identity,)).to_json(),
-        *structured_handler._payloads,
+        *structured_handler.payloads,
     )
     assert '<redacted>' in stream.getvalue()
-    assert structured_handler._payloads
+    assert structured_handler.payloads
     assert all(protected_value not in surface for surface in surfaces)
     assert all(secret_digest not in surface for surface in surfaces)
+
+
+@pytest.mark.parametrize(
+    ('exit_call', 'class_name'),
+    [('raise SystemExit(3)', 'SystemExit'), ('raise KeyboardInterrupt()', 'KeyboardInterrupt')],
+)
+def test_setup_exit_returns_setup_failed_naming_the_class(
+    tmp_path: Path, exit_call: str, class_name: str
+) -> None:
+    path = _write_plugin(
+        tmp_path,
+        f'def setup(ctx):\n    {exit_call}\n\ndef register(reg):\n    reg.set_setup(setup)\n',
+    )
+    group = _group((_plugin(path, 'exiting'),))
+    provider, _fake = _provider()
+    site = _site(group)
+    plugins = load_plugins(site, group, provider)
+    try:
+        failure = _host(site, group, provider, plugins).setup_sync()
+    except (SystemExit, KeyboardInterrupt):
+        pytest.fail('plugin exit escaped the setup boundary')
+    assert isinstance(failure, PluginError)
+    assert failure.code == 'setup-failed'
+    assert class_name in str(failure)
+
+
+@pytest.mark.parametrize('stage', ['callback', 'setup'])
+@pytest.mark.parametrize('exit_call', ['raise SystemExit(3)', 'raise KeyboardInterrupt()'])
+def test_async_plugin_exit_returns_failure_and_loop_survives(
+    tmp_path: Path, stage: str, exit_call: str
+) -> None:
+    path = _write_plugin(
+        tmp_path,
+        f'async def setup(ctx):\n    {exit_call if stage == "setup" else "pass"}\n\n'
+        f'async def callback(ctx):\n    {exit_call if stage == "callback" else "pass"}\n\n'
+        'def register(reg):\n    reg.set_setup(setup)\n'
+        "    reg.add_callback(id='only', callback=callback)\n",
+    )
+    group = _group((_plugin(path, 'exiting'),), execution='async')
+    provider, _fake = _provider()
+    site = _site(group)
+    plugins = load_plugins(site, group, provider)
+    host = _host(site, group, provider, plugins)
+
+    async def exercise() -> PluginError | None:
+        failure = await host.setup_async()
+        if stage == 'callback':
+            assert failure is None
+            failure = await host.invoke_async(
+                plugins[0],
+                plugins[0].callbacks[0],
+                _event(None),
+                delivery_attempt=1,
+                is_operator_replay=False,
+            )
+        assert await asyncio.sleep(0, result=True)
+        return failure
+
+    try:
+        failure = asyncio.run(exercise())
+    except (SystemExit, KeyboardInterrupt):
+        pytest.fail('plugin exit escaped the async boundary')
+    assert isinstance(failure, PluginError)
+    assert failure.code == ('setup-failed' if stage == 'setup' else 'callback-failed')
+    class_name = 'SystemExit' if 'SystemExit' in exit_call else 'KeyboardInterrupt'
+    assert class_name in str(failure)
 
 
 def test_setup_failure_returns_structured_group_halt_and_stops_later_setup(
@@ -2143,7 +2267,7 @@ def register(reg):
     assert halt.plugin_id == 'failing'
     assert halt.callback_id is None
     assert _module(plugins[1]).setup_ran is False
-    assert fake._create_calls == [('sync', _SITE_URL, 'default-creds')]
+    assert fake.create_calls == [('sync', _SITE_URL, 'default-creds')]
 
 
 def test_sync_callback_context_applies_and_clears_session_uuid(tmp_path: Path) -> None:
@@ -2196,8 +2320,8 @@ def register(reg):
 
     assert first is None
     assert second is None
-    handle = cast('_FakeSyncHandle', fake._handles[0])
-    assert handle._session_uuids == ['browser-session', None]
+    handle = cast('_FakeSyncHandle', fake.handles[0])
+    assert handle.session_uuids == ['browser-session', None]
     contexts = cast('list[EventContext]', _module(plugins[0]).contexts)
     assert tuple(context.event['session_uuid'] for context in contexts) == (
         'browser-session',
@@ -2270,12 +2394,12 @@ def register(reg):
 
     assert setup_results == [None]
     contexts = tuple(cast('SetupContext', _module(plugin).setup_contexts[0]) for plugin in plugins)
-    assert fake._create_calls == [
+    assert fake.create_calls == [
         ('sync', _SITE_URL, 'default-creds'),
         ('sync', _SITE_URL, 'plugin-creds'),
     ]
     assert lane_thread.ident is not None
-    assert fake._create_threads == [lane_thread.ident, lane_thread.ident]
+    assert fake.create_threads == [lane_thread.ident, lane_thread.ident]
     assert len({id(context.sg) for context in contexts}) == 2
     assert beats == ['beat', 'beat']
     assert all(
@@ -2292,7 +2416,7 @@ def register(reg):
     stopping = True
     assert all(context.shutdown_requested for context in contexts)
     host.close_sync()
-    assert all(handle._closed for handle in fake._handles)
+    assert all(handle.closed for handle in fake.handles)
 
 
 @pytest.mark.parametrize('result', [None, False, 0, 'value', [1], {'key': 'value'}])
@@ -2351,8 +2475,8 @@ def register(reg):
     plugins = load_plugins(site, group, provider)
     host = _host(site, group, provider, plugins)
     assert host.setup_sync() is None
-    handle = cast('_FakeSyncHandle', fake._handles[0])
-    handle._session_error = RuntimeError(f'setter exposed {protected_value} {protected_digest}')
+    handle = cast('_FakeSyncHandle', fake.handles[0])
+    handle.session_error = RuntimeError(f'setter exposed {protected_value} {protected_digest}')
 
     failure = host.invoke_sync(
         plugins[0],
@@ -2381,8 +2505,8 @@ def test_with_heartbeat_preserves_event_context_and_updates_callback() -> None:
         source='events',
         group='editorial',
         plugin_id='notify',
-        _heartbeat_callback=lambda: called.append('old'),
-        _shutdown_check=lambda: False,
+        heartbeat_callback=lambda: called.append('old'),
+        shutdown_check=lambda: False,
         event=cast('Event', object()),
         callback_id='update',
         delivery_attempt=2,

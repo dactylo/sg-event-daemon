@@ -10,35 +10,13 @@ from ._source_schema import BUMP_RANGE_REVISION
 
 if TYPE_CHECKING:
     import sqlite3
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Iterable, Sequence
+    from pathlib import Path
 
+    from ._gaps import IdRun
     from ._group_types import (
         ReplayRequiredNotice,
     )
-
-_SourceCapacityCode: TypeAlias = Literal[
-    'frame-too-large',
-    'late-capacity-exhausted',
-    'obligation-capacity-exhausted',
-    'range-capacity-exhausted',
-]
-
-_SourceIdentityCode: TypeAlias = Literal[
-    'adoption-command-conflict',
-    'adoption-id-not-current',
-    'adoption-id-reused',
-    'adoption-identity-required',
-    'adoption-requires-identity-halt',
-    'adoption-requires-parked-groups',
-    'adoption-requires-prior-incarnation',
-    'adoption-reservation-invalid',
-    'adoption-target-mismatch',
-    'configured-stream-conflict',
-    'source-database-identity-changed',
-    'stream-identity-changed',
-    'terminal-disposition-id-reused',
-    'terminal-disposition-incomplete',
-]
 
 _SourceStatus: TypeAlias = Literal[
     'late-capacity-exhausted',
@@ -55,13 +33,7 @@ _DiscoveryRangeRow: TypeAlias = tuple[
     int,
     int,
     float,
-    float,
-    int,
-    int,
     str,
-    float | None,
-    int,
-    int,
     int,
     int,
 ]
@@ -91,42 +63,30 @@ class DiscoveryRange:
     `scan_cycle_pages` counts completed provider pages in the current query
     cycle; resuming after the page cap resets that cycle count while retaining
     cumulative logical-scan progress. `scan_next_id` is the inclusive position
-    for the next provider query.
+    for the next provider query. `late_id_count` is the number of recorded IDs
+    retained for this range.
     """
 
     obligation_id: str
     low_id: int
     high_id: int
     opened_successful_at: float
-    _visibility_deadline: float
-    _revision: int
-    _close_generation: int
     state: Literal['closed', 'open']
-    late_ids: tuple[int, ...]
-    group_eligibility: tuple[tuple[str, float], ...]
-    _scan_started_at: float | None
+    late_id_count: int
     scan_next_id: int
-    _scan_pages: int
-    _degraded: bool
     scan_cycle_pages: int = 0
 
 
 @dataclass(frozen=True)
 class RangeMutation:
-    """Describe one staged inclusive range revision.
-
-    Each `existing_eligibility` item contains `(group_name, group_generation,
-    eligibility_point)` for one retained group revision.
-    """
+    """Describe one staged inclusive range revision."""
 
     obligation_id: str
-    merged_ids: tuple[str, ...]
     low_id: int
     high_id: int
     opened_successful_at: float
     visibility_deadline: float
     revision: int
-    existing_eligibility: tuple[tuple[str, int, float], ...]
 
 
 @dataclass(frozen=True)
@@ -137,38 +97,16 @@ class RangeScanProgress:
     query_page_complete: bool
 
 
-class SourceCapacityError(RuntimeError):
-    """Report a source limit that halted before affected evidence committed.
-
-    `code` identifies the capacity limit independently of the diagnostic.
-    """
-
-    def __init__(self, message: str, *, code: _SourceCapacityCode | None = None) -> None:
-        """Keep the diagnostic separate from the machine-readable reason.
-
-        Args:
-            message: Human-readable diagnostic preserved by `str(error)`.
-            code: Stable reason for control flow; `None` is unclassified.
-        """
-        super().__init__(message)
-        self.code = code
-
-
 class SourceIdentityError(RuntimeError):
-    """Report a rejected stream identity or adoption transition.
+    """Report a rejected stream identity or adoption transition."""
 
-    `code` identifies the rejected transition independently of the diagnostic.
-    """
-
-    def __init__(self, message: str, *, code: _SourceIdentityCode | None = None) -> None:
-        """Keep the diagnostic separate from the machine-readable reason.
+    def __init__(self, message: str) -> None:
+        """Preserve the diagnostic as the exception message.
 
         Args:
             message: Human-readable diagnostic preserved by `str(error)`.
-            code: Stable reason for control flow; `None` is unclassified.
         """
         super().__init__(message)
-        self.code = code
 
 
 @dataclass(frozen=True)
@@ -190,7 +128,7 @@ class SourceSettings:
     source: str
     configured_fingerprint: str
     source_generation: str
-    visibility_overlap_secs: float
+    late_event_window_secs: float
     max_open_ranges: int
     max_range_query_pages: int
     max_pending_group_obligations: int
@@ -226,7 +164,6 @@ class _RangeStageOptions(TypedDict):
     low_id: int
     high_id: int
     successful_clock: float
-    new_token: Callable[[], str]
 
 
 class _SnapshotOptions(TypedDict):
@@ -279,8 +216,7 @@ def _clear_range_query_page_condition(connection: sqlite3.Connection) -> None:
 
 def _discovery_range_from_row(
     row: Sequence[object],
-    late_ids: Sequence[int],
-    group_eligibility: Sequence[tuple[str, float]],
+    late_id_count: int,
 ) -> DiscoveryRange:
     """Convert one persisted range row and its owned evidence."""
     normalized = cast('_DiscoveryRangeRow', tuple(row))
@@ -289,17 +225,10 @@ def _discovery_range_from_row(
         low_id=int(normalized[1]),
         high_id=int(normalized[2]),
         opened_successful_at=float(normalized[3]),
-        _visibility_deadline=float(normalized[4]),
-        _revision=int(normalized[5]),
-        _close_generation=int(normalized[6]),
-        state=cast("Literal['closed', 'open']", str(normalized[7])),
-        late_ids=tuple(late_ids),
-        group_eligibility=tuple(group_eligibility),
-        _scan_started_at=None if normalized[8] is None else float(normalized[8]),
-        scan_next_id=int(normalized[9]),
-        _scan_pages=int(normalized[10]),
-        _degraded=bool(normalized[11]),
-        scan_cycle_pages=int(normalized[12]),
+        state=cast("Literal['closed', 'open']", str(normalized[4])),
+        late_id_count=late_id_count,
+        scan_next_id=int(normalized[5]),
+        scan_cycle_pages=int(normalized[6]),
     )
 
 
@@ -331,23 +260,6 @@ def _range_is_closed(
     return str(row[0]) == 'closed'
 
 
-def _range_late_ids(
-    connection: sqlite3.Connection,
-    obligation_id: str,
-) -> tuple[int, ...]:
-    """Return exact retained late ids for one range."""
-    return tuple(
-        int(item[0])
-        for item in connection.execute(
-            """
-            SELECT event_id FROM source_late_ids
-            WHERE obligation_id = ? ORDER BY event_id
-            """,
-            (obligation_id,),
-        )
-    )
-
-
 def _require_nonnegative_integer(value: int, name: str) -> None:
     """Reject Boolean, negative, or non-integer ids."""
     if type(value) is not int or value < 0:
@@ -371,6 +283,7 @@ def begin_range_scan(
 
     Raises:
         ValueError: The obligation does not identify a retained open range.
+        sqlite3.Error: SQLite cannot read or update the scan progress.
     """
     row = connection.execute(
         """
@@ -416,14 +329,18 @@ def begin_range_scan(
 
 
 def can_query(connection: sqlite3.Connection, configured_fingerprint: str) -> bool:
-    """Return whether the persisted and configured stream identities match.
+    """Return whether stream identity permits provider queries.
 
     Args:
         connection: Facade-owned connection.
         configured_fingerprint: Current configured stream identity.
 
     Returns:
-        `True` when SG queries are permitted.
+        `True` when source metadata exists, its fingerprint matches, and its
+        condition is not `stream-identity-changed`.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the source identity.
     """
     row = connection.execute('SELECT stream_fingerprint, condition FROM source_meta').fetchone()
     return (
@@ -442,6 +359,9 @@ def clear_capacity_condition(connection: sqlite3.Connection) -> None:
 
     Args:
         connection: Facade-owned live transaction connection.
+
+    Raises:
+        sqlite3.Error: SQLite cannot inspect or update the source condition.
     """
     row = connection.execute('SELECT condition FROM source_meta').fetchone()
     recoverable = CAPACITY_CONDITIONS | {'range-query-page-cap'}
@@ -462,8 +382,44 @@ def disposition_audit_count(connection: sqlite3.Connection) -> int:
 
     Returns:
         Number of retained disposition audit rows.
+
+    Raises:
+        sqlite3.Error: SQLite cannot count the disposition audit rows.
     """
     return int(connection.execute('SELECT COUNT(*) FROM disposition_audit').fetchone()[0])
+
+
+def disposition_observation(
+    connection: sqlite3.Connection, group: str, disposition_id: str
+) -> tuple[tuple[int, int] | None, int, bool, str] | None:
+    """Read a disposition receipt and the group's current admission fields.
+
+    Returns:
+        `(receipt, revision, parked, lifecycle)`, or `None` when the group
+        state is absent. The receipt is `(old_generation, new_generation)`, or
+        `None` when this disposition has no audit record.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the receipt or group state.
+    """
+    receipt = connection.execute(
+        'SELECT old_generation, new_generation FROM disposition_audit '
+        'WHERE group_name = ? AND disposition_id = ?',
+        (group, disposition_id),
+    ).fetchone()
+    state = connection.execute(
+        'SELECT revision, parked, lifecycle FROM group_state '
+        'JOIN groups USING (group_name) WHERE group_name = ?',
+        (group,),
+    ).fetchone()
+    if state is None:
+        return None
+    return (
+        None if receipt is None else (int(receipt[0]), int(receipt[1])),
+        int(state[0]),
+        bool(state[1]),
+        str(state[2]),
+    )
 
 
 def due_range_id(connection: sqlite3.Connection) -> str | None:
@@ -474,6 +430,9 @@ def due_range_id(connection: sqlite3.Connection) -> str | None:
 
     Returns:
         One due range in deadline order, or `None`.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the due ranges.
     """
     row = connection.execute(
         """
@@ -510,8 +469,23 @@ def eligible_groups(
     Returns:
         Rows shaped as `(group_name, group_generation, delivery_floor,
         holdback_secs)`, ordered by group name and generation.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the eligible groups.
     """
     return tuple(row for row in _active_groups(connection) if row[2] < high_id)
+
+
+def group_exists(connection: sqlite3.Connection, group: str) -> bool:
+    """Return whether one durable group row exists.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the group inventory.
+    """
+    return (
+        connection.execute('SELECT 1 FROM groups WHERE group_name = ?', (group,)).fetchone()
+        is not None
+    )
 
 
 def initialize(
@@ -520,7 +494,7 @@ def initialize(
     *,
     incarnation: str | None,
 ) -> None:
-    """Stage first-start frontier, marker, and incarnation.
+    """Stage first-start frontier, initialized flag, and incarnation.
 
     Already initialized state is unchanged. First initialization requires an
     incarnation when none is retained.
@@ -534,6 +508,8 @@ def initialize(
     Raises:
         ValueError: The latest id is not a nonnegative integer or first
             initialization lacks a stream incarnation.
+        RuntimeError: Source metadata is missing.
+        sqlite3.Error: SQLite cannot read or initialize the source metadata.
     """
     frontier = 0 if latest_id is None else latest_id
     _require_nonnegative_integer(frontier, 'latest id')
@@ -561,7 +537,7 @@ def initialize(
     )
 
 
-def initialize_meta(
+def insert_meta(
     connection: sqlite3.Connection,
     *,
     site: str,
@@ -569,51 +545,27 @@ def initialize_meta(
     stream_fingerprint: str,
     source_generation: str,
 ) -> None:
-    """Create or validate the singleton source identity row.
+    """Insert the source identity inside the schema creation transaction.
 
     Args:
-        connection: Facade-owned live transaction connection.
+        connection: FULL-synchronous connection in the creation transaction.
         site: Stable site identity.
         source: Stable configured source name.
         stream_fingerprint: Non-secret configured stream identity.
         source_generation: Supervisor-issued source process identity.
 
     Raises:
-        SourceIdentityError: The database belongs to another source.
+        sqlite3.Error: SQLite cannot insert the source metadata.
     """
-    row = connection.execute(
-        'SELECT site, source_name, stream_fingerprint FROM source_meta'
-    ).fetchone()
-    if row is None:
-        connection.execute(
-            """
-            INSERT INTO source_meta (
-                singleton, site, source_name, stream_fingerprint,
-                stream_incarnation, source_generation, initialized,
-                frontier, successful_clock, condition
-            ) VALUES (1, ?, ?, ?, NULL, ?, 0, 0, 0.0, NULL)
-            """,
-            (site, source, stream_fingerprint, source_generation),
-        )
-        return
-    if str(row[0]) != site or str(row[1]) != source:
-        raise SourceIdentityError(
-            'configured source database identity changed', code='source-database-identity-changed'
-        )
     connection.execute(
         """
-        UPDATE source_meta
-        SET source_generation = ?,
-            condition = CASE
-                WHEN stream_fingerprint != ?
-                THEN 'stream-identity-changed'
-                WHEN condition = 'stream-identity-changed'
-                THEN NULL
-                ELSE condition
-            END
-        WHERE singleton = 1
+        INSERT INTO source_meta (
+            singleton, site, source_name, stream_fingerprint,
+            stream_incarnation, source_generation, initialized,
+            frontier, successful_clock, condition
+        ) VALUES (1, ?, ?, ?, NULL, ?, 0, 0, 0.0, NULL)
         """,
-        (source_generation, stream_fingerprint),
+        (site, source, stream_fingerprint, source_generation),
     )
 
 
@@ -630,6 +582,7 @@ def meta(connection: sqlite3.Connection) -> _SourceMetaRow:
 
     Raises:
         RuntimeError: The database lacks its singleton metadata row.
+        sqlite3.Error: SQLite cannot read the source metadata.
     """
     row = connection.execute(
         """
@@ -645,6 +598,101 @@ def meta(connection: sqlite3.Connection) -> _SourceMetaRow:
     return cast('_SourceMetaRow', tuple(row))
 
 
+def missing_runs(
+    connection: sqlite3.Connection,
+    obligation_id: str,
+) -> tuple[IdRun, ...]:
+    """Return unrecorded inclusive ID runs for one open range.
+
+    Args:
+        connection: Facade-owned connection.
+        obligation_id: Open retained range identity.
+
+    Raises:
+        ValueError: The range is unknown or closed.
+        sqlite3.Error: SQLite cannot read the range or recorded IDs.
+    """
+    row = connection.execute(
+        'SELECT low_id, high_id, range_state FROM discovery_ranges WHERE obligation_id = ?',
+        (obligation_id,),
+    ).fetchone()
+    if row is None or row[2] != 'open':
+        raise ValueError('missing runs require an open discovery range')
+    next_id, high_id = int(row[0]), int(row[1])
+    runs: list[IdRun] = []
+    for (event_id,) in connection.execute(
+        'SELECT event_id FROM source_late_ids WHERE obligation_id = ? ORDER BY event_id',
+        (obligation_id,),
+    ):
+        recorded = int(event_id)
+        if next_id < recorded:
+            runs.append((next_id, recorded - 1))
+        next_id = recorded + 1
+    if next_id <= high_id:
+        runs.append((next_id, high_id))
+    return tuple(runs)
+
+
+def orphan_group_metadata(
+    connection: sqlite3.Connection, group: str
+) -> tuple[int, str, str, str, str, str | None] | None:
+    """Read the durable identity needed to reopen an absent orphan.
+
+    Returns:
+        `(group_generation, ordering_mode, site, source_name,
+        source_generation, stream_incarnation)`, or `None` when the joined
+        identity is absent. The incarnation may itself be `None`.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the group and source identity.
+    """
+    row = connection.execute(
+        """
+        SELECT group_generation, ordering_mode, site, source_name,
+               source_generation, stream_incarnation
+        FROM groups CROSS JOIN source_meta
+        WHERE group_name = ?
+        """,
+        (group,),
+    ).fetchone()
+    return (
+        None
+        if row is None
+        else (
+            int(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            None if row[5] is None else str(row[5]),
+        )
+    )
+
+
+def park_evidence_state(
+    connection: sqlite3.Connection, group: str
+) -> tuple[object, object, object, object] | None:
+    """Read the durable group fence and in-flight event for park evidence.
+
+    Returns:
+        Uncoerced `(group_generation, revision, in_flight_event_id, parked)`
+        values for caller validation, or `None` when the group state is absent.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the park evidence.
+    """
+    row = connection.execute(
+        """
+        SELECT groups.group_generation, group_state.revision,
+               group_state.in_flight_event_id, group_state.parked
+        FROM group_state JOIN groups ON groups.group_name = group_state.group_name
+        WHERE group_state.group_name = ?
+        """,
+        (group,),
+    ).fetchone()
+    return None if row is None else tuple(row)
+
+
 def poll_state(connection: sqlite3.Connection) -> SourcePollState:
     """Return the source fields needed by one polling cycle.
 
@@ -656,6 +704,7 @@ def poll_state(connection: sqlite3.Connection) -> SourcePollState:
 
     Raises:
         RuntimeError: The database lacks its singleton metadata row.
+        sqlite3.Error: SQLite cannot read the polling state.
     """
     row = connection.execute(
         """
@@ -676,7 +725,12 @@ def poll_state(connection: sqlite3.Connection) -> SourcePollState:
 
 
 def prune_unbound_ranges(connection: sqlite3.Connection) -> None:
-    """Retire every range without pending delivery work, including open ranges."""
+    """Retire every range without pending delivery work, including open ranges.
+
+    Raises:
+        sqlite3.Error: SQLite cannot retire ranges or publish changed
+            revisions.
+    """
     changed = connection.execute(
         """
         DELETE FROM discovery_ranges
@@ -703,13 +757,14 @@ def range_for(
 
     Returns:
         The retained range, or `None` when it is absent.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the retained range.
     """
     row = connection.execute(
         """
         SELECT obligation_id, low_id, high_id, opened_successful_at,
-               visibility_deadline, source_revision,
-               close_generation, range_state, scan_started_at,
-               scan_next_id, scan_pages, degraded, scan_cycle_pages
+               range_state, scan_next_id, scan_cycle_pages
         FROM discovery_ranges
         WHERE obligation_id = ?
         """,
@@ -717,20 +772,12 @@ def range_for(
     ).fetchone()
     if row is None:
         return None
-    late_ids = _range_late_ids(connection, obligation_id)
-    eligibility = tuple(
-        (str(group), float(point))
-        for group, point in connection.execute(
-            """
-            SELECT group_name, eligibility_point
-            FROM range_groups
-            WHERE obligation_id = ? AND obligation_state = 'pending'
-            ORDER BY group_name, group_generation
-            """,
-            (obligation_id,),
-        )
-    )
-    return _discovery_range_from_row(row, late_ids, eligibility)
+    count_row = connection.execute(
+        'SELECT COUNT(*) FROM source_late_ids WHERE obligation_id = ? GROUP BY obligation_id',
+        (obligation_id,),
+    ).fetchone()
+    count = 0 if count_row is None else int(count_row[0])
+    return _discovery_range_from_row(row, count)
 
 
 def ranges(connection: sqlite3.Connection) -> tuple[DiscoveryRange, ...]:
@@ -741,46 +788,35 @@ def ranges(connection: sqlite3.Connection) -> tuple[DiscoveryRange, ...]:
 
     Returns:
         Immutable retained ranges.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the retained ranges.
     """
     rows = connection.execute(
         """
         SELECT obligation_id, low_id, high_id, opened_successful_at,
-               visibility_deadline, source_revision,
-               close_generation, range_state, scan_started_at,
-               scan_next_id, scan_pages, degraded, scan_cycle_pages
+               range_state, scan_next_id, scan_cycle_pages
         FROM discovery_ranges
         ORDER BY low_id, high_id, obligation_id
         """
     ).fetchall()
-    late_ids_by_range: dict[str, list[int]] = {}
-    for obligation_id, event_id in connection.execute(
-        """
-        SELECT obligation_id, event_id
-        FROM source_late_ids
-        ORDER BY obligation_id, event_id
-        """
-    ):
-        late_ids_by_range.setdefault(str(obligation_id), []).append(int(event_id))
-    eligibility_by_range: dict[str, list[tuple[str, float]]] = {}
-    for obligation_id, group_name, eligibility_point in connection.execute(
-        """
-        SELECT obligation_id, group_name, eligibility_point
-        FROM range_groups
-        WHERE obligation_state = 'pending'
-        ORDER BY obligation_id, group_name, group_generation
-        """
-    ):
-        eligibility_by_range.setdefault(str(obligation_id), []).append(
-            (str(group_name), float(eligibility_point))
+    late_counts = {
+        str(obligation_id): int(count)
+        for obligation_id, count in connection.execute(
+            """
+            SELECT obligation_id, COUNT(*)
+            FROM source_late_ids
+            GROUP BY obligation_id
+            """
         )
+    }
     result: list[DiscoveryRange] = []
     for row in rows:
         obligation_id = str(row[0])
         result.append(
             _discovery_range_from_row(
                 row,
-                late_ids_by_range.get(obligation_id, ()),
-                eligibility_by_range.get(obligation_id, ()),
+                late_counts.get(obligation_id, 0),
             )
         )
     return tuple(result)
@@ -798,6 +834,9 @@ def reset_for_adoption(
         connection: Facade-owned FULL transaction connection.
         stream_fingerprint: Adopted configured stream identity.
         incarnation: Stable adoption and next initialization identity.
+
+    Raises:
+        sqlite3.Error: SQLite cannot reset the source metadata.
     """
     connection.execute(
         """
@@ -814,12 +853,39 @@ def reset_for_adoption(
     )
 
 
+def restart_group_identity(
+    connection: sqlite3.Connection, group: str
+) -> tuple[str, str, int] | None:
+    """Read the source and group identity of a durable restart candidate.
+
+    Returns:
+        `(site, group_name, group_generation)`, or `None` when the joined
+        source, group, and group-state identity is absent.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the restart identity.
+    """
+    row = connection.execute(
+        """
+        SELECT source_meta.site, groups.group_name, groups.group_generation
+        FROM groups CROSS JOIN source_meta
+        JOIN group_state ON group_state.group_name = groups.group_name
+        WHERE groups.group_name = ?
+        """,
+        (group,),
+    ).fetchone()
+    return None if row is None else (str(row[0]), str(row[1]), int(row[2]))
+
+
 def set_condition(connection: sqlite3.Connection, condition: str) -> None:
     """Stage one source halt condition.
 
     Args:
         connection: Facade-owned live transaction connection.
         condition: Exact source condition code.
+
+    Raises:
+        sqlite3.Error: SQLite cannot store the condition.
     """
     connection.execute(
         'UPDATE source_meta SET condition = ? WHERE singleton = 1',
@@ -845,12 +911,16 @@ def record_range_scan_page(
         successful_clock: Current successful-query clock.
 
     Returns:
-        `True` only when a complete scan begun after the deadline finished.
+        `True` only when a complete scan begun at or after the deadline
+        finished and the current successful clock has reached the deadline.
 
     Raises:
         ValueError: The range is not open or progress is outside its current
             inclusive bounds.
         TypeError: The page completion flag is not a Boolean.
+        RuntimeError: Source metadata is missing when recording a page-cap
+            condition.
+        sqlite3.Error: SQLite cannot read or update the scan progress.
     """
     row = connection.execute(
         """
@@ -892,7 +962,7 @@ def record_range_scan_page(
         """,
         (next_id, pages, int(degraded), cycle_pages, obligation_id),
     )
-    if hit_cap:
+    if hit_cap and meta(connection)[8] not in CAPACITY_CONDITIONS:
         set_condition(connection, 'range-query-page-cap')
     elif complete:
         _clear_range_query_page_condition(connection)
@@ -918,6 +988,11 @@ def snapshot(
 
     Returns:
         Complete immutable body-free source snapshot.
+
+    Raises:
+        RuntimeError: Source metadata is missing or its persisted condition is
+            unknown.
+        sqlite3.Error: SQLite cannot read the source projection.
     """
     row = meta(connection)
     stored_fingerprint = str(row[5])
@@ -962,144 +1037,94 @@ def stage_open_range(
     settings: SourceSettings,
     **options: Unpack[_RangeStageOptions],
 ) -> RangeMutation:
-    """Stage one inclusive range insertion or overlap merge.
+    """Stage one inclusive open-range insertion.
 
     Args:
         connection: Facade-owned live transaction connection.
         settings: Validated source limits.
-        options: Inclusive bounds, observation clock, and non-reusable token
-            source.
+        options: Inclusive bounds and observation clock; the obligation ID is
+            `range-<low>-<high>`. The bounds must not overlap an existing open
+            range.
 
     Returns:
         Exact range revision staged in the current transaction.
 
     Raises:
-        SourceCapacityError: A new nonoverlapping range cannot fit.
+        sqlite3.Error: SQLite cannot inspect or insert the range, or publish
+            its revision.
     """
     low_id = options['low_id']
     high_id = options['high_id']
     successful_clock = options['successful_clock']
-    overlapping = connection.execute(
+    overlap = connection.execute(
         """
-        SELECT obligation_id, low_id, high_id, opened_successful_at,
-               visibility_deadline, source_revision
+        SELECT 1
         FROM discovery_ranges
         WHERE range_state = 'open'
           AND low_id <= ?
           AND high_id >= ?
-        ORDER BY low_id, high_id, obligation_id
+        LIMIT 1
         """,
         (high_id, low_id),
-    ).fetchall()
-    if overlapping:
-        obligation_id = str(overlapping[0][0])
-        merged_ids = tuple(str(row[0]) for row in overlapping)
-        merged_low = min(low_id, *(int(row[1]) for row in overlapping))
-        merged_high = max(high_id, *(int(row[2]) for row in overlapping))
-        opened_at = min(successful_clock, *(float(row[3]) for row in overlapping))
-        deadline = max(
-            successful_clock + settings.visibility_overlap_secs,
-            *(float(row[4]) for row in overlapping),
-        )
-        revision = max(int(row[5]) for row in overlapping) + 1
-        existing_eligibility = tuple(
-            (
-                str(item[0]),
-                int(item[1]),
-                float(item[2]),
-            )
-            for merged_id in merged_ids
-            for item in connection.execute(
-                """
-                SELECT group_name, group_generation, eligibility_point
-                FROM range_groups
-                WHERE obligation_id = ?
-                """,
-                (merged_id,),
-            )
-        )
-        late_ids = {
-            int(item[0])
-            for merged_id in merged_ids
-            for item in connection.execute(
-                'SELECT event_id FROM source_late_ids WHERE obligation_id = ?',
-                (merged_id,),
-            )
-        }
-        for merged_id in merged_ids[1:]:
-            connection.execute(
-                'DELETE FROM discovery_ranges WHERE obligation_id = ?',
-                (merged_id,),
-            )
-        connection.execute(
-            """
-            UPDATE discovery_ranges
-            SET low_id = ?, high_id = ?, opened_successful_at = ?,
-                visibility_deadline = ?, source_revision = ?,
-                scan_started_at = NULL,
-                scan_next_id = ?, scan_pages = 0, degraded = 0,
-                scan_cycle_pages = 0
-            WHERE obligation_id = ?
-            """,
-            (
-                merged_low,
-                merged_high,
-                opened_at,
-                deadline,
-                revision,
-                merged_low,
-                obligation_id,
-            ),
-        )
-        connection.executemany(
-            'INSERT OR IGNORE INTO source_late_ids VALUES (?, ?)',
-            ((obligation_id, event_id) for event_id in late_ids),
-        )
-    else:
-        count = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM discovery_ranges WHERE range_state = 'open'"
-            ).fetchone()[0]
-        )
-        if count >= settings.max_open_ranges:
-            raise SourceCapacityError('range-capacity-exhausted', code='range-capacity-exhausted')
-        obligation_id = f'range-{low_id}-{high_id}'
-        merged_ids = (obligation_id,)
-        merged_low = low_id
-        merged_high = high_id
-        opened_at = successful_clock
-        deadline = successful_clock + settings.visibility_overlap_secs
-        revision = 1
-        existing_eligibility = ()
-        connection.execute(
-            """
-            INSERT INTO discovery_ranges (
-                obligation_id, low_id, high_id, opened_successful_at,
-                visibility_deadline, source_revision,
-                close_generation, range_state, scan_started_at,
-                scan_next_id, scan_pages, degraded
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, 'open', NULL, ?, 0, 0)
-            """,
-            (
-                obligation_id,
-                low_id,
-                high_id,
-                opened_at,
-                deadline,
-                revision,
-                low_id,
-            ),
-        )
+    ).fetchone()
+    if overlap is not None:
+        # Callers pass gaps with every open range subtracted; a merge would
+        # delete the merged ranges' late-id marks.
+        raise RuntimeError('open range overlaps an existing open range')
+    obligation_id = f'range-{low_id}-{high_id}'
+    deadline = successful_clock + settings.late_event_window_secs
+    connection.execute(
+        """
+        INSERT INTO discovery_ranges (
+            obligation_id, low_id, high_id, opened_successful_at,
+            visibility_deadline, source_revision,
+            close_generation, range_state, scan_started_at,
+            scan_next_id, scan_pages, degraded
+        ) VALUES (?, ?, ?, ?, ?, 1, 0, 'open', NULL, ?, 0, 0)
+        """,
+        (obligation_id, low_id, high_id, successful_clock, deadline, low_id),
+    )
     connection.execute(BUMP_RANGE_REVISION)
     return RangeMutation(
         obligation_id=obligation_id,
-        merged_ids=merged_ids,
-        low_id=merged_low,
-        high_id=merged_high,
-        opened_successful_at=opened_at,
+        low_id=low_id,
+        high_id=high_id,
+        opened_successful_at=successful_clock,
         visibility_deadline=deadline,
-        revision=revision,
-        existing_eligibility=existing_eligibility,
+        revision=1,
+    )
+
+
+def stamp_generation(
+    connection: sqlite3.Connection,
+    *,
+    stream_fingerprint: str,
+    source_generation: str,
+) -> None:
+    """Stamp the current process and reconcile its configured stream identity.
+
+    Args:
+        connection: Facade-owned live write transaction connection.
+        stream_fingerprint: Non-secret configured stream identity.
+        source_generation: Supervisor-issued source process identity.
+
+    Raises:
+        sqlite3.Error: SQLite cannot update the source generation or condition.
+    """
+    connection.execute(
+        """
+        UPDATE source_meta
+        SET source_generation = ?,
+            condition = CASE
+                WHEN stream_fingerprint != ?
+                THEN 'stream-identity-changed'
+                WHEN condition = 'stream-identity-changed'
+                THEN NULL
+                ELSE condition
+            END
+        WHERE singleton = 1
+        """,
+        (source_generation, stream_fingerprint),
     )
 
 
@@ -1117,6 +1142,9 @@ def uncovered_intervals(
 
     Returns:
         Ordered nonoverlapping intervals not already retained.
+
+    Raises:
+        sqlite3.Error: SQLite cannot read the retained open ranges.
     """
     if low_id > high_id:
         return ()
@@ -1146,6 +1174,24 @@ def uncovered_intervals(
     return tuple(result)
 
 
+def validate_meta(connection: sqlite3.Connection, *, site: str, source: str, path: Path) -> None:
+    """Validate existing source metadata without acquiring writer authority.
+
+    Raises:
+        SourceIdentityError: Metadata is missing or belongs to another source.
+        sqlite3.Error: SQLite cannot read the source metadata.
+    """
+    row = connection.execute('SELECT site, source_name FROM source_meta').fetchone()
+    if row is None:
+        raise SourceIdentityError(
+            f'{path}: source database metadata is missing (source-database-uninitialized)',
+        )
+    if str(row[0]) != site or str(row[1]) != source:
+        raise SourceIdentityError(
+            f'{path}: configured source database identity changed; expected {site}/{source}',
+        )
+
+
 def validate_successful_clock(
     connection: sqlite3.Connection,
     successful_clock: float,
@@ -1159,6 +1205,7 @@ def validate_successful_clock(
 
     Raises:
         ValueError: The clock is invalid or moves backward.
+        sqlite3.Error: SQLite cannot read the durable clock checkpoint.
     """
     if not isfinite(successful_clock) or successful_clock < 0:
         raise ValueError('successful clock must be finite and nonnegative')
@@ -1169,26 +1216,27 @@ def validate_successful_clock(
 
 def record_late_ids(
     connection: sqlite3.Connection,
-    settings: SourceSettings,
     obligation_id: str,
     event_ids: Iterable[int],
     *,
     successful_clock: float,
-) -> None:
+) -> bool:
     """Stage exact late-id evidence and successful-clock progress.
 
     Args:
         connection: Facade-owned live transaction connection.
-        settings: Validated source limits.
         obligation_id: Exact retained owning range.
         event_ids: Exact positive integers within the range's inclusive bounds.
         successful_clock: Finite nonnegative successful-query clock at or
             beyond the durable checkpoint.
 
+    Returns:
+        Whether every ID in the inclusive range has been recorded.
+
     Raises:
         ValueError: An id is invalid, the range is unknown, an id lies outside
             its range, or the successful clock is invalid or moves backward.
-        SourceCapacityError: The retained late-id set cannot fit.
+        sqlite3.Error: SQLite cannot read or record the late IDs and clock.
     """
     ids = tuple(event_ids)
     if any(type(event_id) is not int or event_id <= 0 for event_id in ids):
@@ -1202,7 +1250,6 @@ def record_late_ids(
     low_id, high_id = int(row[0]), int(row[1])
     if any(event_id < low_id or event_id > high_id for event_id in ids):
         raise ValueError('late id lies outside its discovery range')
-    retained_count = int(connection.execute('SELECT COUNT(*) FROM source_late_ids').fetchone()[0])
     incoming_count = sum(
         connection.execute(
             'SELECT 1 FROM source_late_ids WHERE obligation_id = ? AND event_id = ?',
@@ -1211,8 +1258,6 @@ def record_late_ids(
         is None
         for event_id in set(ids)
     )
-    if retained_count + incoming_count > settings.max_source_late_ids:
-        raise SourceCapacityError('late-capacity-exhausted', code='late-capacity-exhausted')
     validate_successful_clock(connection, successful_clock)
     connection.executemany(
         'INSERT OR IGNORE INTO source_late_ids VALUES (?, ?)',
@@ -1232,6 +1277,14 @@ def record_late_ids(
         (successful_clock,),
     )
 
+    count = int(
+        connection.execute(
+            'SELECT COUNT(*) FROM source_late_ids WHERE obligation_id = ?',
+            (obligation_id,),
+        ).fetchone()[0]
+    )
+    return count == high_id - low_id + 1
+
 
 def record_successful_query(
     connection: sqlite3.Connection,
@@ -1246,6 +1299,7 @@ def record_successful_query(
 
     Raises:
         ValueError: The clock is invalid or moves backward.
+        sqlite3.Error: SQLite cannot read or update the clock checkpoint.
     """
     validate_successful_clock(connection, successful_clock)
     connection.execute(
@@ -1275,6 +1329,8 @@ def stage_close_range(
     Raises:
         ValueError: The range is unknown, or a newly closed range is supplied
             an invalid or regressing successful clock.
+        sqlite3.Error: SQLite cannot read or close the range and update its
+            clock and revisions.
     """
     if _range_is_closed(connection, obligation_id):
         return False

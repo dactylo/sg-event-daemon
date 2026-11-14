@@ -5,7 +5,7 @@ import select
 import sqlite3
 import subprocess
 import sys
-import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -17,11 +17,12 @@ from sg_event_daemon._identity import stream_fingerprint
 from sg_event_daemon._platform import AlreadyLockedError, FileLock
 from sg_event_daemon._source_state import (
     DiscoveryRange,
-    SourceCapacityError,
+    SourceCommitResult,
     SourceSnapshot,
     SourceState,
 )
 from sg_event_daemon._sqlite import DatabaseError, DatabaseHandle
+from sg_event_daemon._strict import StrictBuffer
 from tests._storage_support import insert_replay_marker, orphan_group, write_context_for
 from tests.source._support import (
     SITE as _SITE,
@@ -42,6 +43,7 @@ from tests.source._support import open_group as _open_group
 from tests.source._support import (
     open_source as _open_source,
 )
+from tests.source._support import stored_range_details
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -90,7 +92,7 @@ def test_batch_atomically_commits_frontier_range_and_every_group_obligation(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / 'source.db'
-    with _open_source(path, token_factory=_token_sequence('range-token-1')) as state:
+    with _open_source(path) as state:
         state.initialize(100, incarnation='incarnation-1')
 
         committed = state.commit_observations(
@@ -108,16 +110,9 @@ def test_batch_atomically_commits_frontier_range_and_every_group_obligation(
                 low_id=101,
                 high_id=101,
                 opened_successful_at=10.0,
-                _visibility_deadline=310.0,
-                _revision=1,
-                _close_generation=0,
                 state='open',
-                late_ids=(),
-                group_eligibility=(('editorial', 10.0), ('render', 10.0)),
-                _scan_started_at=None,
+                late_id_count=0,
                 scan_next_id=101,
-                _scan_pages=0,
-                _degraded=False,
             ),
         )
         assert snapshot.pending_obligations == 2
@@ -128,20 +123,75 @@ def test_batch_atomically_commits_frontier_range_and_every_group_obligation(
         ).fetchall() == [('editorial', 7, 'pending'), ('render', 3, 'pending')]
 
 
-def test_capacity_halt_condition_is_independent_of_diagnostic(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    def reword_capacity(*_args: object, **_kwargs: object) -> object:
-        raise SourceCapacityError('new capacity explanation', code='range-capacity-exhausted')
-
-    with _open_source(tmp_path / 'source.db') as source:
+@pytest.mark.parametrize('limit', ['max_open_ranges', 'max_pending_group_obligations'])
+def test_chunk_with_more_gaps_than_limit_commits_its_prefix(tmp_path: Path, limit: str) -> None:
+    with _open_source(tmp_path / 'source.db', groups={'editorial': 7}) as source:
+        source._settings = replace(source._settings, **{limit: 1})
         source.initialize(100, incarnation='incarnation-1')
-        monkeypatch.setattr(source_store_module, 'stage_open_range', reword_capacity)
-        with pytest.raises(SourceCapacityError, match='new capacity explanation') as raised:
-            open_source_range(source, 101, 101, successful_clock=1.0)
-        assert raised.value.code == 'range-capacity-exhausted'
-        assert source.snapshot().status == 'range-capacity-exhausted'
+        result = source.commit_observations((102, 103, 105), successful_clock=2)
+        assert result.committed_count == 2
+        assert result.range_changed
+        assert result.pause is not None
+        assert (
+            result.pause.setting,
+            result.pause.limit,
+            result.pause.count,
+            result.pause.blocked_id,
+        ) == (limit, 1, 2, 105)
+        snapshot = source.snapshot()
+        assert snapshot.frontier == 103
+        assert [(r.low_id, r.high_id) for r in snapshot.ranges] == [(101, 101)]
+        assert snapshot.pending_obligations == 1
+        assert not snapshot.replay_markers
+        assert snapshot.conditions
+        assert source._database.connection.execute(
+            'SELECT obligation_id FROM range_groups'
+        ).fetchall() == [('range-101-101',)]
+
+
+def test_default_range_limit_admits_bulk_gaps(tmp_path: Path) -> None:
+    path = tmp_path / 'source.db'
+    with SourceState.open(
+        path,
+        writes=write_context_for(path),
+        create=True,
+        site=_SITE,
+        source=_SOURCE,
+        stream_fingerprint=_STREAM,
+        source_generation=_SOURCE_GENERATION,
+    ) as source:
+        connection = source._database.connection
+        for group in ('editorial', 'render'):
+            connection.execute(
+                "INSERT INTO groups VALUES (?, 1, 'eager', ?, 'incarnation-1', 0, 1, 'active')",
+                (group, 'https://studio.example.invalid'),
+            )
+            connection.execute(
+                'INSERT INTO group_state '
+                '(group_name, revision, cursor, delivery_floor, last_delivered_id) '
+                'VALUES (?, 0, 0, 0, 0)',
+                (group,),
+            )
+        source.initialize(100, incarnation='incarnation-1')
+        admitted = source.commit_observations(range(102, 1101, 2), successful_clock=1)
+        assert admitted.pause is None
+        assert admitted.committed_count == 500
+        snapshot = source.snapshot()
+        assert not snapshot.conditions
+        assert len(snapshot.ranges) == 500
+        assert all(item.low_id == item.high_id for item in snapshot.ranges)
+        assert snapshot.pending_obligations == 1_000
+
+        refused = source.commit_observations((1102,), successful_clock=2)
+        assert refused.committed_count == 0
+        assert refused.pause is not None
+        assert (refused.pause.setting, refused.pause.limit, refused.pause.count) == (
+            'max_open_ranges',
+            500,
+            501,
+        )
+        assert source.snapshot().conditions == ('range-capacity-exhausted',)
+        assert len(source.snapshot().ranges) == 500
 
 
 def test_distinct_identity_halts_reserve_fresh_adoption_ids_for_same_reason(
@@ -195,6 +245,51 @@ def test_distinct_identity_halts_reserve_fresh_adoption_ids_for_same_reason(
     assert second.adoption_id != first.adoption_id
 
 
+def test_failed_open_releases_write_lock_without_masking_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / 'source.db'
+    writes = write_context_for(path)
+    original = writes.lock.close
+
+    def close() -> None:
+        original()
+        raise RuntimeError('close failure')
+
+    monkeypatch.setattr(writes.lock, 'close', close)
+    with pytest.raises(ValueError, match='source limits') as raised:
+        SourceState.open(
+            path,
+            writes=writes,
+            create=True,
+            site='studio',
+            source='events',
+            stream_fingerprint='fingerprint',
+            source_generation='generation',
+            max_open_ranges=0,
+        )
+    assert any('close failure' in note for note in raised.value.__notes__)
+    assert writes.lock._entry is None
+    assert not path.exists()
+
+
+def test_first_gap_refused_commits_only_the_condition(tmp_path: Path) -> None:
+    with _open_source(tmp_path / 'source.db', max_pending_group_obligations=1) as source:
+        source.initialize(100, incarnation='incarnation-1')
+        result = source.commit_observations((102, 104), successful_clock=2)
+        assert result.committed_count == 0
+        assert not result.range_changed
+        assert result.pause is not None
+        assert result.pause.blocked_id == 102
+        snapshot = source.snapshot()
+        assert snapshot.frontier == 100
+        assert snapshot.successful_clock == 0
+        assert not snapshot.ranges
+        assert snapshot.pending_obligations == 0
+        assert snapshot.conditions == ('obligation-capacity-exhausted',)
+
+
 def test_first_start_initializes_latest_frontier_and_restarts(tmp_path: Path) -> None:
     path = tmp_path / 'source.db'
     with _open_source(path) as state:
@@ -234,6 +329,7 @@ def test_killed_batch_transaction_reopens_at_prior_frontier(tmp_path: Path) -> N
 
     code = """
 import sys
+from dataclasses import replace
 from pathlib import Path
 from sg_event_daemon._source_state import SourceState
 from tests._storage_support import write_context_for
@@ -266,21 +362,20 @@ state.commit_observations((102,), successful_clock=10.0)
     assert process.stdout is not None
     return_code: int | None = None
     try:
-        deadline = time.monotonic() + 2.0
         readable, _writable, _exceptional = select.select(
             (process.stdout,),
             (),
             (),
-            max(0.0, deadline - time.monotonic()),
+            None,
         )
-        assert readable, 'child readiness timed out'
+        assert readable, 'child stdout closed without readiness'
         assert os.read(process.stdout.fileno(), 4_096).decode().strip() == 'READY'
         process.kill()
-        return_code = process.wait(timeout=5)
+        return_code = process.wait()
     finally:
         if process.poll() is None:
             process.kill()
-            process.wait(timeout=5)
+            process.wait()
         if process.stdin is not None:
             process.stdin.close()
         process.stdout.close()
@@ -292,6 +387,26 @@ state.commit_observations((102,), successful_clock=10.0)
         assert snapshot.frontier == 100
         assert snapshot.ranges == ()
         assert snapshot.pending_obligations == 0
+
+
+def test_late_id_limit_commits_contiguous_prefix_then_refuses_new_gap(tmp_path: Path) -> None:
+    with _open_source(tmp_path / 'source.db', max_source_late_ids=1) as source:
+        source.initialize(100, incarnation='incarnation-1')
+        opened = open_source_range(source, 101, 103, successful_clock=1)
+        record_source_late_ids(source, opened.obligation_id, (101,), successful_clock=2)
+        result = source.commit_observations((105, 106), successful_clock=3)
+        assert result.committed_count == 2
+        assert result.pause is None
+        result = source.commit_observations((108,), successful_clock=4)
+        assert result.committed_count == 0
+        assert result.pause is not None
+        assert (result.pause.setting, result.pause.count, result.pause.blocked_id) == (
+            'max_source_late_ids',
+            1,
+            108,
+        )
+        assert source.snapshot().frontier == 106
+        assert len(source.snapshot().ranges) == 1
 
 
 def test_later_matching_halt_reserves_fresh_adoption_id_for_same_command(
@@ -335,14 +450,32 @@ def test_later_matching_halt_reserves_fresh_adoption_id_for_same_command(
     assert not fresh.recorded
 
 
+def test_multiple_gaps_count_late_ids_once_per_transaction(tmp_path: Path) -> None:
+    with _open_source(tmp_path / 'source.db') as source:
+        source.initialize(100, incarnation='incarnation-1')
+        statements: list[str] = []
+        source._database.connection.set_trace_callback(statements.append)
+        try:
+            result = source.commit_observations((102, 104, 106), successful_clock=1)
+        finally:
+            source._database.connection.set_trace_callback(None)
+        assert result.committed_count == 3
+        assert (
+            sum(
+                statement.startswith('SELECT COUNT(*) FROM source_late_ids')
+                for statement in statements
+            )
+            == 1
+        )
+
+
 def test_narrow_source_facade_reads_current_poll_range_and_deadline(
     tmp_path: Path,
 ) -> None:
     with _open_source(
         tmp_path / 'source.db',
         groups={'editorial': 7},
-        token_factory=_token_sequence('range-1'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         open_source_range(source, 101, 102, successful_clock=1.0)
@@ -363,14 +496,56 @@ def test_narrow_source_facade_reads_current_poll_range_and_deadline(
         assert source.due_range_id() == 'range-101-102'
 
 
+def test_open_existing_source_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / 'readonly-open.db'
+    with _open_source(path):
+        pass
+    statements: list[str] = []
+    original = sqlite3.connect
+
+    def traced_connect(
+        database: str | Path,
+        *,
+        isolation_level: None,
+        timeout: float,
+        uri: bool,
+    ) -> sqlite3.Connection:
+        connection = original(database, isolation_level=isolation_level, timeout=timeout, uri=uri)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    with original(path, isolation_level=None) as holder:
+        holder.execute('BEGIN IMMEDIATE')
+        monkeypatch.setattr(sqlite3, 'connect', traced_connect)
+        with SourceState.open(
+            path,
+            writes=replace(write_context_for(path), policy='one-attempt'),
+            site=_SITE,
+            source=_SOURCE,
+            stream_fingerprint=_STREAM,
+            source_generation='replacement',
+        ) as state:
+            assert state.snapshot().source_generation == _SOURCE_GENERATION
+            assert not state.stamped
+        holder.rollback()
+    assert not any(
+        sql.lstrip()
+        .upper()
+        .startswith(('BEGIN IMMEDIATE', 'INSERT', 'UPDATE', 'DELETE', 'CREATE'))
+        for sql in statements
+    )
+
+
 def test_orphan_full_transaction_commits_generation_retirement(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / 'source.db'
     with _open_source(
         path,
-        token_factory=_token_sequence('open-token', 'close-token', 'marker-token'),
-        visibility_overlap_secs=1.0,
+        late_event_window_secs=1.0,
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         opened = open_source_range(source, 101, 110, successful_clock=1.0)
@@ -424,8 +599,7 @@ def test_orphan_full_transaction_rolls_back_every_generation_row(
     path = tmp_path / 'source.db'
     with _open_source(
         path,
-        token_factory=_token_sequence('open-token', 'close-token', 'marker-token'),
-        visibility_overlap_secs=1.0,
+        late_event_window_secs=1.0,
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         opened = open_source_range(source, 101, 110, successful_clock=1.0)
@@ -480,7 +654,7 @@ def test_orphan_full_transaction_rolls_back_every_generation_row(
 
 def test_pending_group_status_reads_unresolved_source_ids_before_lane_copy(tmp_path: Path) -> None:
     path = tmp_path / 'source.db'
-    with _open_source(path, visibility_overlap_secs=1.0) as source:
+    with _open_source(path, late_event_window_secs=1.0) as source:
         source.initialize(100, incarnation='incarnation-1')
         opened = open_source_range(source, 101, 110, successful_clock=1.0)
         record_source_late_ids(source, opened.obligation_id, (101, 103), successful_clock=2.0)
@@ -516,6 +690,60 @@ def test_primary_synchronous_policy_survives_reopen_with_full_handoff(
             assert handoff.execute('PRAGMA synchronous').fetchone() == (2,)
 
 
+def test_projections_read_no_late_ids(tmp_path: Path) -> None:
+    with _open_source(tmp_path / 'source.db') as source:
+        source.initialize(100, incarnation='incarnation-1')
+        connection = source._database.connection
+        for index in range(20):
+            low_id = 101 + index * 101
+            obligation_id = f'range-{low_id}-{low_id + 99}'
+            connection.execute(
+                'INSERT INTO discovery_ranges ('
+                'obligation_id, low_id, high_id, opened_successful_at, '
+                'visibility_deadline, source_revision, close_generation, '
+                'range_state, scan_next_id, scan_pages, degraded) '
+                'VALUES (?, ?, ?, 1, 301, 1, 0, ?, ?, 0, 0)',
+                (obligation_id, low_id, low_id + 99, 'open', low_id),
+            )
+            connection.executemany(
+                'INSERT INTO source_late_ids VALUES (?, ?)',
+                ((obligation_id, event_id) for event_id in range(low_id, low_id + 100)),
+            )
+            connection.execute(
+                "INSERT INTO range_groups VALUES (?, 'editorial', 7, 0, 1, 'pending')",
+                (obligation_id,),
+            )
+        source.invalidate_strict_ranges()
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        try:
+            snapshot = source.snapshot()
+            strict_ranges = source.strict_ranges_if_changed()
+            refreshed = source.range_for('range-101-200')
+            strict = StrictBuffer(max_events=20, max_bytes=10_000_000)
+            assert strict_ranges is not None
+            strict.synchronize_ranges(strict_ranges)
+            with _open_group(tmp_path / 'source.db') as group:
+                group_connection = group._database.connection
+                group_connection.set_trace_callback(statements.append)
+                try:
+                    _progress, pending = group.refresh_ranges()
+                finally:
+                    group_connection.set_trace_callback(None)
+                assert pending is not None
+                assert len(pending) == 20
+        finally:
+            connection.set_trace_callback(None)
+        assert sum(item.late_id_count for item in snapshot.ranges) == 2_000
+        assert sum(item.late_id_count for item in strict_ranges) == 2_000
+        assert refreshed is not None
+        assert refreshed.late_id_count == 100
+        assert not any(
+            'event_id' in statement.lower() and 'source_late_ids' in statement.lower()
+            for statement in statements
+        )
+
+
 def test_range_preflight_does_not_wait_for_a_writer(tmp_path: Path) -> None:
     path = tmp_path / 'source.db'
     with _open_source(path) as state:
@@ -523,12 +751,41 @@ def test_range_preflight_does_not_wait_for_a_writer(tmp_path: Path) -> None:
         writer = sqlite3.connect(path, isolation_level=None)
         try:
             writer.execute('BEGIN IMMEDIATE')
-            started = time.monotonic()
+            state._database.connection.execute('PRAGMA busy_timeout=0')
             assert state._preflight_range(102) == set()
-            assert time.monotonic() - started < 0.5
         finally:
             writer.rollback()
             writer.close()
+
+
+def test_record_missing_rows_preserves_deadline_cursor_and_invalidates_projection(
+    tmp_path: Path,
+) -> None:
+    with _open_source(tmp_path / 'source.db') as state:
+        state.initialize(100, incarnation='incarnation-1')
+        gap = open_source_range(state, 101, 105, successful_clock=1.0)
+        record_source_late_ids(state, gap.obligation_id, (102,), successful_clock=2.0)
+        before = state.range_for(gap.obligation_id)
+        assert before is not None
+        before_details = stored_range_details(state, before.obligation_id)
+        assert state.strict_ranges_if_changed() is not None
+        assert state.strict_ranges_if_changed() is None
+        committed = state.record_missing_rows(gap.obligation_id, (104,), successful_clock=3.0)
+        after = state.range_for(gap.obligation_id)
+        assert after is not None
+        assert committed.range_changed
+        assert after.late_id_count == 2
+        assert (
+            stored_range_details(state, after.obligation_id).scan_started_at,
+            after.scan_next_id,
+            after.scan_cycle_pages,
+        ) == (
+            before_details.scan_started_at,
+            before.scan_next_id,
+            before.scan_cycle_pages,
+        )
+        assert state.successful_clock() == 3.0
+        assert state.strict_ranges_if_changed() is not None
 
 
 def test_record_successful_query_returns_none_without_snapshot(
@@ -547,18 +804,19 @@ def test_record_successful_query_returns_none_without_snapshot(
         assert source.successful_clock() == 1.0
 
 
-def test_reopen_prunes_unbound_ranges_without_discarding_pending_bindings(tmp_path: Path) -> None:
-    path = tmp_path / 'source.db'
-    with _open_source(path, groups={'editorial': 7}) as source:
+def test_refused_candidate_rolls_back_its_gap_cap_collapse(tmp_path: Path) -> None:
+    with _open_source(
+        tmp_path / 'source.db', groups={'editorial': 7}, max_group_obligations=1, max_open_ranges=1
+    ) as source:
         source.initialize(100, incarnation='incarnation-1')
-        source.commit_observations((103, 106), successful_clock=1.0)
-        orphan, pending = 'range-101-102', 'range-104-105'
-        connection = source._database.connection
-        connection.execute('DELETE FROM range_groups WHERE obligation_id = ?', (orphan,))
-    with _open_source(path, groups={'editorial': 7}) as reopened:
-        assert reopened.range_for(orphan) is None
-        assert reopened.range_for(pending) is not None
-        assert reopened.snapshot().pending_obligations == 1
+        source.commit_observations((102,), successful_clock=1)
+        before = source.snapshot()
+        result = source.commit_observations((104,), successful_clock=2)
+        assert result.pause is not None
+        assert source.snapshot().ranges == before.ranges
+        assert source.snapshot().replay_markers == ()
+        assert source.snapshot().pending_obligations == 1
+        assert source.group_snapshot('editorial').replay_required_from is None
 
 
 def test_retirement_releases_only_unbound_range_and_late_capacity(
@@ -581,7 +839,36 @@ def test_retirement_releases_only_unbound_range_and_late_capacity(
             source.commit_observations((106,), successful_clock=3.0)
             next_id = 'range-104-105'
             record_source_late_ids(source, next_id, (104,), successful_clock=4.0)
-            assert source.snapshot().ranges[0].late_ids == (104,)
+            assert source.snapshot().ranges[0].late_id_count == 1
+
+
+def test_retiring_empty_orphan_reports_range_change_at_late_capacity(tmp_path: Path) -> None:
+    with _open_source(tmp_path / 'source.db', max_source_late_ids=1) as source:
+        source.initialize(100, incarnation='incarnation-1')
+        source.commit_observations((102, 104), successful_clock=1)
+        record_source_late_ids(source, 'range-103-103', (103,), successful_clock=2)
+        assert source.strict_ranges_if_changed() is not None
+        connection = source._database.connection
+        connection.execute('DELETE FROM range_groups WHERE obligation_id = ?', ('range-101-101',))
+        result = source.commit_observations((106,), successful_clock=3)
+        assert result.pause is not None
+        assert result.pause.setting == 'max_source_late_ids'
+        assert result.range_changed
+        assert source.range_for('range-101-101') is None
+        assert source.range_for('range-103-103') is not None
+        assert source.snapshot().replay_markers == ()
+        assert source.group_snapshot('editorial').status == 'running'
+        assert source.strict_ranges_if_changed() is not None
+
+
+def test_schema_without_metadata_row_is_refused_as_uninitialized(tmp_path: Path) -> None:
+    path = tmp_path / 'uninitialized.db'
+    with _open_source(path) as state:
+        state._database.connection.execute('DELETE FROM source_meta')
+    with pytest.raises(source_store_module.SourceIdentityError) as raised:
+        _open_source(path)
+    assert str(path) in str(raised.value)
+    assert 'source-database-uninitialized' in str(raised.value)
 
 
 @pytest.mark.parametrize('range_count', [0, 1, 5])
@@ -639,19 +926,9 @@ def test_snapshot_query_count_is_constant_for_discovery_ranges(
                     low_id=low_id,
                     high_id=high_id,
                     opened_successful_at=float(index + 1),
-                    _visibility_deadline=float(index + 11),
-                    _revision=index + 1,
-                    _close_generation=index,
                     state='open',
-                    late_ids=(low_id, high_id),
-                    group_eligibility=(
-                        ('editorial', float(index + 5)),
-                        ('render', float(index + 6)),
-                    ),
-                    _scan_started_at=float(index + 2),
+                    late_id_count=2,
                     scan_next_id=low_id + 1,
-                    _scan_pages=index + 3,
-                    _degraded=bool(index % 2),
                     scan_cycle_pages=index + 4,
                 )
             )
@@ -668,7 +945,7 @@ def test_snapshot_query_count_is_constant_for_discovery_ranges(
                 for table in ('discovery_ranges', 'source_late_ids', 'range_groups')
             )
         )
-        assert len(range_owned) == 4
+        assert len(range_owned) == 3
         assert snapshot.ranges == tuple(expected)
 
 
@@ -679,13 +956,13 @@ def test_close_attempts_all_owned_cleanup(failures: frozenset[int]) -> None:
 
     class Resource:
         def __init__(self, index: int) -> None:
-            self.index = index
+            self._index = index
 
         def close(self) -> None:
-            attempts.append(self.index)
-            if self.index == 0 and 0 in failures:
+            attempts.append(self._index)
+            if self._index == 0 and 0 in failures:
                 raise failure
-            if self.index == 1 and 1 in failures:
+            if self._index == 1 and 1 in failures:
                 raise KeyboardInterrupt('second cleanup failure')
 
     state = SourceState.__new__(SourceState)
@@ -778,18 +1055,20 @@ def test_source_owner_lock_rejects_a_second_poller(tmp_path: Path) -> None:
         _open_source(path)
 
 
-def test_stream_adoption_schema_has_only_retired_evidence_counts(tmp_path: Path) -> None:
-    with _open_source(tmp_path / 'source.db') as source:
-        connection = vars(source)['_database'].connection
-        assert [row[1] for row in connection.execute('PRAGMA table_info(stream_adoptions)')] == [
-            'adoption_id',
-            'command_fingerprint',
-            'stream_fingerprint',
-            'reason',
-            'retired_range_count',
-            'retired_late_id_count',
-            'retired_marker_count',
-        ]
+def test_stamp_prunes_unbound_ranges_without_discarding_pending_bindings(tmp_path: Path) -> None:
+    path = tmp_path / 'source.db'
+    with _open_source(path, groups={'editorial': 7}) as source:
+        source.initialize(100, incarnation='incarnation-1')
+        source.commit_observations((103, 106), successful_clock=1.0)
+        orphan, pending = 'range-101-102', 'range-104-105'
+        connection = source._database.connection
+        connection.execute('DELETE FROM range_groups WHERE obligation_id = ?', (orphan,))
+    with _open_source(path, groups={'editorial': 7}) as reopened:
+        assert reopened.range_for(orphan) is not None
+        reopened.stamp_generation()
+        assert reopened.range_for(orphan) is None
+        assert reopened.range_for(pending) is not None
+        assert reopened.snapshot().pending_obligations == 1
 
 
 def test_stream_identity_controls_preserve_new_mismatch_and_other_halt(
@@ -813,12 +1092,10 @@ def test_stream_identity_controls_preserve_new_mismatch_and_other_halt(
     with _open_source(
         capacity_path,
         max_open_ranges=1,
-        token_factory=_token_sequence('range-token-1', 'range-token-2'),
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         open_source_range(source, 101, 101, successful_clock=1.0)
-        with pytest.raises(SourceCapacityError, match='range-capacity-exhausted'):
-            source.commit_observations((104,), successful_clock=2.0)
+        assert source.commit_observations((104,), successful_clock=2.0).pause is not None
         assert source.snapshot().status == 'range-capacity-exhausted'
 
     with _open_source(capacity_path) as reopened:
@@ -829,8 +1106,7 @@ def test_strict_ranges_ignore_clock_and_scan_cursor_only_progress(tmp_path: Path
     with _open_source(
         tmp_path / 'source.db',
         groups={'editorial': 7},
-        token_factory=_token_sequence('open-1'),
-        visibility_overlap_secs=10.0,
+        late_event_window_secs=10.0,
     ) as source:
         source.initialize(100, incarnation='incarnation-1')
         opened = open_source_range(source, 101, 105, successful_clock=1.0)
@@ -855,7 +1131,7 @@ def test_strict_ranges_ignore_clock_and_scan_cursor_only_progress(tmp_path: Path
         changed = source.strict_ranges_if_changed()
 
     assert changed is not None
-    assert changed[0].late_ids == (103,)
+    assert changed[0].late_id_count == 1
 
 
 def test_strict_ranges_rebuild_once_per_dirty_generation(tmp_path: Path) -> None:
@@ -889,3 +1165,66 @@ def test_unneeded_gaps_do_not_consume_range_capacity(tmp_path: Path, coverage: s
         assert snapshot.frontier == 104
         assert snapshot.ranges == ()
         assert source.due_range_id() is None
+
+
+@pytest.mark.parametrize('scan_page', [False, True])
+def test_range_closes_atomically_with_final_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scan_page: bool,
+) -> None:
+    with _open_source(tmp_path / 'source.db') as state:
+        state.initialize(100, incarnation='incarnation-1')
+        gap = open_source_range(state, 101, 102, successful_clock=1.0)
+        state.record_missing_rows(gap.obligation_id, (101,), successful_clock=2.0)
+        if scan_page:
+            state.begin_range_scan(gap.obligation_id, successful_clock=3.0)
+        assert state.strict_ranges_if_changed() is not None
+        assert state.strict_ranges_if_changed() is None
+
+        def record() -> SourceCommitResult:
+            if scan_page:
+                return state.record_range_scan_page(
+                    gap.obligation_id,
+                    scanned_through=102,
+                    event_ids=(102,),
+                    successful_clock=3.0,
+                )
+            return state.record_missing_rows(gap.obligation_id, (102,), successful_clock=3.0)
+
+        def fail_close(*_args: object, **_kwargs: object) -> bool:
+            raise RuntimeError('close write failed')
+
+        with monkeypatch.context() as patch:
+            patch.setattr(source_store_module, 'stage_close_range', fail_close)
+            with pytest.raises(RuntimeError, match='close write failed'):
+                record()
+        retained = state.range_for(gap.obligation_id)
+        assert retained is not None
+        assert (retained.state, retained.late_id_count) == ('open', 1)
+        assert state.successful_clock() == 2.0
+        assert state.strict_ranges_if_changed() is None
+        committed = record()
+        assert committed.range_changed
+        assert committed.closed is not None
+        assert (
+            committed.closed.low_id,
+            committed.closed.high_id,
+            committed.closed.secs,
+            committed.closed.missing,
+        ) == (101, 102, 2.0, ())
+        retained = state.range_for(gap.obligation_id)
+        assert retained is not None
+        assert (
+            retained.state,
+            retained.late_id_count,
+            stored_range_details(state, retained.obligation_id).close_generation,
+        ) == (
+            'closed',
+            2,
+            1,
+        )
+        projected = state.strict_ranges_if_changed()
+        assert projected is not None
+        assert projected[0].state == 'closed'
+        assert state._close_range(gap.obligation_id, successful_clock=3.0).closed is None

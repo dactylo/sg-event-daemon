@@ -16,17 +16,28 @@ from ._group_store import (
     check_revision,
     clear_failure,
     ensure_delivery_ready,
+    group_conditions,
     snapshot,
 )
 from ._group_types import (
     GroupSnapshot,
     digest,
+    manifest_from_json,
 )
 
 if TYPE_CHECKING:
     import sqlite3
 
     from ._plugins import CallbackManifest
+
+
+@dataclass(frozen=True)
+class _CompletionState:
+    """Hold freshly read completion checks only within the caller's transaction."""
+
+    in_flight_event_id: int | None
+    in_flight_obligation_id: str | None
+    recovery_blocked: bool
 
 
 @dataclass(frozen=True)
@@ -95,6 +106,31 @@ def _insert_pending_marks(
     )
 
 
+def _read_completion_state(connection: sqlite3.Connection, group_name: str) -> _CompletionState:
+    """Read and validate transaction-local state without projecting ordinary health."""
+    row = connection.execute(
+        'SELECT in_flight_event_id, in_flight_obligation_id, manifest_json, '
+        'failure_code, required_event_id, shape_mismatch '
+        'FROM group_state WHERE group_name = ?',
+        (group_name,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError('group state is not initialized')
+    if row[0] is None or row[1] is not None or row[3] is not None or row[4] is not None or row[5]:
+        # Keep exceptional and late completion on the existing snapshot path.
+        current = snapshot(connection, group_name)
+        return _CompletionState(
+            current.in_flight_event_id,
+            current.in_flight_obligation_id,
+            current.failure_code is not None
+            or current.required_event_id is not None
+            or 'shape-mismatch' in current.conditions,
+        )
+    if row[2] is not None:
+        manifest_from_json(str(row[2]))
+    return _CompletionState(int(row[0]), None, recovery_blocked=False)
+
+
 def _validated_manifest_json(
     manifest: CallbackManifest,
     max_manifest_bytes: int,
@@ -108,6 +144,26 @@ def _validated_manifest_json(
     if any(callback.ordinal != ordinal for ordinal, callback in enumerate(manifest.callbacks)):
         raise InvalidTransitionError('callback manifest ordinals must be consecutive')
     return manifest_json
+
+
+def _write_terminal_event(connection: sqlite3.Connection, group_name: str, event_id: int) -> None:
+    """Advance and clear an event after the caller validates terminal completion."""
+    connection.execute(
+        """
+        UPDATE group_state
+        SET cursor = MAX(cursor, ?),
+            last_delivered_id = MAX(last_delivered_id, ?),
+            in_flight_event_id = NULL,
+            in_flight_obligation_id = NULL,
+            manifest_json = NULL
+        WHERE group_name = ?
+        """,
+        (event_id, event_id, group_name),
+    )
+    connection.execute(
+        'DELETE FROM callback_marks WHERE group_name = ? AND event_id = ?',
+        (group_name, event_id),
+    )
 
 
 def callback_failed(
@@ -131,6 +187,8 @@ def callback_failed(
     Raises:
         InvalidTransitionError: The callback was not invoked and pending.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     raw = request.failure_text.encode()
     retained = raw[: request.max_failure_text_bytes].decode(errors='ignore')
@@ -185,6 +243,8 @@ def require_event(
         InvalidTransitionError: Another required event is active or the event
             does not match the in-flight event.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     current = snapshot(connection, group_name)
@@ -221,12 +281,15 @@ def restart_event_manifest(
         max_manifest_bytes: Maximum encoded manifest size.
 
     Returns:
-        Immutable snapshot with fresh pending callback marks.
+        Immutable snapshot with fresh pending callback marks and cleared
+        callback-failure and shape-mismatch evidence.
 
     Raises:
         InvalidTransitionError: The manifest is empty, oversized, or has
             nonconsecutive ordinals, or no event is in flight.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     manifest_json = _validated_manifest_json(manifest, max_manifest_bytes)
     check_revision(connection, group_name, expected_revision)
@@ -273,6 +336,8 @@ def restore_required_event(
         InvalidTransitionError: The event does not match the authorized
             refetch.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     row = connection.execute(
@@ -312,6 +377,9 @@ def strict_obligation_fence(
     Returns:
         Earliest obligation identity and bounds, or `None` outside a strict
         fence.
+
+    Raises:
+        sqlite3.Error: Reading the strict obligation fence fails.
     """
     ordering = str(
         connection.execute(
@@ -343,6 +411,16 @@ def _check_strict_obligation_fence(
         raise InvalidTransitionError('strict delivery is blocked by an earlier obligation')
 
 
+def _finish_ordinary_event(
+    connection: sqlite3.Connection, group_name: str, current: _CompletionState
+) -> None:
+    """Finish the ordinary event using only this transaction's completion read."""
+    if current.in_flight_event_id is None:
+        raise InvalidTransitionError('no event is in flight')
+    _check_strict_obligation_fence(connection, group_name, current.in_flight_event_id, None)
+    _write_terminal_event(connection, group_name, current.in_flight_event_id)
+
+
 def advance_irrelevant(
     connection: sqlite3.Connection,
     group_name: str,
@@ -364,6 +442,8 @@ def advance_irrelevant(
         InvalidTransitionError: Delivery is blocked, `high_id` does not advance
             the cursor, or strict progress reaches an unresolved obligation.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     ensure_delivery_ready(connection, group_name)
@@ -413,6 +493,8 @@ def advance_irrelevant_prefix(
         InvalidTransitionError: A recovery condition or in-flight event
             prevents delivery progress.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     ensure_delivery_ready(connection, group_name)
@@ -424,38 +506,39 @@ def advance_irrelevant_prefix(
     return advance_irrelevant(connection, group_name, safe_high, expected_revision)
 
 
-def begin_callback(
+def begin_callback_step(
     connection: sqlite3.Connection,
     group_name: str,
     ordinal: int,
     expected_revision: int,
-) -> GroupSnapshot:
-    """Increment one callback attempt inside a live transaction.
+) -> int:
+    """Record one callback attempt and return its advanced revision.
 
     Args:
-        connection: Live group-state database connection.
+        connection: Live group-state transaction connection; the caller owns
+            commit or rollback.
         group_name: Exact group whose durable rows are accessed.
-        ordinal: In-flight callback ordinal.
+        ordinal: Pending callback ordinal for the in-flight event.
         expected_revision: Required compare-and-swap revision.
 
     Returns:
-        Immutable snapshot with the incremented delivery attempt.
+        `expected_revision + 1` after incrementing the callback attempt count.
 
     Raises:
-        InvalidTransitionError: Callback delivery is blocked or the callback is
-            not the next pending in-flight callback.
+        InvalidTransitionError: Delivery is blocked, no event is in flight, the
+            callback is not pending, an earlier callback is pending, or the
+            strict obligation fence blocks delivery.
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     check_revision(connection, group_name, expected_revision)
-    current = snapshot(connection, group_name)
-    blocking = tuple(
-        condition
-        for condition in current.conditions
-        if condition not in {'required-event', 'event-unavailable'}
-    )
-    if blocking or current.required_event_id is not None:
+    if group_conditions(connection, group_name):
         raise InvalidTransitionError('callback delivery is blocked')
-    if current.in_flight_event_id is None:
+    event_id, obligation_id = connection.execute(
+        'SELECT in_flight_event_id, in_flight_obligation_id FROM group_state WHERE group_name = ?',
+        (group_name,),
+    ).fetchone()
+    if event_id is None:
         raise InvalidTransitionError('no event is in flight')
     mark = connection.execute(
         """
@@ -463,7 +546,7 @@ def begin_callback(
         FROM callback_marks
         WHERE group_name = ? AND event_id = ? AND ordinal = ?
         """,
-        (group_name, current.in_flight_event_id, ordinal),
+        (group_name, event_id, ordinal),
     ).fetchone()
     if mark is None or str(mark[0]) != 'pending':
         raise InvalidTransitionError('callback is not pending')
@@ -474,7 +557,7 @@ def begin_callback(
             WHERE group_name = ? AND event_id = ? AND ordinal < ? AND outcome = 'pending'
             LIMIT 1
             """,
-            (group_name, current.in_flight_event_id, ordinal),
+            (group_name, event_id, ordinal),
         ).fetchone()
         is not None
     ):
@@ -482,8 +565,8 @@ def begin_callback(
     _check_strict_obligation_fence(
         connection,
         group_name,
-        current.in_flight_event_id,
-        current.in_flight_obligation_id,
+        event_id,
+        obligation_id,
     )
     connection.execute(
         """
@@ -491,10 +574,10 @@ def begin_callback(
         SET delivery_attempt = delivery_attempt + 1
         WHERE group_name = ? AND event_id = ? AND ordinal = ?
         """,
-        (group_name, current.in_flight_event_id, ordinal),
+        (group_name, event_id, ordinal),
     )
     bump_revision(connection, group_name, expected_revision)
-    return snapshot(connection, group_name)
+    return expected_revision + 1
 
 
 def finish_terminal_event(connection: sqlite3.Connection, group_name: str) -> None:
@@ -509,6 +592,9 @@ def finish_terminal_event(connection: sqlite3.Connection, group_name: str) -> No
     Raises:
         InvalidTransitionError: No event is in flight or the strict obligation
             fence blocks terminal completion.
+        sqlite3.Error: Reading or updating durable group state fails.
+        RuntimeError: Group state is not initialized.
+        ValueError: The stored callback manifest is invalid.
     """
     current = snapshot(connection, group_name)
     if current.in_flight_event_id is None:
@@ -535,58 +621,41 @@ def finish_terminal_event(connection: sqlite3.Connection, group_name: str) -> No
                 group_name,
                 -1,
             )
-    connection.execute(
-        """
-        UPDATE group_state
-        SET cursor = MAX(cursor, ?),
-            last_delivered_id = MAX(last_delivered_id, ?),
-            in_flight_event_id = NULL,
-            in_flight_obligation_id = NULL,
-            manifest_json = NULL
-        WHERE group_name = ?
-        """,
-        (current.in_flight_event_id, current.in_flight_event_id, group_name),
-    )
-    connection.execute(
-        'DELETE FROM callback_marks WHERE group_name = ? AND event_id = ?',
-        (group_name, current.in_flight_event_id),
-    )
+    _write_terminal_event(connection, group_name, current.in_flight_event_id)
 
 
-def callback_done(
+def callback_done_step(
     connection: sqlite3.Connection,
     group_name: str,
     ordinal: int,
     expected_revision: int,
-) -> GroupSnapshot:
-    """Record one callback success and finish a final mark in the live transaction.
+) -> int:
+    """Record one callback success and return its advanced transaction-local revision.
 
     Args:
-        connection: Live group-state transaction connection; the caller commits
-            or rolls back.
+        connection: Live group-state transaction connection; the caller owns
+            commit or rollback, including partial writes on rejection.
         group_name: Exact group whose durable rows are accessed.
         ordinal: In-flight callback ordinal.
         expected_revision: Required compare-and-swap revision.
 
     Returns:
-        Immutable snapshot with the callback done and, for the final mark, the
-        event completed.
+        `expected_revision + 1` after recording the callback and finishing its
+        event when no pending callback remains. Ordinary completion builds no
+        full snapshot; the caller projects one at its transaction boundary.
 
     Raises:
-        InvalidTransitionError: Recovery evidence blocks completion, the
-            callback was not invoked and pending, or a strict obligation blocks
-            the final mark.
+        InvalidTransitionError: Recovery evidence or callback state rejects
+            completion, or a strict fence blocks the final mark.
         RevisionConflictError: The expected revision differs.
+        ValueError: The stored callback manifest is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     check_revision(connection, group_name, expected_revision)
-    current = snapshot(connection, group_name)
+    current = _read_completion_state(connection, group_name)
     if current.in_flight_event_id is None:
         raise InvalidTransitionError('no event is in flight')
-    if (
-        current.failure_code is not None
-        or current.required_event_id is not None
-        or 'shape-mismatch' in current.conditions
-    ):
+    if current.recovery_blocked:
         raise InvalidTransitionError('callback completion is blocked by recovery evidence')
     mark = connection.execute(
         """
@@ -616,36 +685,73 @@ def callback_done(
         ).fetchone()
         is None
     ):
-        finish_terminal_event(connection, group_name)
+        if current.in_flight_obligation_id is None:
+            _finish_ordinary_event(connection, group_name, current)
+        else:
+            finish_terminal_event(connection, group_name)
         clear_failure(connection, group_name)
     bump_revision(connection, group_name, expected_revision)
+    return expected_revision + 1
+
+
+def callback_done(
+    connection: sqlite3.Connection,
+    group_name: str,
+    ordinal: int,
+    expected_revision: int,
+) -> GroupSnapshot:
+    """Record one callback success and finish a final mark in the live transaction.
+
+    Args:
+        connection: Live group-state transaction connection; the caller commits
+            or rolls back.
+        group_name: Exact group whose durable rows are accessed.
+        ordinal: In-flight callback ordinal.
+        expected_revision: Required compare-and-swap revision.
+
+    Returns:
+        Immutable snapshot with the callback done and, for the final mark, the
+        event completed.
+
+    Raises:
+        InvalidTransitionError: Recovery evidence blocks completion, the
+            callback was not invoked and pending, or a strict obligation blocks
+            the final mark.
+        RevisionConflictError: The expected revision differs.
+        ValueError: The stored callback manifest is invalid.
+        sqlite3.Error: Reading or updating durable group state fails.
+    """
+    callback_done_step(connection, group_name, ordinal, expected_revision)
     return snapshot(connection, group_name)
 
 
-def start_event(
+def start_event_step(
     connection: sqlite3.Connection,
     group_name: str,
     request: EventStartRequest,
     expected_revision: int,
-) -> GroupSnapshot:
-    """Persist one event and every callback mark before invocation.
+) -> int:
+    """Record one event and its manifest and return the advanced revision.
 
     Args:
-        connection: Live group-state database connection.
+        connection: Live group-state transaction connection; the caller owns
+            commit or rollback.
         group_name: Exact group whose durable rows are accessed.
-        request: Exact event, manifest policy, and late-obligation owner.
+        request: Event identity, complete callback manifest, manifest byte
+            limit, and optional late-event obligation reservation.
         expected_revision: Required compare-and-swap revision.
 
     Returns:
-        Immutable snapshot with the event and callbacks in flight.
+        `expected_revision + 1` after recording the in-flight event and fresh
+        pending callback marks.
 
     Raises:
-        InvalidTransitionError: The manifest is invalid, delivery is blocked,
-            the ordinary event does not advance, or the strict obligation fence
-            rejects the event.
+        InvalidTransitionError: The manifest is empty, oversized, or has
+            nonconsecutive ordinals; delivery is blocked; an ordinary event
+            does not advance the cursor; a late event lacks an exact pending
+            reservation; or the strict obligation fence blocks delivery.
         RevisionConflictError: The expected revision differs.
-        TerminalLateEventError: The late event lacks a pending exact
-            reservation.
+        sqlite3.Error: Reading or updating durable group state fails.
     """
     manifest_json = _validated_manifest_json(request.manifest, request.max_manifest_bytes)
     check_revision(connection, group_name, expected_revision)
@@ -684,7 +790,7 @@ def start_event(
     )
     _insert_pending_marks(connection, group_name, request.event_id, request.manifest)
     bump_revision(connection, group_name, expected_revision)
-    return snapshot(connection, group_name)
+    return expected_revision + 1
 
 
 def verify_manifest(
@@ -707,6 +813,8 @@ def verify_manifest(
 
     Raises:
         RevisionConflictError: The expected revision differs.
+        sqlite3.Error: Reading or updating durable group state fails.
+        ValueError: The stored callback manifest is invalid.
     """
     check_revision(connection, group_name, expected_revision)
     row = connection.execute(

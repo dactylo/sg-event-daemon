@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sg-event-daemon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Event daemon for Autodesk Flow Production Tracking"
 keywords = [ "daemon", "events", "flow-production-tracking", "shotgrid", "shotgun" ]
 license = "MIT"
@@ -27,13 +27,13 @@ classifiers = [
 ]
 dynamic = [ "readme" ]
 optional-dependencies.sg-python-api = [
-  "sg-python-api>=0.1,<0.2",
+  "sg-python-api>=0.2",
 ]
 optional-dependencies.sg-python-api-async = [
-  "sg-python-api[async]>=0.1,<0.2",
+  "sg-python-api[async]>=0.2",
 ]
 optional-dependencies.shotgun-api3 = [
-  "shotgun-api3>=3.10,<4",
+  "shotgun-api3>=3.10.5,<4",
 ]
 urls.Documentation = "https://github.com/dactylo/sg-event-daemon/tree/main/docs"
 urls.Homepage = "https://github.com/dactylo/sg-event-daemon"
@@ -53,10 +53,12 @@ dev = [
   "pyproject-fmt",
   "pyright",
   "ruff",
+  "zizmor",
   { include-group = "test" },
 ]
 test = [
   "pytest",
+  "pytest-timeout",
   "pytest-xdist>=3.2",
 ]
 
@@ -64,14 +66,7 @@ test = [
 metadata.hooks.fancy-pypi-readme.content-type = "text/markdown"
 metadata.hooks.fancy-pypi-readme.fragments = [ { path = "README.md" } ]
 build.targets.wheel.packages = [ "src/sg_event_daemon" ]
-build.targets.sdist.include = [
-  "/docs/operations.md",
-  "/docs/porting.md",
-  "/LICENSE",
-  "/pyproject.toml",
-  "/README.md",
-  "/src",
-]
+build.targets.sdist.include = [ "/LICENSE", "/pyproject.toml", "/README.md", "/src" ]
 
 # Keep checkout links relative; package links target this release.
 [[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
@@ -110,19 +105,6 @@ lint.ignore = [
   "T201",   # print() found
   "TRY003", # Avoid specifying long messages outside exception class
 ]
-lint.per-file-ignores."benchmarks/benchmark_state.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_config.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_control.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_fanout.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_group_recovery.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_group_state.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_ipc.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_lane.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_plugins.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_source.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_strict.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_supervisor.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_event_daemon/_worker.py" = [ "SLF001" ]
 lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
   "PLR2004", # Allow magic values in tests
@@ -141,6 +123,8 @@ max_supported_python = "3.15"
 # ==========================================================
 [tool.pyright]
 pythonVersion = "3.11"  # Keep in sync with tool.ruff.target-version
+venv = ".venv"  # Created by make setup
+venvPath = "."
 typeCheckingMode = "strict"
 extraPaths = [ ".", "src" ]
 executionEnvironments = [
@@ -160,6 +144,9 @@ ini_options.markers = [
   "live_load: external bounded-load test requiring --run-live-load",
   "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
+ini_options.faulthandler_timeout = 300
+# Fail a hung test after 15 minutes; tests never wait on time, so only a hang reaches this.
+ini_options.timeout = 900
 
 # ==========================================================
 # Mdformat Configuration (Requires mdformat-pyproject)

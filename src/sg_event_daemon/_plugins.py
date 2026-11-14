@@ -1,7 +1,5 @@
 """Explicit trusted-plugin loading, registration, and hosted callback contexts."""
 
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import asyncio
@@ -27,6 +25,7 @@ from ._config import (
 )
 from ._events import Event, EventFilter, matches, normalize_filter
 from ._identity import canonical_bytes, digest
+from ._providers import callable_mode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -114,12 +113,12 @@ class SetupContext:
     source: str
     group: str
     plugin_id: str
-    _heartbeat_callback: Callable[[], None] = field(repr=False)
-    _shutdown_check: Callable[[], bool] = field(repr=False)
+    heartbeat_callback: Callable[[], None] = field(repr=False)
+    shutdown_check: Callable[[], bool] = field(repr=False)
 
     def heartbeat(self) -> None:
         """Refresh the owning lane's callback watchdog."""
-        self._heartbeat_callback()
+        self.heartbeat_callback()
 
     @property
     def shutdown_requested(self) -> bool:
@@ -128,7 +127,7 @@ class SetupContext:
         Returns:
             Whether cooperative shutdown is currently requested.
         """
-        return self._shutdown_check()
+        return self.shutdown_check()
 
 
 @dataclass(frozen=True)
@@ -179,23 +178,23 @@ class PluginSpec:
 class _IdentitySeed:
     """Carry shared durable identity fields for one plugin."""
 
-    _plugin_id: str
-    _execution: Literal['sync', 'async']
-    _config_digest: str
-    _secret_refs: tuple[tuple[str, str], ...]
-    _credential_name: str
-    _credential_fingerprint: str
-    _starting_ordinal: int
+    plugin_id: str
+    execution: Literal['sync', 'async']
+    config_digest: str
+    secret_refs: tuple[tuple[str, str], ...]
+    credential_name: str
+    credential_fingerprint: str
+    starting_ordinal: int
 
 
 @dataclass(frozen=True)
 class _PluginLocation:
     """Identify one plugin failure location."""
 
-    _site: str
-    _group: str
-    _plugin_id: str | None = None
-    _callback_id: str | None = None
+    site: str
+    group: str
+    plugin_id: str | None = None
+    callback_id: str | None = None
 
 
 class PluginError(RuntimeError):
@@ -225,17 +224,19 @@ class PluginError(RuntimeError):
             detail: Human-readable failure detail.
             location: Stable site, group, plugin, and callback identity.
         """
-        self.callback_id = location._callback_id
+        self.callback_id = location.callback_id
         self.code = code
-        self.group = location._group
-        self.plugin_id = location._plugin_id
-        self.site = location._site
-        identity = f'site {location._site!r}, group {location._group!r}'
-        if location._plugin_id is not None:
-            identity += f', plugin {location._plugin_id!r}'
-        if location._callback_id is not None:
-            identity += f', callback {location._callback_id!r}'
-        message = f'{code} for {identity}: {detail}; {_TRUSTED_CODE_NOTICE}'
+        self.group = location.group
+        self.plugin_id = location.plugin_id
+        self.site = location.site
+        identity = f'site {location.site!r}, group {location.group!r}'
+        if location.plugin_id is not None:
+            identity += f', plugin {location.plugin_id!r}'
+        if location.callback_id is not None:
+            identity += f', callback {location.callback_id!r}'
+        message = f'{code} for {identity}: {detail}'
+        if code in {'import-failed', 'registration-failed', 'registration-invalid'}:
+            message += f'; {_TRUSTED_CODE_NOTICE}'
         super().__init__(_redact_text(message))
 
 
@@ -296,7 +297,7 @@ class PluginHost:
         """Build one redacted structured group halt."""
         return PluginError(
             code,
-            str(error),
+            f'{type(error).__name__}: {error}' if isinstance(error, BaseException) else str(error),
             _plugin_location(
                 self._site,
                 self._group,
@@ -339,8 +340,8 @@ class PluginHost:
             source=self._group.source,
             group=self._group.name,
             plugin_id=plugin.id,
-            _heartbeat_callback=self._heartbeat,
-            _shutdown_check=self._shutdown_requested,
+            heartbeat_callback=self._heartbeat,
+            shutdown_check=self._shutdown_requested,
             event=event,
             callback_id=callback.id,
             delivery_attempt=delivery_attempt,
@@ -379,8 +380,8 @@ class PluginHost:
             source=self._group.source,
             group=self._group.name,
             plugin_id=plugin.id,
-            _heartbeat_callback=self._heartbeat,
-            _shutdown_check=self._shutdown_requested,
+            heartbeat_callback=self._heartbeat,
+            shutdown_check=self._shutdown_requested,
         )
 
     def _teardown_failure(
@@ -475,6 +476,9 @@ class PluginHost:
 
         Returns:
             A structured group halt on failure, otherwise `None`.
+
+        Raises:
+            asyncio.CancelledError: The callback's awaited work is cancelled.
         """
         handle = self._handles.get(plugin.id)
         if handle is None:
@@ -505,6 +509,8 @@ class PluginHost:
                     callback,
                 )
             await result
+        except (SystemExit, KeyboardInterrupt) as error:
+            return self._failure('callback-failed', _exit_text(error), plugin, callback)
         except Exception as error:  # noqa: BLE001
             return self._failure('callback-failed', error, plugin, callback)
         return None
@@ -552,6 +558,8 @@ class PluginHost:
             )
             result = callback.callback(context)
             validate_sync_callback_result(result, callback.id)
+        except (SystemExit, KeyboardInterrupt) as error:
+            return self._failure('callback-failed', _exit_text(error), plugin, callback)
         except Exception as error:  # noqa: BLE001
             return self._failure('callback-failed', error, plugin, callback)
         return None
@@ -606,6 +614,8 @@ class PluginHost:
                     await result
             except asyncio.CancelledError as error:
                 return self._failure('setup-failed', error, plugin)
+            except (SystemExit, KeyboardInterrupt) as error:
+                return self._failure('setup-failed', _exit_text(error), plugin)
             except Exception as error:  # noqa: BLE001
                 return self._failure('setup-failed', error, plugin)
         return None
@@ -632,6 +642,8 @@ class PluginHost:
                     )
                 if plugin.setup is not None:
                     plugin.setup(self._setup_context(plugin))
+            except (SystemExit, KeyboardInterrupt) as error:
+                return self._failure('setup-failed', _exit_text(error), plugin)
             except Exception as error:  # noqa: BLE001
                 return self._failure('setup-failed', error, plugin)
         return None
@@ -641,19 +653,19 @@ class PluginHost:
 class _RegisteredCallback:
     """Hold callback registration before durable identity construction."""
 
-    _id: str
-    _callback: Callable[[EventContext], object] = field(repr=False)
-    _events: EventFilter | None
+    id: str
+    callback: Callable[[EventContext], object] = field(repr=False)
+    events: EventFilter | None
 
 
 @dataclass
 class _RegistrationState:
     """Hold mutable registration state shared with the loader."""
 
-    _callbacks: list[_RegisteredCallback]
-    _frozen: bool
-    _setup: Callable[[SetupContext], object] | None
-    _setup_was_set: bool
+    callbacks: list[_RegisteredCallback]
+    frozen: bool
+    setup: Callable[[SetupContext], object] | None
+    setup_was_set: bool
 
 
 class _Registrar:
@@ -674,7 +686,7 @@ class _Registrar:
 
     def _check_open(self) -> None:
         """Reject mutation after the registration function returns."""
-        if self._state._frozen:
+        if self._state.frozen:
             raise PluginError(
                 'registration-frozen',
                 'registration is frozen after register returns',
@@ -720,16 +732,17 @@ class _Registrar:
         ):
             raise PluginError(
                 'registration-invalid',
-                f'invalid callback id {callback_id!r}',
+                f'invalid callback id {callback_id!r}; use 1-64 lowercase letters, digits, '
+                "'-' or '_', starting with a letter",
                 self._location,
             )
         callback_location = _PluginLocation(
-            _site=self._location._site,
-            _group=self._location._group,
-            _plugin_id=self._location._plugin_id,
-            _callback_id=callback_id,
+            site=self._location.site,
+            group=self._location.group,
+            plugin_id=self._location.plugin_id,
+            callback_id=callback_id,
         )
-        if any(existing._id == callback_id for existing in self._state._callbacks):
+        if any(existing.id == callback_id for existing in self._state.callbacks):
             raise PluginError(
                 'registration-invalid',
                 f'duplicate callback id {callback_id!r}',
@@ -749,11 +762,11 @@ class _Registrar:
                 f'callback {callback_id!r} has an invalid filter: {error}',
                 callback_location,
             ) from None
-        self._state._callbacks.append(
+        self._state.callbacks.append(
             _RegisteredCallback(
-                _id=callback_id,
-                _callback=cast('Callable[[EventContext], object]', callback),
-                _events=normalized,
+                id=callback_id,
+                callback=cast('Callable[[EventContext], object]', callback),
+                events=normalized,
             )
         )
 
@@ -777,7 +790,7 @@ class _Registrar:
                 setup was already declared.
         """
         self._check_open()
-        if self._state._setup_was_set:
+        if self._state.setup_was_set:
             raise PluginError(
                 'registration-invalid',
                 'setup was registered more than once',
@@ -789,8 +802,8 @@ class _Registrar:
                 'setup is not callable',
                 self._location,
             )
-        self._state._setup = cast('Callable[[SetupContext], object]', setup)
-        self._state._setup_was_set = True
+        self._state.setup = cast('Callable[[SetupContext], object]', setup)
+        self._state.setup_was_set = True
 
 
 class _SecretFilter(logging.Filter):
@@ -825,10 +838,9 @@ class _SecretFilter(logging.Filter):
         return True
 
 
-def _callable_is_async(value: Callable[..., object]) -> bool:
-    """Classify an unwrapped function or callable target."""
-    targets = (inspect.unwrap(value), inspect.unwrap(value.__call__))
-    return any(inspect.iscoroutinefunction(target) for target in targets)
+def _exit_text(error: BaseException) -> str:
+    """Name a plugin exit class in its group-local failure text."""
+    return f'{type(error).__name__}: {error}'
 
 
 def _freeze_json(value: object) -> object:
@@ -861,10 +873,10 @@ def _plugin_location(
 ) -> _PluginLocation:
     """Build one stable failure location from resolved configuration."""
     return _PluginLocation(
-        _site=site.name,
-        _group=group.name,
-        _plugin_id=plugin_id,
-        _callback_id=callback_id,
+        site=site.name,
+        group=group.name,
+        plugin_id=plugin_id,
+        callback_id=callback_id,
     )
 
 
@@ -878,22 +890,30 @@ def _check_mode(
     """Reject native coroutine mode mismatches before setup can run."""
     expects_async = group.execution == 'async'
     if setup is not None:
-        setup_is_async = _callable_is_async(setup)
-        if setup_is_async != expects_async:
-            actual = 'async' if setup_is_async else 'ordinary'
+        setup_is_async = callable_mode(setup)
+        if setup_is_async is None or setup_is_async != expects_async:
+            actual = (
+                'invalid' if setup_is_async is None else 'async' if setup_is_async else 'ordinary'
+            )
             raise PluginError(
                 'registration-invalid',
                 f'{group.execution} group rejects {actual} setup',
                 _plugin_location(site, group, plugin_id),
             )
     for callback in callbacks:
-        callback_is_async = _callable_is_async(callback._callback)
-        if callback_is_async != expects_async:
-            actual = 'async' if callback_is_async else 'ordinary'
+        callback_is_async = callable_mode(callback.callback)
+        if callback_is_async is None or callback_is_async != expects_async:
+            actual = (
+                'invalid'
+                if callback_is_async is None
+                else 'async'
+                if callback_is_async
+                else 'ordinary'
+            )
             raise PluginError(
                 'registration-invalid',
-                f'{group.execution} group rejects {actual} callback {callback._id!r}',
-                _plugin_location(site, group, plugin_id, callback._id),
+                f'{group.execution} group rejects {actual} callback {callback.id!r}',
+                _plugin_location(site, group, plugin_id, callback.id),
             )
 
 
@@ -903,12 +923,6 @@ def _check_provider(site: SiteConfig, group: GroupConfig, provider: ProviderInte
         raise PluginError(
             'provider-incompatible',
             f'provider {provider.name!r} does not support async plugin handles',
-            _plugin_location(site, group),
-        )
-    if group.execution == 'sync' and not provider.capabilities.sync:
-        raise PluginError(
-            'provider-incompatible',
-            f'provider {provider.name!r} does not support sync plugin handles',
             _plugin_location(site, group),
         )
 
@@ -1063,7 +1077,7 @@ def _load_module(
         _remove_module(module_name, module)
         raise PluginError(
             'import-failed',
-            f'plugin import failed: {error}',
+            f'plugin import failed: {type(error).__name__}: {error}',
             _plugin_location(site, group, plugin_id),
         ) from None
     return module
@@ -1089,10 +1103,10 @@ def _run_registration(
             location,
         )
     state = _RegistrationState(
-        _callbacks=[],
-        _frozen=False,
-        _setup=None,
-        _setup_was_set=False,
+        callbacks=[],
+        frozen=False,
+        setup=None,
+        setup_was_set=False,
     )
     registrar = _Registrar(config, location, state)
     try:
@@ -1102,7 +1116,7 @@ def _run_registration(
     except Exception as error:  # noqa: BLE001
         raise PluginError(
             'registration-failed',
-            f'registration failed: {error}',
+            f'registration failed: {type(error).__name__}: {error}',
             location,
         ) from None
     if inspect.isawaitable(result):
@@ -1113,8 +1127,8 @@ def _run_registration(
             'registration must be synchronous and return a non-awaitable result',
             location,
         )
-    state._frozen = True
-    return state._setup, tuple(state._callbacks)
+    state.frozen = True
+    return state.setup, tuple(state.callbacks)
 
 
 def _secret_filter() -> _SecretFilter:
@@ -1153,19 +1167,19 @@ def _callback_specs(
     """Build durable identities for one plugin's ordered callbacks."""
     return tuple(
         CallbackSpec(
-            id=registered._id,
-            callback=registered._callback,
-            events=registered._events,
+            id=registered.id,
+            callback=registered.callback,
+            events=registered.events,
             identity=CallbackIdentity(
-                ordinal=seed._starting_ordinal + offset,
-                plugin_id=seed._plugin_id,
-                callback_id=registered._id,
-                execution=seed._execution,
-                filter_digest=digest(canonical_bytes(_thaw_json(registered._events or ()))),
-                config_digest=seed._config_digest,
-                secret_refs=seed._secret_refs,
-                credential_name=seed._credential_name,
-                credential_fingerprint=seed._credential_fingerprint,
+                ordinal=seed.starting_ordinal + offset,
+                plugin_id=seed.plugin_id,
+                callback_id=registered.id,
+                execution=seed.execution,
+                filter_digest=digest(canonical_bytes(_thaw_json(registered.events or ()))),
+                config_digest=seed.config_digest,
+                secret_refs=seed.secret_refs,
+                credential_name=seed.credential_name,
+                credential_fingerprint=seed.credential_fingerprint,
             ),
         )
         for offset, registered in enumerate(callbacks)
@@ -1214,13 +1228,13 @@ def load_plugin_spec(
         callbacks = _callback_specs(
             registered_callbacks,
             _IdentitySeed(
-                _plugin_id=plugin.id,
-                _execution=group.execution,
-                _config_digest=digest(canonical_bytes(_thaw_json(config))),
-                _secret_refs=references,
-                _credential_name=plugin.credentials,
-                _credential_fingerprint=_credential_fingerprint(site, plugin, group),
-                _starting_ordinal=starting_ordinal,
+                plugin_id=plugin.id,
+                execution=group.execution,
+                config_digest=digest(canonical_bytes(_thaw_json(config))),
+                secret_refs=references,
+                credential_name=plugin.credentials,
+                credential_fingerprint=_credential_fingerprint(site, plugin, group),
+                starting_ordinal=starting_ordinal,
             ),
         )
     except PluginError:
@@ -1261,17 +1275,9 @@ def load_plugins(
     """
     _register_site_secrets(site)
     _check_provider(site, group, provider)
-    plugin_ids: set[str] = set()
     plugins: list[PluginSpec] = []
     ordinal = 0
     for plugin in group.plugins:
-        if plugin.id in plugin_ids:
-            raise PluginError(
-                'configuration-invalid',
-                f'duplicate plugin id {plugin.id!r}',
-                _plugin_location(site, group, plugin.id),
-            )
-        plugin_ids.add(plugin.id)
         loaded = load_plugin_spec(site, group, plugin, ordinal)
         plugins.append(loaded)
         ordinal += len(loaded.callbacks)
@@ -1304,4 +1310,4 @@ def with_heartbeat(context: _ContextT, heartbeat: Callable[[], None]) -> _Contex
     Returns:
         A context of the same concrete type with all other fields preserved.
     """
-    return replace(context, _heartbeat_callback=heartbeat)
+    return replace(context, heartbeat_callback=heartbeat)

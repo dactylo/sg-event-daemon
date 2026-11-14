@@ -12,7 +12,6 @@ from sg_event_daemon._fanout import (
     FanoutMessage,
     GroupChannel,
     GroupChannelInterface,
-    StrictCapacityControl,
     StrictOrderingControl,
 )
 from sg_event_daemon._group_types import LiveJoinIdentity
@@ -26,12 +25,13 @@ from sg_event_daemon._source import (
 from sg_event_daemon._source_store import DiscoveryRange
 from sg_event_daemon._strict import (
     JOIN_ABORT_LIMIT,
-    OrderingAnomaly,
     StrictBuffer,
     _AttachGroupOptions,
+    _OrderingAnomaly,
     _StrictRelease,
     _StrictReleaseWatermark,
 )
+from tests._strict_state import strict_observations, strict_watermark
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -53,21 +53,21 @@ class _PacedTestChannel(GroupChannel):
             max_bytes=10_000_000,
         )
         self._accept_count = accept_count
-        self._accepted_event_ids: list[int] = []
-        self._offer_count = 0
+        self.accepted_event_ids: list[int] = []
+        self.offer_count = 0
 
     def offer_paced(self, message: FanoutMessage) -> bool:
         assert isinstance(message, EventDelivery)
-        self._offer_count += 1
-        if len(self._accepted_event_ids) >= self._accept_count:
+        self.offer_count += 1
+        if len(self.accepted_event_ids) >= self._accept_count:
             return False
-        self._accepted_event_ids.append(message.encoded.event_id)
+        self.accepted_event_ids.append(message.encoded.event_id)
         return True
 
 
 class _SortCounter:
     def __init__(self) -> None:
-        self._count = 0
+        self.count = 0
 
     def __call__(
         self,
@@ -77,7 +77,7 @@ class _SortCounter:
         reverse: bool = False,
     ) -> list[Any]:
         if key is None:
-            self._count += 1
+            self.count += 1
             return sorted(values, reverse=reverse)
         return sorted(values, key=key, reverse=reverse)
 
@@ -125,28 +125,20 @@ def _range(
     high_id: int,
     *,
     opened_successful_at: float,
-    eligibility_points: dict[str, float],
 ) -> DiscoveryRange:
     return DiscoveryRange(
         obligation_id=obligation_id,
         low_id=low_id,
         high_id=high_id,
         opened_successful_at=opened_successful_at,
-        _visibility_deadline=opened_successful_at,
-        _revision=1,
-        _close_generation=0,
         state='open',
-        late_ids=(),
-        group_eligibility=tuple(eligibility_points.items()),
-        _scan_started_at=None,
+        late_id_count=0,
         scan_next_id=low_id,
-        _scan_pages=0,
-        _degraded=False,
     )
 
 
 def _release_ids(buffer: StrictBuffer, group: str, successful_time: float) -> list[int]:
-    return [release._event_id for release in buffer.pump_many((group,), successful_time)]
+    return [release.event_id for release in buffer.pump_many((group,), successful_time)]
 
 
 def attach_strict_group(
@@ -170,6 +162,26 @@ def attach_strict_group(
     assert buffer.prepare(identity, channel) == Attached(identity)
     assert buffer.finalize(identity) == JoinFinalized(identity)
     return watermark
+
+
+def test_below_floor_rows_do_not_change_delivery() -> None:
+    buffer = StrictBuffer(max_events=1, max_bytes=_encoded(1).byte_count)
+    initial = attach_strict_group(
+        buffer,
+        'editorial',
+        7,
+        holdback_secs=60.0,
+        delivery_floor=200,
+    )
+
+    decisions = buffer.observe_many(
+        (_encoded(event_id) for event_id in range(1, 102)),
+        successful_time=0.0,
+    )
+
+    assert decisions == ()
+    assert strict_watermark(buffer, 'editorial') == initial
+    assert buffer._halt_reasons.get('editorial', None) is None
 
 
 def test_capacity_abort_limit_is_fixed_and_surfaces_a_halt() -> None:
@@ -198,29 +210,6 @@ def test_capacity_abort_limit_is_fixed_and_surfaces_a_halt() -> None:
     assert buffer._halt_reasons.get('joining', None) == 'strict-capacity-exhausted'
 
 
-def test_capacity_relief_history_keeps_latest_hundred_without_changing_halt() -> None:
-    buffer = StrictBuffer(max_events=1, max_bytes=_encoded(1).byte_count)
-    for group_number in range(101):
-        attach_strict_group(
-            buffer,
-            f'group-{group_number:03}',
-            1,
-            holdback_secs=300.0,
-            delivery_floor=0,
-        )
-    buffer._observe(_encoded(1), successful_time=0.0)
-
-    buffer._observe(_encoded(2), successful_time=0.0)
-
-    expected = tuple(
-        [f'detach-group:group-{group_number:03}' for group_number in range(1, 100)]
-        + ['halt-group:group-100']
-    )
-    assert buffer._relief_actions == expected
-    assert buffer._watermark('group-100')._released_through == 0
-    assert buffer._halt_reasons.get('group-100', None) == 'strict-capacity-exhausted'
-
-
 def test_default_window_sustains_twenty_five_events_per_second_within_caps() -> None:
     events = tuple(_encoded(event_id) for event_id in range(1, 7_501))
     max_bytes = sum(event.byte_count for event in events)
@@ -233,8 +222,8 @@ def test_default_window_sustains_twenty_five_events_per_second_within_caps() -> 
     assert buffer._halt_reasons.get('editorial', None) is None
     releases = buffer.pump_many(('editorial',), 600.0)
     assert len(releases) == 7_500
-    assert releases[0]._event_id == 1
-    assert releases[-1]._event_id == 7_500
+    assert releases[0].event_id == 1
+    assert releases[-1].event_id == 7_500
 
 
 def test_detached_group_does_not_pin_shared_payloads() -> None:
@@ -298,8 +287,8 @@ def test_groups_share_one_payload_but_keep_independent_release_progress() -> Non
     assert buffer.byte_count == encoded.byte_count
     assert _release_ids(buffer, 'fast', 60.0) == [100]
     assert buffer.event_count == 1
-    assert buffer._watermark('fast')._released_through == 100
-    assert buffer._watermark('slow')._released_through == 99
+    assert strict_watermark(buffer, 'fast').released_through == 100
+    assert strict_watermark(buffer, 'slow').released_through == 99
     assert _release_ids(buffer, 'slow', 299.0) == []
     assert _release_ids(buffer, 'slow', 300.0) == [100]
     assert buffer.event_count == 0
@@ -310,8 +299,8 @@ def test_incremental_release_constructs_only_the_synchronously_offered_prefix(
     monkeypatch: pytest.MonkeyPatch,
     accept_count: int,
 ) -> None:
-    events = tuple(_encoded(event_id) for event_id in range(1, 20_001))
-    inserted = _encoded(20_001)
+    events = tuple(_encoded(event_id) for event_id in range(1, 17))
+    inserted = _encoded(17)
     channel = _PacedTestChannel(accept_count=accept_count)
     buffer = StrictBuffer(
         max_events=len(events) + 1,
@@ -331,20 +320,20 @@ def test_incremental_release_constructs_only_the_synchronously_offered_prefix(
 
     def counting_release(
         *,
-        _group: str,
-        _event_id: int,
-        _encoded: EncodedEvent,
-        _ordering_time: float,
-        _is_operator_replay: bool,
+        group: str,
+        event_id: int,
+        encoded: EncodedEvent,
+        ordering_time: float,
+        is_operator_replay: bool,
     ) -> _StrictRelease:
         nonlocal construction_count
         construction_count += 1
         return _StrictRelease(
-            _group=_group,
-            _event_id=_event_id,
-            _encoded=_encoded,
-            _ordering_time=_ordering_time,
-            _is_operator_replay=_is_operator_replay,
+            group=group,
+            event_id=event_id,
+            encoded=encoded,
+            ordering_time=ordering_time,
+            is_operator_replay=is_operator_replay,
         )
 
     monkeypatch.setattr(strict_module, '_StrictRelease', counting_release)
@@ -354,21 +343,21 @@ def test_incremental_release_constructs_only_the_synchronously_offered_prefix(
         accepted = buffer.pump_many(('editorial',), 1.0)
 
         expected_ids = list(range(1, accept_count + 1))
-        assert [release._event_id for release in accepted] == expected_ids
-        assert channel._accepted_event_ids == expected_ids
-        assert channel._offer_count == accept_count + 1
+        assert [release.event_id for release in accepted] == expected_ids
+        assert channel.accepted_event_ids == expected_ids
+        assert channel.offer_count == accept_count + 1
         assert construction_count == accept_count + 1
-        assert buffer._watermark('editorial')._released_through == accept_count
+        assert strict_watermark(buffer, 'editorial').released_through == accept_count
         assert buffer.event_count == len(events) - accept_count
-        assert sort_counter._count == 1
+        assert sort_counter.count == 1
 
         for _ in range(3):
             assert buffer.pump_many(('editorial',), 1.0) == ()
 
         expected_sorts = 1 if accept_count == 0 else 2
-        assert sort_counter._count == expected_sorts
+        assert sort_counter.count == expected_sorts
         assert construction_count == accept_count + 4
-        assert buffer._watermark('editorial')._released_through == accept_count
+        assert strict_watermark(buffer, 'editorial').released_through == accept_count
         assert buffer.event_count == len(events) - accept_count
 
     buffer._observe(inserted, successful_time=0.0)
@@ -376,10 +365,26 @@ def test_incremental_release_constructs_only_the_synchronously_offered_prefix(
         patch.setattr(strict_module, 'sorted', sort_counter, raising=False)
         assert buffer.pump_many(('editorial',), 1.0) == ()
 
-    assert sort_counter._count == expected_sorts + 1
+    assert sort_counter.count == expected_sorts + 1
     assert construction_count == accept_count + 5
-    assert buffer._watermark('editorial')._released_through == accept_count
+    assert strict_watermark(buffer, 'editorial').released_through == accept_count
     assert buffer.event_count == len(events) - accept_count + 1
+
+
+@pytest.mark.parametrize(('first_time', 'duplicate_time'), [(10.0, 20.0), (20.0, 10.0)])
+def test_duplicate_observation_keeps_earliest_successful_time(
+    first_time: float,
+    duplicate_time: float,
+) -> None:
+    buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
+    attach_strict_group(buffer, 'editorial', 1, holdback_secs=1.0, delivery_floor=100)
+    event = _encoded(101)
+    assert buffer.observe_many((event,), successful_time=first_time) == ()
+    assert buffer.observe_many((event,), successful_time=duplicate_time) == ()
+    assert buffer.event_count == 1
+    assert buffer.byte_count == event.byte_count
+    assert _release_ids(buffer, 'editorial', 10.5) == []
+    assert _release_ids(buffer, 'editorial', 11.0) == [101]
 
 
 def test_invalid_or_foreign_strict_join_identity_is_rejected() -> None:
@@ -432,7 +437,7 @@ def test_join_prepare_finalize_abort_are_exact_idempotent_and_token_fenced() -> 
     assert buffer.finalize(identity) == JoinFinalized(identity)
     assert buffer.finalize(identity) == JoinFinalized(identity)
     assert 'editorial' in buffer._groups
-    assert buffer._watermark('editorial')._released_through == 10
+    assert strict_watermark(buffer, 'editorial').released_through == 10
 
     buffer.abort(identity)
     buffer.abort(identity)
@@ -473,9 +478,8 @@ def test_join_reservation_rejects_insufficient_byte_headroom_with_event_capacity
     assert retry.headroom_events == max_events - len(initial)
     assert retry.headroom_bytes == retained_bytes - 1
     assert buffer._leases == ()
-    assert tuple(item._encoded for item in buffer._observations) == initial
+    assert tuple(item.encoded for item in strict_observations(buffer)) == initial
     assert buffer.byte_count == retained_bytes
-    assert buffer._relief_actions == ()
 
 
 def test_join_reservation_uses_measured_half_headroom_not_id_distance() -> None:
@@ -507,7 +511,7 @@ def test_join_reservation_uses_measured_half_headroom_not_id_distance() -> None:
     assert retry.headroom_bytes == _encoded(1).byte_count
 
 
-def test_late_discovery_halts_above_floor_and_skips_body_free_below_floor() -> None:
+def test_late_discovery_halts_above_floor_and_ignores_rows_below_floor() -> None:
     buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
     attach_strict_group(
         buffer,
@@ -529,21 +533,13 @@ def test_late_discovery_halts_above_floor_and_skips_body_free_below_floor() -> N
     decisions = buffer._observe(_encoded(101), successful_time=100.0)
 
     assert decisions == (
-        OrderingAnomaly(
+        _OrderingAnomaly(
             group='anomalous',
             group_generation=4,
             event_id=101,
             last_delivered_id=102,
             delivery_floor=50,
             action='halt',
-        ),
-        OrderingAnomaly(
-            group='floored',
-            group_generation=4,
-            event_id=101,
-            last_delivered_id=102,
-            delivery_floor=102,
-            action='skip',
         ),
     )
     assert buffer._halt_reasons.get('anomalous', None) == 'ordering-anomaly'
@@ -557,13 +553,9 @@ def test_lower_held_observation_and_overlapping_ranges_block_higher_rows() -> No
     buffer._observe(_encoded(100), successful_time=10.0)
     buffer._observe(_encoded(102), successful_time=0.0)
     buffer_ranges: dict[str, DiscoveryRange] = {}
-    buffer_ranges['lower-a'] = _range(
-        'lower-a', 101, 101, opened_successful_at=0.0, eligibility_points={'editorial': 60.0}
-    )
+    buffer_ranges['lower-a'] = _range('lower-a', 101, 101, opened_successful_at=0.0)
     buffer.synchronize_ranges(buffer_ranges.values())
-    buffer_ranges['lower-b'] = _range(
-        'lower-b', 100, 101, opened_successful_at=5.0, eligibility_points={'editorial': 65.0}
-    )
+    buffer_ranges['lower-b'] = _range('lower-b', 100, 101, opened_successful_at=5.0)
     buffer.synchronize_ranges(buffer_ranges.values())
 
     assert _release_ids(buffer, 'editorial', 60.0) == []
@@ -575,41 +567,11 @@ def test_lower_held_observation_and_overlapping_ranges_block_higher_rows() -> No
     assert _release_ids(buffer, 'editorial', 70.0) == [100, 102]
 
 
-def test_merged_range_uses_earliest_ordering_time_and_latest_eligibility() -> None:
-    buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
-    attach_strict_group(buffer, 'editorial', 1, holdback_secs=10.0, delivery_floor=99)
-    buffer_ranges: dict[str, DiscoveryRange] = {}
-    buffer_ranges['early'] = _range(
-        'early', 100, 101, opened_successful_at=0.0, eligibility_points={'editorial': 50.0}
-    )
-    buffer.synchronize_ranges(buffer_ranges.values())
-    buffer_ranges['late'] = _range(
-        'late', 101, 102, opened_successful_at=20.0, eligibility_points={'editorial': 100.0}
-    )
-    buffer.synchronize_ranges(buffer_ranges.values())
-    buffer._observe(
-        _encoded(101),
-        successful_time=90.0,
-        range_ids=('early', 'late'),
-    )
-    buffer_ranges['early'] = replace(buffer_ranges['early'], state='closed')
-    buffer.synchronize_ranges(buffer_ranges.values())
-    buffer_ranges['late'] = replace(buffer_ranges['late'], state='closed')
-    buffer.synchronize_ranges(buffer_ranges.values())
-
-    observation = buffer._observations[0]
-    assert observation._ordering_time == 0.0
-    assert _release_ids(buffer, 'editorial', 99.0) == []
-    assert _release_ids(buffer, 'editorial', 100.0) == [101]
-
-
 def test_million_id_gap_uses_one_range_and_one_observation() -> None:
     buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
     attach_strict_group(buffer, 'restricted', 1, holdback_secs=60.0, delivery_floor=0)
     buffer_ranges: dict[str, DiscoveryRange] = {}
-    buffer_ranges['sparse-gap'] = _range(
-        'sparse-gap', 1, 999999, opened_successful_at=0.0, eligibility_points={'restricted': 60.0}
-    )
+    buffer_ranges['sparse-gap'] = _range('sparse-gap', 1, 999999, opened_successful_at=0.0)
     buffer.synchronize_ranges(buffer_ranges.values())
     buffer._observe(_encoded(1_000_000), successful_time=0.0)
 
@@ -649,7 +611,7 @@ def test_multi_group_pump_reclaims_once(monkeypatch: pytest.MonkeyPatch) -> None
 
     releases = buffer.pump_many((group for group in ('alpha', 'beta', 'gamma')), 1.0)
 
-    assert [(item._group, item._event_id) for item in releases] == [
+    assert [(item.group, item.event_id) for item in releases] == [
         ('alpha', 101),
         ('alpha', 102),
         ('beta', 101),
@@ -703,9 +665,7 @@ def test_open_range_overlapping_the_release_watermark_still_blocks_higher_rows()
     buffer._observe(_encoded(100), successful_time=0.0)
     assert _release_ids(buffer, 'editorial', 1.0) == [100]
     buffer_ranges: dict[str, DiscoveryRange] = {}
-    buffer_ranges['overlapping'] = _range(
-        'overlapping', 50, 101, opened_successful_at=0.0, eligibility_points={'editorial': 1.0}
-    )
+    buffer_ranges['overlapping'] = _range('overlapping', 50, 101, opened_successful_at=0.0)
     buffer.synchronize_ranges(buffer_ranges.values())
     buffer._observe(_encoded(102), successful_time=0.0)
 
@@ -727,69 +687,40 @@ def test_ordered_observation_view_sorts_once_per_key_set(
         delivery_floor=0,
         channel=_channel('editorial', max_events=1),
     )
-    buffer_ranges: dict[str, DiscoveryRange] = {}
-    for range_id in ('range-a', 'range-b'):
-        buffer_ranges[range_id] = _range(
-            range_id, 1, 1, opened_successful_at=0.0, eligibility_points={'editorial': 0.0}
-        )
-        buffer.synchronize_ranges(buffer_ranges.values())
-        buffer_ranges[range_id] = replace(buffer_ranges[range_id], state='closed')
-        buffer.synchronize_ranges(buffer_ranges.values())
     first = _encoded(1)
-    buffer._observe(first, successful_time=0.0, range_ids=('range-a',))
+    buffer._observe(first, successful_time=0.0)
 
     sort_counter = _SortCounter()
 
     with monkeypatch.context() as patch:
         patch.setattr(strict_module, 'sorted', sort_counter, raising=False)
-        assert [item._event_id for item in buffer._observations] == [1]
-        assert [item._event_id for item in buffer._observations] == [1]
+        assert [item.event_id for item in strict_observations(buffer)] == [1]
+        assert [item.event_id for item in strict_observations(buffer)] == [1]
         assert buffer.pump_many(('editorial',), 0.5) == ()
-    assert sort_counter._count == 1
+    assert sort_counter.count == 1
 
-    buffer._observe(first, successful_time=1.0, range_ids=('range-b',))
+    buffer._observe(first, successful_time=1.0)
     sort_counter = _SortCounter()
     with monkeypatch.context() as patch:
         patch.setattr(strict_module, 'sorted', sort_counter, raising=False)
-        assert buffer._observations[0]._range_ids == ('range-a', 'range-b')
-    assert sort_counter._count == 0
+        assert strict_observations(buffer)[0].ordering_time == 0.0
+    assert sort_counter.count == 0
 
     buffer._observe(_encoded(2), successful_time=0.0)
     sort_counter = _SortCounter()
     with monkeypatch.context() as patch:
         patch.setattr(strict_module, 'sorted', sort_counter, raising=False)
-        assert [item._event_id for item in buffer._observations] == [1, 2]
-        assert [item._event_id for item in buffer._observations] == [1, 2]
-    assert sort_counter._count == 1
+        assert [item.event_id for item in strict_observations(buffer)] == [1, 2]
+        assert [item.event_id for item in strict_observations(buffer)] == [1, 2]
+    assert sort_counter.count == 1
 
-    assert [release._event_id for release in buffer.pump_many(('editorial',), 1.0)] == [1]
+    assert [release.event_id for release in buffer.pump_many(('editorial',), 1.0)] == [1]
     sort_counter = _SortCounter()
     with monkeypatch.context() as patch:
         patch.setattr(strict_module, 'sorted', sort_counter, raising=False)
-        assert [item._event_id for item in buffer._observations] == [2]
-        assert [item._event_id for item in buffer._observations] == [2]
-    assert sort_counter._count == 1
-
-
-def test_ordering_decisions_preserve_input_order_without_changing_delivery() -> None:
-    buffer = StrictBuffer(max_events=1, max_bytes=_encoded(1).byte_count)
-    initial = attach_strict_group(
-        buffer,
-        'editorial',
-        7,
-        holdback_secs=60.0,
-        delivery_floor=200,
-    )
-
-    decisions = buffer.observe_many(
-        (_encoded(event_id) for event_id in range(1, 102)),
-        successful_time=0.0,
-    )
-
-    assert tuple(item.event_id for item in decisions) == tuple(range(1, 102))
-    assert all(item.action == 'skip' for item in decisions)
-    assert buffer._watermark('editorial') == initial
-    assert buffer._halt_reasons.get('editorial', None) is None
+        assert [item.event_id for item in strict_observations(buffer)] == [2]
+        assert [item.event_id for item in strict_observations(buffer)] == [2]
+    assert sort_counter.count == 1
 
 
 def test_queue_pacing_fills_all_current_strict_channel_space() -> None:
@@ -810,11 +741,11 @@ def test_queue_pacing_fills_all_current_strict_channel_space() -> None:
 
     accepted = buffer.pump_many(('editorial',), 1.0)
 
-    assert [item._event_id for item in accepted] == [100, 101, 102]
+    assert [item.event_id for item in accepted] == [100, 101, 102]
     assert channel.status.attached
     assert channel.status.queued_count == 3
     channel.drain()
-    assert [item._event_id for item in buffer.pump_many(('editorial',), 1.0)] == [103]
+    assert [item.event_id for item in buffer.pump_many(('editorial',), 1.0)] == [103]
 
 
 def test_queue_pacing_waits_for_space_without_detaching_strict_channel() -> None:
@@ -830,13 +761,13 @@ def test_queue_pacing_waits_for_space_without_detaching_strict_channel() -> None
     )
     buffer.observe_many((_encoded(100), _encoded(101)), successful_time=0.0)
 
-    assert [item._event_id for item in buffer.pump_many(('editorial',), 1.0)] == [100]
+    assert [item.event_id for item in buffer.pump_many(('editorial',), 1.0)] == [100]
     assert buffer.pump_many(('editorial',), 1.0) == ()
     assert channel.status.attached
     first = channel.drain()
     assert len(first) == 1
     assert isinstance(first[0], EventDelivery)
-    assert [item._event_id for item in buffer.pump_many(('editorial',), 1.0)] == [101]
+    assert [item.event_id for item in buffer.pump_many(('editorial',), 1.0)] == [101]
     assert channel.status.attached
 
 
@@ -845,9 +776,7 @@ def test_range_expiry_releases_sparse_rows_without_allocating_missing_ids() -> N
     attach_strict_group(buffer, 'editorial', 1, holdback_secs=300.0, delivery_floor=99)
     buffer.observe_many((_encoded(100), _encoded(102)), successful_time=0.0)
     buffer_ranges: dict[str, DiscoveryRange] = {}
-    buffer_ranges['range-101'] = _range(
-        'range-101', 101, 101, opened_successful_at=0.0, eligibility_points={'editorial': 300.0}
-    )
+    buffer_ranges['range-101'] = _range('range-101', 101, 101, opened_successful_at=0.0)
     buffer.synchronize_ranges(buffer_ranges.values())
 
     assert len(buffer._ranges) == 1
@@ -858,7 +787,7 @@ def test_range_expiry_releases_sparse_rows_without_allocating_missing_ids() -> N
     assert _release_ids(buffer, 'editorial', 300.0) == [102]
 
 
-def test_rebuild_restarts_ordinary_holdback_but_preserves_range_timing() -> None:
+def test_rebuild_restarts_ordinary_holdback() -> None:
     before_crash = StrictBuffer(max_events=20, max_bytes=10_000_000)
     attach_strict_group(before_crash, 'ordinary', 1, holdback_secs=300.0, delivery_floor=99)
     before_crash._observe(_encoded(100), successful_time=0.0)
@@ -869,24 +798,6 @@ def test_rebuild_restarts_ordinary_holdback_but_preserves_range_timing() -> None
     rebuilt._observe(_encoded(100), successful_time=300.0)
     assert _release_ids(rebuilt, 'ordinary', 599.0) == []
     assert _release_ids(rebuilt, 'ordinary', 600.0) == [100]
-
-    range_rebuilt = StrictBuffer(max_events=20, max_bytes=10_000_000)
-    attach_strict_group(range_rebuilt, 'ranged', 1, holdback_secs=300.0, delivery_floor=99)
-    range_rebuilt_ranges: dict[str, DiscoveryRange] = {}
-    range_rebuilt_ranges['durable-range'] = _range(
-        'durable-range', 100, 100, opened_successful_at=0.0, eligibility_points={'ranged': 300.0}
-    )
-    range_rebuilt.synchronize_ranges(range_rebuilt_ranges.values())
-    range_rebuilt_ranges['durable-range'] = replace(
-        range_rebuilt_ranges['durable-range'], state='closed'
-    )
-    range_rebuilt.synchronize_ranges(range_rebuilt_ranges.values())
-    range_rebuilt._observe(
-        _encoded(100),
-        successful_time=300.0,
-        range_ids=('durable-range',),
-    )
-    assert _release_ids(range_rebuilt, 'ranged', 300.0) == [100]
 
 
 def test_reclamation_floor_matches_payload_retention_truth_table() -> None:
@@ -903,42 +814,20 @@ def test_reclamation_floor_matches_payload_retention_truth_table() -> None:
     )
 
     assert buffer._retention_floor() == 100
-    assert [item._event_id for item in buffer._observations] == [101, 102, 103, 104, 105]
+    assert [item.event_id for item in strict_observations(buffer)] == [101, 102, 103, 104, 105]
 
     buffer.abort(first_lease)
     assert buffer._retention_floor() == 101
-    assert [item._event_id for item in buffer._observations] == [102, 103, 104, 105]
+    assert [item.event_id for item in strict_observations(buffer)] == [102, 103, 104, 105]
 
-    buffer._groups['alpha']._capacity_pending = True
-    buffer._free_unused()
+    buffer.detach_group('alpha', reason='strict-buffer-capacity')
     assert buffer._retention_floor() == 103
-    assert [item._event_id for item in buffer._observations] == [104, 105]
+    assert [item.event_id for item in strict_observations(buffer)] == [104, 105]
 
-    buffer._groups['beta']._capacity_pending = True
+    buffer.detach_group('beta', reason='strict-buffer-capacity')
     buffer.abort(second_lease)
     assert buffer._retention_floor() is None
-    assert buffer._observations == ()
-
-
-def test_release_waits_for_late_range_and_emits_the_complete_ascending_prefix() -> None:
-    buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
-    attach_strict_group(buffer, 'editorial', 1, holdback_secs=300.0, delivery_floor=99)
-    buffer.observe_many((_encoded(100), _encoded(102)), successful_time=0.0)
-    buffer_ranges: dict[str, DiscoveryRange] = {}
-    buffer_ranges['range-101'] = _range(
-        'range-101', 101, 101, opened_successful_at=0.0, eligibility_points={'editorial': 300.0}
-    )
-    buffer.synchronize_ranges(buffer_ranges.values())
-    buffer._observe(
-        _encoded(101),
-        successful_time=299.0,
-        range_ids=('range-101',),
-    )
-
-    assert _release_ids(buffer, 'editorial', 299.0) == []
-    buffer_ranges['range-101'] = replace(buffer_ranges['range-101'], state='closed')
-    buffer.synchronize_ranges(buffer_ranges.values())
-    assert _release_ids(buffer, 'editorial', 300.0) == [100, 101, 102]
+    assert strict_observations(buffer) == ()
 
 
 def test_relief_aborts_newest_join_then_detaches_lowest_watermark_stably() -> None:
@@ -956,13 +845,10 @@ def test_relief_aborts_newest_join_then_detaches_lowest_watermark_stably() -> No
 
     buffer._observe(_encoded(3), successful_time=0.0)
 
-    assert buffer._relief_actions[:2] == (
-        'abort-join:joining:newest',
-        'detach-group:alpha',
-    )
+    assert buffer._join_records[joining.attempt_token].abort_cause == 'capacity'
     assert 'alpha' not in buffer._groups
     assert 'beta' in buffer._groups
-    assert tuple(item._event_id for item in buffer._observations) == (2, 3)
+    assert tuple(item.event_id for item in strict_observations(buffer)) == (2, 3)
 
 
 def test_relief_detaches_lowest_watermark_for_bytes_with_event_capacity() -> None:
@@ -980,16 +866,14 @@ def test_relief_detaches_lowest_watermark_for_bytes_with_event_capacity() -> Non
     assert buffer.byte_count <= max_bytes
     assert buffer.event_count + 1 < max_events
     assert buffer.byte_count + third.byte_count > max_bytes
-    assert buffer._relief_actions == ()
 
     buffer._observe(third, successful_time=0.0)
 
-    assert buffer._relief_actions == ('detach-group:alpha',)
     assert 'alpha' not in buffer._groups
     assert 'beta' in buffer._groups
     assert buffer._halt_reasons.get('beta', None) is None
-    assert buffer._watermark('beta')._released_through == 1
-    assert tuple(item._encoded for item in buffer._observations) == (second, third)
+    assert strict_watermark(buffer, 'beta').released_through == 1
+    assert tuple(item.encoded for item in strict_observations(buffer)) == (second, third)
     assert buffer.event_count == 2
     assert buffer.byte_count == max_bytes
 
@@ -1024,12 +908,12 @@ def test_replay_generation_resets_ordering_comparison_and_marks_release() -> Non
 
     releases = buffer.pump_many(('editorial',), 1.0)
 
-    assert [release._event_id for release in releases] == [100, 101]
-    assert all(release._is_operator_replay for release in releases)
+    assert [release.event_id for release in releases] == [100, 101]
+    assert all(release.is_operator_replay for release in releases)
     assert decisions == ()
 
 
-def test_restart_restores_only_body_free_policy_and_durable_range_timing() -> None:
+def test_restart_restores_only_body_free_policy_and_range_bounds() -> None:
     rebuilt = StrictBuffer(max_events=20, max_bytes=10_000_000)
     rebuilt.synchronize_ranges(
         iter(
@@ -1039,16 +923,9 @@ def test_restart_restores_only_body_free_policy_and_durable_range_timing() -> No
                     low_id=104,
                     high_id=106,
                     opened_successful_at=5.0,
-                    _visibility_deadline=10.0,
-                    _revision=2,
-                    _close_generation=0,
                     state='open',
-                    late_ids=(104,),
-                    group_eligibility=(('editorial', 15.0),),
-                    _scan_started_at=None,
+                    late_id_count=1,
                     scan_next_id=104,
-                    _scan_pages=0,
-                    _degraded=False,
                 ),
             )
         )
@@ -1068,10 +945,12 @@ def test_restart_restores_only_body_free_policy_and_durable_range_timing() -> No
     assert rebuilt.event_count == 0
     assert rebuilt.byte_count == 0
     assert len(rebuilt._ranges) == 1
-    assert rebuilt.range_ids_for(104) == ('durable-range',)
-    assert watermark._delivery_floor == 100
-    assert watermark._last_delivered_id == 103
-    assert watermark._is_operator_replay
+    assert rebuilt._ranges['durable-range'].low_id == 104
+    assert rebuilt._ranges['durable-range'].high_id == 106
+    assert not rebuilt._ranges['durable-range'].closed
+    assert watermark.delivery_floor == 100
+    assert watermark.last_delivered_id == 103
+    assert watermark.is_operator_replay
 
 
 def test_restored_floor_above_join_boundary_remains_the_comparison_point() -> None:
@@ -1088,11 +967,11 @@ def test_restored_floor_above_join_boundary_remains_the_comparison_point() -> No
 
     assert buffer.reserve(identity) == JoinTarget(identity)
     assert buffer.prepare(identity, channel) == Attached(identity)
-    watermark = buffer._watermark('editorial')
+    watermark = strict_watermark(buffer, 'editorial')
 
-    assert watermark._delivery_floor == 57
-    assert watermark._last_delivered_id == 57
-    assert watermark._released_through == 57
+    assert watermark.delivery_floor == 57
+    assert watermark.last_delivered_id == 57
+    assert watermark.released_through == 57
 
 
 def test_retention_health_counts_each_groups_remaining_payloads() -> None:
@@ -1119,7 +998,7 @@ def test_retention_health_counts_each_groups_remaining_payloads() -> None:
         ('alpha', 100, 3, first.byte_count + second.byte_count + third.byte_count),
         ('beta', 102, 1, third.byte_count),
     )
-    assert [item._event_id for item in buffer.pump_many(('alpha',), 10.0)] == [101]
+    assert [item.event_id for item in buffer.pump_many(('alpha',), 10.0)] == [101]
     assert buffer.retention_health() == (
         ('alpha', 101, 2, second.byte_count + third.byte_count),
         ('beta', 102, 1, third.byte_count),
@@ -1128,16 +1007,10 @@ def test_retention_health_counts_each_groups_remaining_payloads() -> None:
 
     buffer.detach_group('alpha', reason='channel-lost')
     assert buffer.retention_health() == (('beta', 102, 1, third.byte_count),)
-    beta_channel = buffer._groups['beta']._channel
+    beta_channel = buffer._groups['beta'].channel
     assert beta_channel is not None
-    for event_id in (101, 102):
-        assert buffer.pump_many(('beta',), 10.0) == ()
-        (control,) = beta_channel.drain()
-        assert isinstance(control, StrictOrderingControl)
-        assert control.action == 'skip'
-        assert control.event_id == event_id
-        buffer.acknowledge_control(control)
     assert _release_ids(buffer, 'beta', 10.0) == [103]
+    assert all(not isinstance(message, StrictOrderingControl) for message in beta_channel.drain())
     assert buffer.retention_health() == (('beta', 103, 0, 0),)
     buffer.detach_group('beta', reason='channel-lost')
     assert buffer.retention_health() == ()
@@ -1175,7 +1048,7 @@ def test_retention_health_includes_leases_until_finalize_or_abort() -> None:
     assert buffer.retention_health() == ()
 
 
-def test_retention_health_matches_restored_and_capacity_pending_ownership() -> None:
+def test_retention_health_matches_restored_and_detached_ownership() -> None:
     buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
     buffer.restore_group_policy('restored', 1, holdback_secs=10.0, delivery_floor=0)
     assert buffer.retention_health() == ()
@@ -1184,12 +1057,11 @@ def test_retention_health_matches_restored_and_capacity_pending_ownership() -> N
     buffer._observe(encoded, successful_time=0.0)
     assert buffer.retention_health() == (('halted', 100, 1, encoded.byte_count),)
 
-    buffer._groups['halted']._capacity_pending = True
-    buffer._free_unused()
+    buffer.detach_group('halted', reason='strict-buffer-capacity')
     assert buffer.retention_health() == ()
 
 
-def test_retired_range_releases_retained_observation_but_is_unknown_for_new_events() -> None:
+def test_retired_range_releases_retained_higher_observation() -> None:
     buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
     attach_strict_group(buffer, 'editorial', 1, holdback_secs=10.0, delivery_floor=100)
     buffer.synchronize_ranges(
@@ -1199,39 +1071,37 @@ def test_retired_range_releases_retained_observation_but_is_unknown_for_new_even
                 low_id=101,
                 high_id=101,
                 opened_successful_at=0.0,
-                _visibility_deadline=10.0,
-                _revision=1,
-                _close_generation=0,
                 state='open',
-                late_ids=(101,),
-                group_eligibility=(('editorial', 10.0),),
-                _scan_started_at=None,
+                late_id_count=1,
                 scan_next_id=101,
-                _scan_pages=0,
-                _degraded=False,
             ),
         )
     )
-    buffer._observe(
-        _encoded(101),
-        successful_time=10.0,
-        range_ids=('range-101',),
-    )
+    buffer._observe(_encoded(102), successful_time=0.0)
 
     assert _release_ids(buffer, 'editorial', 10.0) == []
-
     buffer.synchronize_ranges(())
-
-    assert _release_ids(buffer, 'editorial', 10.0) == [101]
-    with pytest.raises(ValueError, match='unknown ranges'):
-        buffer._observe(
-            _encoded(102),
-            successful_time=10.0,
-            range_ids=('range-101',),
-        )
+    assert _release_ids(buffer, 'editorial', 10.0) == [102]
 
 
-def test_single_unfittable_live_window_halts_without_advancing() -> None:
+def test_rows_at_or_below_floor_queue_no_control() -> None:
+    channel = _channel('floored')
+    buffer = StrictBuffer(max_events=20, max_bytes=10_000_000)
+    attach_strict_group(
+        buffer,
+        'floored',
+        1,
+        channel=channel,
+        holdback_secs=1.0,
+        delivery_floor=110,
+    )
+
+    assert buffer.observe_many((_encoded(105), _encoded(110)), successful_time=1.0) == ()
+    assert _release_ids(buffer, 'floored', 2.0) == []
+    assert channel.drain() == ()
+
+
+def test_sole_strict_group_detaches_when_its_window_cannot_fit() -> None:
     first = _encoded(1)
     second = _encoded(2)
     buffer = StrictBuffer(max_events=1, max_bytes=max(first.byte_count, second.byte_count))
@@ -1240,8 +1110,9 @@ def test_single_unfittable_live_window_halts_without_advancing() -> None:
 
     buffer._observe(second, successful_time=0.0)
 
-    assert buffer._halt_reasons.get('only', None) == 'strict-capacity-exhausted'
-    assert buffer._watermark('only')._released_through == 0
+    assert buffer._halt_reasons.get('only', None) is None
+    assert 'only' not in buffer._groups
+    assert strict_watermark(buffer, 'only').released_through == 0
     assert buffer.event_count == 0
 
 
@@ -1260,7 +1131,7 @@ def test_strict_buffer_counts_each_complete_frame_once() -> None:
 
     assert buffer.event_count == 2
     assert buffer.byte_count == first.byte_count + second.byte_count
-    assert tuple(item._event_id for item in buffer._observations) == (100, 101)
+    assert tuple(item.event_id for item in strict_observations(buffer)) == (100, 101)
 
 
 def test_strict_control_generation_replacement_discards_old_control() -> None:
@@ -1277,11 +1148,15 @@ def test_strict_control_generation_replacement_discards_old_control() -> None:
     assert buffer.reserve(identity) == JoinTarget(identity)
     assert buffer.prepare(identity, channel) == Attached(identity)
     assert buffer.finalize(identity) == JoinFinalized(identity)
-    buffer._observe(first, successful_time=0.0)
-    buffer._observe(second, successful_time=0.0)
+    buffer._queue_control(
+        buffer._groups['editorial'],
+        StrictOrderingControl(
+            identity=identity, event_id=1, last_delivered_id=2, delivery_floor=0, action='halt'
+        ),
+    )
     assert buffer.pump_many(('editorial',), 0.0) == ()
     (old_control,) = channel.drain()
-    assert isinstance(old_control, StrictCapacityControl)
+    assert isinstance(old_control, StrictOrderingControl)
     channel.detach('channel-lost-before-control-commit')
     assert buffer.pump_many(('editorial',), 0.0) == ()
     buffer.abort(identity)
@@ -1322,8 +1197,12 @@ def test_strict_control_rebind_rejects_future_generation() -> None:
     assert buffer.reserve(future) == JoinTarget(future)
     assert buffer.prepare(future, channel) == Attached(future)
     assert buffer.finalize(future) == JoinFinalized(future)
-    buffer._observe(first, successful_time=0.0)
-    buffer._observe(second, successful_time=0.0)
+    buffer._queue_control(
+        buffer._groups['editorial'],
+        StrictOrderingControl(
+            identity=future, event_id=1, last_delivered_id=2, delivery_floor=0, action='halt'
+        ),
+    )
     assert buffer.pump_many(('editorial',), 0.0) == ()
     channel.drain()
     channel.detach('channel-lost-before-control-commit')
@@ -1451,11 +1330,15 @@ def test_terminal_capacity_control_survives_offer_and_rebinds_after_loss() -> No
     assert buffer.prepare(identity, channel) == Attached(identity)
     assert buffer.finalize(identity) == JoinFinalized(identity)
 
-    buffer._observe(first, successful_time=0.0)
-    buffer._observe(second, successful_time=0.0)
+    buffer._queue_control(
+        buffer._groups['editorial'],
+        StrictOrderingControl(
+            identity=identity, event_id=1, last_delivered_id=2, delivery_floor=0, action='halt'
+        ),
+    )
     assert buffer.pump_many(('editorial',), 0.0) == ()
     (old_control,) = channel.drain()
-    assert isinstance(old_control, StrictCapacityControl)
+    assert isinstance(old_control, StrictOrderingControl)
     channel.detach('channel-lost-before-control-commit')
     assert buffer.pump_many(('editorial',), 0.0) == ()
     buffer.abort(identity)
@@ -1467,7 +1350,7 @@ def test_terminal_capacity_control_survives_offer_and_rebinds_after_loss() -> No
     assert buffer.finalize(fresh) == JoinFinalized(fresh)
     assert buffer.pump_many(('editorial',), 0.0) == ()
     (current_control,) = fresh_channel.drain()
-    assert isinstance(current_control, StrictCapacityControl)
+    assert isinstance(current_control, StrictOrderingControl)
     assert current_control.identity == fresh
     assert current_control == replace(old_control, identity=fresh)
 

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, Unpack, cast
 
 from sg_event_daemon._identity import stream_fingerprint
 from sg_event_daemon._source_state import SourceState
 from tests._storage_support import open_test_group, write_context_for
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
     from pathlib import Path
 
     from sg_event_daemon._group_state import GroupState
+    from sg_event_daemon._providers import _FindOptions
 
 
 SITE = 'studio'
@@ -23,7 +24,74 @@ STREAM = stream_fingerprint(
 )
 
 
-class SourceOpenOptions(TypedDict, total=False):
+class _StoredRangeDetails(NamedTuple):
+    visibility_deadline: float
+    revision: int
+    close_generation: int
+    scan_started_at: float | None
+    scan_pages: int
+    degraded: bool
+
+
+class EventLogSG:
+    def __init__(self, rows: Iterable[Mapping[str, object]]) -> None:
+        self._rows = tuple(dict(row) for row in rows)
+        self.visible = {cast('int', row['id']) for row in self._rows}
+        self.calls: list[tuple[object, int, list[dict[str, str]] | None]] = []
+
+    def close(self) -> None:
+        pass
+
+    @staticmethod
+    def matches(event_id: int, expression: object) -> bool:
+        if isinstance(expression, dict):
+            group = cast('dict[str, object]', expression)
+            assert group['filter_operator'] == 'any'
+            return any(
+                EventLogSG.matches(event_id, item)
+                for item in cast('list[object]', group['filters'])
+            )
+        field, operator, *bounds = cast('list[object]', expression)
+        assert field == 'id'
+        low = cast('int', bounds[0])
+        if operator == 'is':
+            return event_id == low
+        if operator == 'greater_than':
+            return event_id > low
+        if operator == 'less_than':
+            return event_id < low
+        assert operator == 'between'
+        return low <= event_id <= cast('int', bounds[1])
+
+    def find(
+        self,
+        entity_type: str,
+        filters: object,
+        fields: list[str] | None = None,
+        **options: Unpack[_FindOptions],
+    ) -> list[dict[str, object]]:
+        assert entity_type == 'EventLogEntry'
+        del fields
+        limit = options.get('limit', 0)
+        order = options.get('order')
+        self.calls.append((filters, limit, order))
+        rows = [
+            row
+            for row in self._rows
+            if row['id'] in self.visible
+            and all(
+                self.matches(cast('int', row['id']), item)
+                for item in cast('list[object]', filters)
+            )
+        ]
+        rows.sort(
+            key=lambda row: cast('int', row['id']),
+            reverse=bool(order and order[0]['direction'] == 'desc'),
+        )
+        return rows[:limit] if limit else rows
+
+
+class _SourceOpenOptions(TypedDict, total=False):
     commit_batch_max_bytes: int
     configured_stream: str
     delivery_floors: Mapping[str, int] | None
@@ -38,7 +106,7 @@ class SourceOpenOptions(TypedDict, total=False):
     source_generation: str
     synchronous: str
     token_factory: Callable[[], str] | None
-    visibility_overlap_secs: float
+    late_event_window_secs: float
 
 
 def adopt_halted_stream(
@@ -90,7 +158,7 @@ def open_group(
 
 def open_source(
     path: Path,
-    **options: Unpack[SourceOpenOptions],
+    **options: Unpack[_SourceOpenOptions],
 ) -> SourceState:
     groups = options.get('groups')
     delivery_floors = options.get('delivery_floors')
@@ -103,7 +171,7 @@ def open_source(
         source=SOURCE,
         stream_fingerprint=options.get('configured_stream', STREAM),
         source_generation=options.get('source_generation', SOURCE_GENERATION),
-        visibility_overlap_secs=options.get('visibility_overlap_secs', 300.0),
+        late_event_window_secs=options.get('late_event_window_secs', 300.0),
         max_open_ranges=options.get('max_open_ranges', 100),
         max_group_obligations=options.get('max_group_obligations', 1_000),
         max_range_query_pages=options.get('max_range_query_pages', 100),
@@ -138,3 +206,23 @@ def open_source(
             (group, floor, floor, floor),
         )
     return state
+
+
+def stored_range_details(state: SourceState, obligation_id: str) -> _StoredRangeDetails:
+    row = state._database.connection.execute(
+        """
+        SELECT visibility_deadline, source_revision, close_generation,
+               scan_started_at, scan_pages, degraded
+        FROM discovery_ranges WHERE obligation_id = ?
+        """,
+        (obligation_id,),
+    ).fetchone()
+    assert row is not None
+    return _StoredRangeDetails(
+        float(row[0]),
+        int(row[1]),
+        int(row[2]),
+        None if row[3] is None else float(row[3]),
+        int(row[4]),
+        bool(row[5]),
+    )

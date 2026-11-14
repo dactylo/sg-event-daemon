@@ -71,8 +71,8 @@ class FailureReport:
     Attributes:
         code: Machine-readable reason: `secret-missing`, `event-invalid`,
             `setup-failed`, or `callback-failed`.
-        detail: Redacted `PluginError` text containing the code, available
-            identities, and the trusted-plugin notice.
+        detail: Redacted `PluginError` text containing the code and available
+            identities.
         site: Site name associated with the failure.
         group: Group name associated with the failure.
         plugin_id: Plugin name, or `None` for a group-level failure.
@@ -188,6 +188,9 @@ class LoadedPlugin:
         callbacks: Registered callback IDs in declaration order.
         config: Deeply frozen non-secret plugin configuration.
         module: Imported trusted plugin module for test inspection.
+        site_config: Validated site configuration used by the host.
+        group_config: Validated group configuration used by the host.
+        plugin_spec: Registered plugin configuration and callbacks.
     """
 
     plugin_id: str
@@ -198,17 +201,17 @@ class LoadedPlugin:
     callbacks: tuple[str, ...]
     config: Mapping[str, object]
     module: ModuleType = field(repr=False)
-    _site_config: SiteConfig = field(repr=False)
-    _group_config: GroupConfig = field(repr=False)
-    _plugin_spec: PluginSpec = field(repr=False)
+    site_config: SiteConfig = field(repr=False)
+    group_config: GroupConfig = field(repr=False)
+    plugin_spec: PluginSpec = field(repr=False)
 
-    def _build_host(self, provider: ProviderInterface) -> PluginHost:
-        """Build one production host around this loaded plugin."""
+    def build_host(self, provider: ProviderInterface) -> PluginHost:
+        """Build an unstarted host whose lifecycle the caller owns."""
         return PluginHost(
-            self._site_config,
-            self._group_config,
+            self.site_config,
+            self.group_config,
             provider,
-            (self._plugin_spec,),
+            (self.plugin_spec,),
             heartbeat=lambda: None,
             shutdown_requested=lambda: False,
         )
@@ -287,17 +290,13 @@ class _OfflineAsyncHandle:
 
     async def find(
         self,
-        _entity_type: str,
-        _filters: object,
-        _fields: list[str] | None = None,
+        *_args: object,
         **_kwargs: object,
     ) -> list[dict[str, object]]:
         """Reject an SG request when no async handle was injected.
 
         Args:
-            _entity_type: Ignored requested entity type.
-            _filters: Ignored requested filters.
-            _fields: Ignored requested fields.
+            *_args: Ignored request arguments.
             **_kwargs: Ignored provider options.
 
         Raises:
@@ -327,17 +326,13 @@ class _OfflineSyncHandle:
 
     def find(
         self,
-        _entity_type: str,
-        _filters: object,
-        _fields: list[str] | None = None,
+        *_args: object,
         **_kwargs: object,
     ) -> list[dict[str, object]]:
         """Reject an SG request when no sync handle was injected.
 
         Args:
-            _entity_type: Ignored requested entity type.
-            _filters: Ignored requested filters.
-            _fields: Ignored requested fields.
+            *_args: Ignored request arguments.
             **_kwargs: Ignored provider options.
 
         Raises:
@@ -447,14 +442,14 @@ async def drive_async_plugin(
             invalid, an event omits a required field, a matching event has an
             `id` that is not a positive integer, or an event field contains an
             unsupported or non-finite value.
+        asyncio.CancelledError: Async callback execution or teardown is
+            cancelled.
     """
     if plugin.execution != 'async':
         raise ValueError('drive_async_plugin requires an async plugin')
     if delivery_attempt <= 0:
         raise ValueError('delivery_attempt must be positive')
-    host = plugin._build_host(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        _provider('async', sg)
-    )
+    host = plugin.build_host(_provider('async', sg))
     callbacks: list[CallbackResult] = []
     primary_error: BaseException | None = None
     try:
@@ -528,9 +523,7 @@ def drive_sync_plugin(
         raise ValueError('drive_sync_plugin requires a sync plugin')
     if delivery_attempt <= 0:
         raise ValueError('delivery_attempt must be positive')
-    host = plugin._build_host(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        _provider('sync', sg)
-    )
+    host = plugin.build_host(_provider('sync', sg))
     callbacks: list[CallbackResult] = []
     primary_error: BaseException | None = None
     try:
@@ -633,7 +626,7 @@ def load_plugin(
         callbacks=tuple(callback.id for callback in loaded.callbacks),
         config=loaded.config,
         module=module,
-        _site_config=site_config,
-        _group_config=group_config,
-        _plugin_spec=loaded,
+        site_config=site_config,
+        group_config=group_config,
+        plugin_spec=loaded,
     )

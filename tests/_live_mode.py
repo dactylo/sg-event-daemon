@@ -1,21 +1,25 @@
+import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
-_LiveMode = Literal['sync', 'sync+async']
-_LiveProvider = Literal['sg-python-api', 'shotgun-api3']
+LiveMode = Literal['sync', 'sync+async']
+LiveProvider = Literal['sg-python-api', 'shotgun-api3']
 
 
 @dataclass(frozen=True)
-class _LiveOptions:
-    _provider: _LiveProvider
-    _mode: _LiveMode
-    _load_events: int
-    _report_dir: Path | None
-    _run_live: bool
-    _run_live_load: bool
+class LiveOptions:
+    provider: LiveProvider
+    mode: LiveMode
+    load_events: int
+    report_dir: Path | None
+    run_live: bool
+    run_live_load: bool
+    namespace: str | None = None
+    recover: str | None = None
 
 
 def _live_load_events(value: object) -> int:
@@ -30,7 +34,7 @@ def _live_load_events(value: object) -> int:
     return count
 
 
-def _live_mode(value: object) -> _LiveMode:
+def _live_mode(value: object) -> LiveMode:
     if value == 'sync':
         return 'sync'
     if value == 'sync+async':
@@ -40,7 +44,23 @@ def _live_mode(value: object) -> _LiveMode:
     )
 
 
-def _live_provider(value: object) -> _LiveProvider:
+def _live_namespace(value: object, option: str) -> str | None:
+    if value is None:
+        return None
+    message = f'{option} must be a valid live namespace'
+    if not isinstance(value, str):
+        raise pytest.UsageError(message)
+    match = re.fullmatch(r'sg-event-daemon-([0-9]{8}T[0-9]{12}Z)-[0-9a-f]{32}', value)
+    if match is None:
+        raise pytest.UsageError(message)
+    try:
+        datetime.strptime(match[1], '%Y%m%dT%H%M%S%fZ').replace(tzinfo=UTC)
+    except ValueError:
+        raise pytest.UsageError(message) from None
+    return value
+
+
+def _live_provider(value: object) -> LiveProvider:
     if value == 'sg-python-api':
         return 'sg-python-api'
     if value == 'shotgun-api3':
@@ -59,18 +79,20 @@ def _live_report_dir(value: object) -> Path | None:
     return Path(value)
 
 
-def _live_options(config: pytest.Config) -> _LiveOptions:
+def live_options(config: pytest.Config) -> LiveOptions:
     provider = _live_provider(config.getoption('live_provider'))
     mode = _live_mode(config.getoption('live_mode'))
     if provider == 'shotgun-api3' and mode == 'sync+async':
         raise pytest.UsageError('shotgun-api3 with sync+async is invalid')
-    return _LiveOptions(
-        _provider=provider,
-        _mode=mode,
-        _load_events=_live_load_events(config.getoption('live_load_events')),
-        _report_dir=_live_report_dir(config.getoption('live_report_dir')),
-        _run_live=bool(config.getoption('run_live')),
-        _run_live_load=bool(config.getoption('run_live_load')),
+    return LiveOptions(
+        provider=provider,
+        mode=mode,
+        load_events=_live_load_events(config.getoption('live_load_events')),
+        report_dir=_live_report_dir(config.getoption('live_report_dir')),
+        run_live=bool(config.getoption('run_live')),
+        run_live_load=bool(config.getoption('run_live_load')),
+        namespace=_live_namespace(config.getoption('live_namespace'), '--live-namespace'),
+        recover=_live_namespace(config.getoption('live_recover'), '--live-recover'),
     )
 
 
@@ -94,6 +116,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help='bounded live load event count from 2 through 1000',
     )
     group.addoption('--live-report-dir', help='optional sanitized report directory')
+    group.addoption('--live-namespace', help="known namespace for this run's Shots")
+    group.addoption('--live-recover', help='namespace whose Shots recovery deletes')
 
 
 def pytest_collection_modifyitems(
@@ -112,5 +136,7 @@ def pytest_collection_modifyitems(
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    _live_namespace(config.getoption('live_namespace'), '--live-namespace')
+    _live_namespace(config.getoption('live_recover'), '--live-recover')
     if config.getoption('run_live') or config.getoption('run_live_load'):
-        _live_options(config)
+        live_options(config)
